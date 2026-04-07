@@ -2371,6 +2371,7 @@
   .remote-toolbar.visible {
     opacity: 1;
     transform: translateY(0);
+    pointer-events: auto;
   }
 
   .viewer-toolbar-group {
@@ -2386,6 +2387,7 @@
     border-radius: 999px;
     background: rgba(15, 23, 42, 0.72);
     border: 1px solid rgba(148, 163, 184, 0.24);
+    pointer-events: auto;
   }
 
   .danger-ghost {
