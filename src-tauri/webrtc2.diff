@@ -1,0 +1,442 @@
+﻿diff --git a/src-tauri/src/agent/webrtc.rs b/src-tauri/src/agent/webrtc.rs
+index a14a344..9c871ed 100644
+--- a/src-tauri/src/agent/webrtc.rs
++++ b/src-tauri/src/agent/webrtc.rs
+@@ -1,7 +1,10 @@
+ use serde_json::Value;
++use std::env;
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
++use super::desktop_duplication::{DesktopFrame, DxgiDesktopDuplicator};
++use super::media_foundation_encoder::MediaFoundationEncoderWorker;
+ use super::input_handler::InputHandler;
+ use super::signaling::SignalingClient;
+ use super::video_encoder::{
+@@ -223,6 +226,8 @@ impl AgentWebRtc {
+             .await
+             .map_err(|e| format!("add_track failed: {e}"))?;
+ 
++        println!("WebRTC video track created: screen/H264");
++
+         tokio::spawn(async move {
+             while rtp_sender.read_rtcp().await.is_ok() {}
+         });
+@@ -310,6 +315,30 @@ impl AgentWebRtc {
+                 VideoEncoderBackend::OpenH264Software => {
+                     run_openh264_screen_sender(&signaling, &peer, &track, selection.preset).await
+                 }
++                VideoEncoderBackend::MediaFoundationH264 => {
++                    match run_media_foundation_screen_sender(
++                        &signaling,
++                        &peer,
++                        &track,
++                        selection.preset,
++                    )
++                    .await
++                    {
++                        Ok(()) => Ok(()),
++                        Err(err) => {
++                            eprintln!(
++                                "Native Media Foundation H264 encoder failed: {err}. Falling back to software OpenH264."
++                            );
++                            run_openh264_screen_sender(
++                                &signaling,
++                                &peer,
++                                &track,
++                                selection.preset,
++                            )
++                            .await
++                        }
++                    }
++                }
+                 backend => {
+                     match run_ffmpeg_rtp_screen_sender(
+                         &signaling,
+@@ -396,6 +425,8 @@ async fn run_openh264_screen_sender(
+     let ts_step: u32 = 90000 / preset.target_fps.max(1);
+     let mut frame_index: u64 = 0;
+     let mut stats = StreamStatsWindow::new();
++    let mut capturer = DxgiDesktopDuplicator::new()?;
++    let scale_target = resolve_scale_request();
+ 
+     loop {
+         match peer.connection_state() {
+@@ -408,8 +439,15 @@ async fn run_openh264_screen_sender(
+             continue;
+         }
+ 
+-        let (width, height, bgra_frame) = match capture_primary_screen_even_bgra() {
+-            Ok(frame) => frame,
++        let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
++            &mut capturer,
++            scale_target,
++        ) {
++            Ok(Some(frame)) => frame,
++            Ok(None) => {
++                tokio::time::sleep(Duration::from_millis(4)).await;
++                continue;
++            }
+             Err(err) => {
+                 eprintln!("Screen capture failed: {err}");
+                 tokio::time::sleep(Duration::from_millis(250)).await;
+@@ -417,15 +455,33 @@ async fn run_openh264_screen_sender(
+             }
+         };
+ 
+-        let bgra = BgraSliceU8::new(&bgra_frame, (width, height));
+-        let yuv = YUVBuffer::from_rgb_source(bgra);
+-
+         frame_index += 1;
+-        if keyframe_interval > 0 && frame_index % keyframe_interval == 0 {
+-            encoder.force_intra_frame();
++        if frame_index % preset.target_fps.max(1) as u64 == 0 {
++            println!(
++                "Captured {} frames via DXGI at {}x{} for software H264 pipeline",
++                frame_index, width, height
++            );
+         }
+ 
+-        let encoded = match encoder.encode(&yuv).map(|bitstream| bitstream.to_vec()) {
++        let force_keyframe = keyframe_interval > 0 && frame_index % keyframe_interval == 0;
++
++        let (encoded_result, returned_encoder) = tokio::task::spawn_blocking(move || {
++            let bgra = BgraSliceU8::new(&bgra_frame, (width, height));
++            let yuv = YUVBuffer::from_rgb_source(bgra);
++
++            if force_keyframe {
++                encoder.force_intra_frame();
++            }
++
++            let result = encoder.encode(&yuv).map(|bitstream| bitstream.to_vec());
++            (result, encoder)
++        })
++        .await
++        .map_err(|e| format!("spawn_blocking failed: {e}"))?;
++
++        encoder = returned_encoder;
++
++        let encoded = match encoded_result {
+             Ok(data) => data,
+             Err(err) => {
+                 eprintln!("H264 encode failed: {err}");
+@@ -485,6 +541,13 @@ async fn run_openh264_screen_sender(
+ 
+         if frame_sent {
+             stats.record_frame(payload_bytes.len());
++            if frame_index % preset.target_fps.max(1) as u64 == 0 {
++                println!(
++                    "Sent software H264 frame {} ({} bytes payload)",
++                    frame_index,
++                    payload_bytes.len()
++                );
++            }
+         }
+         stats.flush_if_due(signaling).await;
+         tokio::time::sleep(frame_interval).await;
+@@ -493,6 +556,146 @@ async fn run_openh264_screen_sender(
+     Ok(())
+ }
+ 
++async fn run_media_foundation_screen_sender(
++    signaling: &Arc<SignalingClient>,
++    peer: &Arc<RTCPeerConnection>,
++    track: &Arc<TrackLocalStaticRTP>,
++    preset: VideoEncoderPreset,
++) -> Result<(), String> {
++    let frame_period = frame_interval_for(preset);
++    let mut payloader = H264Payloader::default();
++    let mut seq: u16 = 1;
++    let mut timestamp: u32 = 0;
++    let ts_step: u32 = 90000 / preset.target_fps.max(1);
++    let mut frame_counter: u64 = 0;
++    let mut stats = StreamStatsWindow::new();
++    let mut capturer = DxgiDesktopDuplicator::new()?;
++    let scale_target = resolve_scale_request();
++    let mut last_dimensions: Option<(usize, usize)> = None;
++    let mut worker = MediaFoundationEncoderWorker::new(
++        0,
++        0,
++        preset.target_fps.max(1),
++        preset.bitrate_bps,
++    )?;
++
++    loop {
++        let loop_start = Instant::now();
++        match peer.connection_state() {
++            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
++            _ => {}
++        }
++
++        if !stream_is_ready(peer, track).await {
++            tokio::time::sleep(Duration::from_millis(80)).await;
++            continue;
++        }
++
++        let (width, height, bgra_frame) =
++            match capture_primary_screen_even_bgra(&mut capturer, scale_target)? {
++                Some(frame) => frame,
++                None => {
++                    tokio::time::sleep(Duration::from_millis(2)).await;
++                    continue;
++                }
++            };
++        frame_counter += 1;
++
++        if last_dimensions != Some((width, height)) {
++            last_dimensions = Some((width, height));
++            println!(
++                "Media Foundation H264 encoder configured at {}x{}",
++                width, height
++            );
++        }
++
++        let (encoded_units_result, returned_worker) = tokio::task::spawn_blocking(move || {
++            let nv12 = super::desktop_duplication::bgra_to_nv12(width, height, width * 4, &bgra_frame);
++            let result = worker.encode_nv12(width, height, nv12.as_bytes());
++            (result, worker)
++        })
++        .await
++        .map_err(|e| format!("spawn_blocking failed: {e}"))?;
++        worker = returned_worker;
++
++        let encoded_units = encoded_units_result?;
++        if encoded_units.is_empty() || encoded_units.iter().all(|u| u.data.is_empty()) {
++            tokio::time::sleep(Duration::from_millis(1)).await;
++            continue;
++        }
++
++        let frame_ts = timestamp;
++        timestamp = timestamp.wrapping_add(ts_step);
++        let mut frame_sent = false;
++        let mut total_payload_bytes = 0usize;
++
++        for unit in encoded_units {
++            if unit.data.is_empty() {
++                continue;
++            }
++            total_payload_bytes += unit.data.len();
++
++            let payload_bytes = Bytes::from(unit.data);
++            let payloads = match payloader.payload(1200, &payload_bytes) {
++                Ok(chunks) => chunks,
++                Err(err) => {
++                    eprintln!("H264 payload split failed (Media Foundation): {err}");
++                    continue;
++                }
++            };
++
++            for (index, fragment) in payloads.iter().enumerate() {
++                if track.any_binding_paused().await {
++                    break;
++                }
++
++                let packet = Packet {
++                    header: rtp::header::Header {
++                        version: 2,
++                        padding: false,
++                        extension: false,
++                        marker: index + 1 == payloads.len(),
++                        payload_type: 0,
++                        sequence_number: seq,
++                        timestamp: frame_ts,
++                        ssrc: 0,
++                        csrc: vec![],
++                        extension_profile: 0,
++                        extensions: vec![],
++                        extensions_padding: 0,
++                    },
++                    payload: fragment.clone(),
++                };
++
++                if track.write_rtp(&packet).await.is_err() {
++                    break;
++                }
++
++                frame_sent = true;
++                seq = seq.wrapping_add(1);
++            }
++        }
++
++        if frame_sent {
++            stats.record_frame(total_payload_bytes.max(1));
++            if frame_counter % preset.target_fps.max(1) as u64 == 0 {
++                println!(
++                    "Sent native MF H264 frame {} ({} bytes payload)",
++                    frame_counter, total_payload_bytes
++                );
++            }
++        }
++        stats.flush_if_due(signaling).await;
++
++        let elapsed = loop_start.elapsed();
++        if elapsed < frame_period {
++            tokio::time::sleep(frame_period - elapsed).await;
++        }
++    }
++
++    Ok(())
++}
++
+ async fn run_ffmpeg_rtp_screen_sender(
+     signaling: &Arc<SignalingClient>,
+     peer: &Arc<RTCPeerConnection>,
+@@ -504,6 +707,9 @@ async fn run_ffmpeg_rtp_screen_sender(
+     let mut bridge: Option<FfmpegRtpBridge> = None;
+     let mut active_dimensions: Option<(usize, usize)> = None;
+     let mut stats = StreamStatsWindow::new();
++    let mut capturer = DxgiDesktopDuplicator::new()?;
++    let scale_target = resolve_scale_request();
++    let mut frame_counter: u64 = 0;
+ 
+     loop {
+         match peer.connection_state() {
+@@ -516,7 +722,15 @@ async fn run_ffmpeg_rtp_screen_sender(
+             continue;
+         }
+ 
+-        let (width, height, bgra_frame) = capture_primary_screen_even_bgra()?;
++        let (width, height, bgra_frame) =
++            match capture_primary_screen_even_bgra(&mut capturer, scale_target)? {
++                Some(frame) => frame,
++                None => {
++                    tokio::time::sleep(Duration::from_millis(4)).await;
++                    continue;
++                }
++            };
++        frame_counter += 1;
+         if active_dimensions != Some((width, height)) {
+             if let Some(existing) = bridge.as_mut() {
+                 existing.shutdown().await;
+@@ -524,12 +738,24 @@ async fn run_ffmpeg_rtp_screen_sender(
+ 
+             bridge = Some(FfmpegRtpBridge::spawn(backend, width, height, preset).await?);
+             active_dimensions = Some((width, height));
++            println!(
++                "Reconfigured FFmpeg RTP bridge for {}x{} with backend {}",
++                width,
++                height,
++                backend.label()
++            );
+         }
+ 
+         let active_bridge = bridge
+             .as_mut()
+             .ok_or_else(|| "FFmpeg bridge unavailable after spawn".to_string())?;
+         active_bridge.write_frame(&bgra_frame).await?;
++        if frame_counter % preset.target_fps.max(1) as u64 == 0 {
++            println!(
++                "Captured {} frames via DXGI for native->FFmpeg bridge at {}x{}",
++                frame_counter, width, height
++            );
++        }
+         drain_ffmpeg_packets(track, active_bridge, &mut stats).await?;
+         stats.flush_if_due(signaling).await;
+         tokio::time::sleep(frame_interval).await;
+@@ -586,36 +812,80 @@ fn frame_interval_for(preset: VideoEncoderPreset) -> Duration {
+     Duration::from_secs_f64(1.0 / preset.target_fps.max(1) as f64)
+ }
+ 
+-fn capture_primary_screen_even_bgra() -> Result<(usize, usize, Vec<u8>), String> {
+-    let frame = screenshots::Screen::all()
+-        .map_err(|err| err.to_string())
+-        .and_then(|screens| {
+-            screens
+-                .first()
+-                .ok_or_else(|| "No screen detected".to_string())
+-                .and_then(|screen| screen.capture().map_err(|err| err.to_string()))
+-        })?;
+-
+-    let width = frame.width() as usize;
+-    let height = frame.height() as usize;
+-    let raw = frame.into_raw();
+-    let even_width = width & !1;
+-    let even_height = height & !1;
+-    if even_width < 2 || even_height < 2 {
++fn capture_primary_screen_even_bgra(
++    capturer: &mut DxgiDesktopDuplicator,
++    scale_target: Option<(usize, usize)>,
++) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
++    let Some(frame) = capturer.capture_next_frame(16)? else {
++        return Ok(None);
++    };
++
++    let prepared = normalize_frame_for_stream(frame, scale_target)?;
++    Ok(Some(prepared))
++}
++
++fn normalize_frame_for_stream(
++    frame: DesktopFrame,
++    scale_target: Option<(usize, usize)>,
++) -> Result<(usize, usize, Vec<u8>), String> {
++    let frame = if let Some((requested_width, requested_height)) = scale_target {
++        let (target_width, target_height) = resolve_scaled_dimensions(
++            frame.width,
++            frame.height,
++            requested_width,
++            requested_height,
++        );
++        frame.resize_bgra_nearest(target_width, target_height)
++    } else {
++        frame
++    };
++
++    let (width, height, bgra) = frame.into_even_bgra();
++    if width < 2 || height < 2 {
+         return Err("Captured frame is too small".to_string());
+     }
+ 
+-    let bgra_even = if even_width == width && even_height == height {
+-        raw
+-    } else {
+-        let mut out = vec![0u8; even_width * even_height * 4];
+-        for y in 0..even_height {
+-            let src_row = &raw[(y * width * 4)..(y * width * 4 + even_width * 4)];
+-            let dst_row = &mut out[(y * even_width * 4)..(y * even_width * 4 + even_width * 4)];
+-            dst_row.copy_from_slice(src_row);
++    Ok((width, height, bgra))
++}
++
++fn resolve_scale_request() -> Option<(usize, usize)> {
++    let requested_width = env::var("LUMIERE_STREAM_WIDTH")
++        .ok()
++        .and_then(|value| value.parse::<usize>().ok())
++        .filter(|value| *value >= 320);
++    let requested_height = env::var("LUMIERE_STREAM_HEIGHT")
++        .ok()
++        .and_then(|value| value.parse::<usize>().ok())
++        .filter(|value| *value >= 180);
++
++    match (requested_width, requested_height) {
++        (Some(width), Some(height)) => Some((width & !1, height & !1)),
++        (Some(width), None) => Some((width & !1, 0)),
++        (None, Some(height)) => Some((0, height & !1)),
++        (None, None) => None,
++    }
++}
++
++fn resolve_scaled_dimensions(
++    source_width: usize,
++    source_height: usize,
++    requested_width: usize,
++    requested_height: usize,
++) -> (usize, usize) {
++    let aspect = source_width as f64 / source_height.max(1) as f64;
++
++    let (target_width, target_height) = match (requested_width, requested_height) {
++        (width, height) if width > 0 && height > 0 => (width, height),
++        (width, 0) if width > 0 => {
++            let height = ((width as f64 / aspect).round() as usize).max(2);
++            (width, height)
++        }
++        (0, height) if height > 0 => {
++            let width = ((height as f64 * aspect).round() as usize).max(2);
++            (width, height)
+         }
+-        out
++        _ => (source_width, source_height),
+     };
+ 
+-    Ok((even_width, even_height, bgra_even))
++    ((target_width.max(2)) & !1, (target_height.max(2)) & !1)
+ }

@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoEncoderBackend {
+    MediaFoundationH264,
     FfmpegNvenc,
     FfmpegQsv,
     FfmpegAmf,
@@ -30,6 +31,7 @@ pub struct VideoEncoderSelection {
 impl VideoEncoderBackend {
     pub fn label(self) -> &'static str {
         match self {
+            Self::MediaFoundationH264 => "native:media_foundation_h264",
             Self::FfmpegNvenc => "ffmpeg:h264_nvenc",
             Self::FfmpegQsv => "ffmpeg:h264_qsv",
             Self::FfmpegAmf => "ffmpeg:h264_amf",
@@ -39,6 +41,7 @@ impl VideoEncoderBackend {
 
     pub fn ffmpeg_encoder_name(self) -> Option<&'static str> {
         match self {
+            Self::MediaFoundationH264 => None,
             Self::FfmpegNvenc => Some("h264_nvenc"),
             Self::FfmpegQsv => Some("h264_qsv"),
             Self::FfmpegAmf => Some("h264_amf"),
@@ -48,6 +51,10 @@ impl VideoEncoderBackend {
 
     pub fn default_preset(self) -> VideoEncoderPreset {
         match self {
+            Self::MediaFoundationH264 => VideoEncoderPreset {
+                target_fps: 60,
+                bitrate_bps: 8_000_000,
+            },
             Self::FfmpegNvenc | Self::FfmpegQsv | Self::FfmpegAmf => VideoEncoderPreset {
                 target_fps: 60,
                 bitrate_bps: 8_000_000,
@@ -71,6 +78,7 @@ impl VideoEncoderSelection {
         let backend = if let Some(backend) = preferred {
             match backend {
                 VideoEncoderBackend::OpenH264Software => backend,
+                VideoEncoderBackend::MediaFoundationH264 => backend,
                 _ if ffmpeg_supports_backend(backend) => backend,
                 _ => {
                     eprintln!(
@@ -118,6 +126,7 @@ impl FfmpegRtpBridge {
         width: usize,
         height: usize,
         preset: VideoEncoderPreset,
+        payload_type: u8,
     ) -> Result<Self, String> {
         let encoder_name = backend
             .ffmpeg_encoder_name()
@@ -172,7 +181,7 @@ impl FfmpegRtpBridge {
             .arg("-f")
             .arg("rtp")
             .arg("-payload_type")
-            .arg("96")
+            .arg(payload_type.to_string())
             .arg(format!("rtp://127.0.0.1:{port}?pkt_size=1200"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -217,6 +226,9 @@ impl FfmpegRtpBridge {
 fn parse_requested_backend(raw: &str) -> Option<VideoEncoderBackend> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => None,
+        "mf" | "mediafoundation" | "media_foundation" | "native_h264" => {
+            Some(VideoEncoderBackend::MediaFoundationH264)
+        }
         "nvenc" | "h264_nvenc" => Some(VideoEncoderBackend::FfmpegNvenc),
         "qsv" | "h264_qsv" => Some(VideoEncoderBackend::FfmpegQsv),
         "amf" | "h264_amf" => Some(VideoEncoderBackend::FfmpegAmf),
@@ -226,6 +238,12 @@ fn parse_requested_backend(raw: &str) -> Option<VideoEncoderBackend> {
 }
 
 fn detect_best_backend() -> VideoEncoderBackend {
+    #[cfg(windows)]
+    {
+        return VideoEncoderBackend::MediaFoundationH264;
+    }
+
+    #[cfg(not(windows))]
     [
         VideoEncoderBackend::FfmpegNvenc,
         VideoEncoderBackend::FfmpegQsv,
@@ -260,6 +278,7 @@ fn ffmpeg_supports_backend(backend: VideoEncoderBackend) -> bool {
 
 fn ffmpeg_backend_args(backend: VideoEncoderBackend) -> &'static [&'static str] {
     match backend {
+        VideoEncoderBackend::MediaFoundationH264 => &[],
         VideoEncoderBackend::FfmpegNvenc => &["-preset", "p4", "-tune", "ll", "-rc", "cbr_ld_hq"],
         VideoEncoderBackend::FfmpegQsv => &["-preset", "veryfast"],
         VideoEncoderBackend::FfmpegAmf => &["-usage", "ultralowlatency", "-quality", "speed"],

@@ -7,3 +7,5 @@ pub mod session;
 pub mod webrtc;
 pub mod screen_capture;
 pub mod video_encoder;
+pub mod desktop_duplication;
+pub mod media_foundation_encoder;

@@ -996,6 +996,11 @@
 
     pc.ontrack = (event) => {
       const stream = event.streams?.[0] ?? new MediaStream([event.track]);
+      console.info("[viewer] remote track received", {
+        kind: event.track.kind,
+        id: event.track.id,
+        streamId: stream.id
+      });
       viewerRemoteStream = stream;
       screenFrameError = null;
     };
