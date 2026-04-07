@@ -14,6 +14,7 @@
   let metrics = $state<AgentMetrics | null>(null);
   let metricsError = $state<string | null>(null);
   let metricsLoading = $state(true);
+  let metricsPanelOpen = $state(false);
   let agentRunning = $state(false);
   let agentLifecycleError = $state<string | null>(null);
 
@@ -60,12 +61,16 @@
   const maxViewerOfferRetries = 8;
   let viewerControlsTimer: ReturnType<typeof setTimeout> | null = null;
   let detachViewerInputListeners: (() => void) | null = null;
+  let detachViewerFullscreenListener: (() => void) | null = null;
+  let viewerShellEl = $state<HTMLDivElement | null>(null);
   let viewerVideoEl = $state<HTMLVideoElement | null>(null);
   let viewerRemoteStream = $state<MediaStream | null>(null);
   let viewerDataChannelOpen = $state(false);
   let viewerKeyboardCaptured = $state(false);
   let viewerConnectionState = $state<string>("idle");
   let viewerControlsVisible = $state(true);
+  let viewerExpanded = $state(false);
+  let viewerFullscreenActive = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
   let viewerStreamMbps = $state<number | null>(null);
@@ -109,6 +114,10 @@
   // Session approval modal
   let machineId = $state<string>("");
   let localMachineId = $state<string>("");
+  let localConnectionCode = $state<string>("");
+  let localConnectionCodeLoading = $state(false);
+  let localConnectionCodeError = $state<string | null>(null);
+  let connectionCodeCopied = $state(false);
   let showApprovalModal = $state(false);
   let pendingApprovalSession = $state<ControlSession | null>(null);
   let approvalAllowRemoteInput = $state(true);
@@ -147,6 +156,7 @@
       }
 
       localMachineId = status.machineId?.trim() ?? "";
+      await refreshLocalConnectionCode();
 
       agentLifecycleError = null;
     } catch (error) {
@@ -162,6 +172,43 @@
       // ignore shutdown errors
     } finally {
       agentRunning = false;
+    }
+  }
+
+  async function refreshLocalConnectionCode() {
+    const machineId = localMachineId.trim();
+    if (!machineId) {
+      localConnectionCode = "";
+      localConnectionCodeError = null;
+      return;
+    }
+
+    localConnectionCodeLoading = true;
+    try {
+      const response = await technicianApi.getMachineAuthStatus(machineId);
+      localConnectionCode = response?.data?.connectionCode?.trim?.() ?? "";
+      localConnectionCodeError = null;
+    } catch (error) {
+      localConnectionCode = "";
+      localConnectionCodeError = String(error);
+    } finally {
+      localConnectionCodeLoading = false;
+    }
+  }
+
+  async function copyLocalConnectionCode() {
+    if (!localConnectionCode) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(localConnectionCode);
+      connectionCodeCopied = true;
+      setTimeout(() => {
+        connectionCodeCopied = false;
+      }, 1600);
+    } catch {
+      connectionCodeCopied = false;
     }
   }
 
@@ -469,6 +516,61 @@
       default:
         return "muted";
     }
+  }
+
+  function viewerStateLabel(state: string) {
+    switch (state) {
+      case "connected":
+        return "connecte";
+      case "connecting":
+        return "connexion";
+      case "disconnected":
+        return "deconnecte";
+      case "failed":
+        return "echec";
+      case "closed":
+        return "ferme";
+      case "new":
+        return "initialisation";
+      default:
+        return "attente";
+    }
+  }
+
+  function viewerQualityClass(mbps: number | null) {
+    if (mbps === null) {
+      return "muted";
+    }
+
+    if (mbps < 0.2) {
+      return "error";
+    }
+
+    if (mbps < 0.7) {
+      return "warn";
+    }
+
+    return "ok";
+  }
+
+  function viewerQualityLabel(mbps: number | null) {
+    if (mbps === null) {
+      return "qualite en attente";
+    }
+
+    if (mbps < 0.2) {
+      return "qualite faible";
+    }
+
+    if (mbps < 0.7) {
+      return "qualite moyenne";
+    }
+
+    if (mbps < 1.6) {
+      return "qualite bonne";
+    }
+
+    return "qualite excellente";
   }
 
   function formatSignalPayload(type: SignalMessage["type"], payload: unknown) {
@@ -1139,6 +1241,32 @@
     }
   }
 
+  function toggleMetricsPanel() {
+    metricsPanelOpen = !metricsPanelOpen;
+  }
+
+  function syncViewerFullscreenState() {
+    viewerFullscreenActive = !!viewerShellEl && document.fullscreenElement === viewerShellEl;
+  }
+
+  async function toggleViewerFullscreen() {
+    if (!viewerShellEl) {
+      return;
+    }
+
+    if (document.fullscreenElement === viewerShellEl) {
+      await document.exitFullscreen();
+      return;
+    }
+
+    await viewerShellEl.requestFullscreen();
+  }
+
+  function toggleViewerExpanded() {
+    viewerExpanded = !viewerExpanded;
+    revealViewerControls();
+  }
+
   async function connectSignaling() {
     const current = queriedSession ?? activeSession;
     if (!current) {
@@ -1316,11 +1444,16 @@
   onMount(() => {
     const handleKeyDown = (event: KeyboardEvent) => handleViewerDocumentKeyDown(event);
     const handleKeyUp = (event: KeyboardEvent) => handleViewerDocumentKeyUp(event);
+    const handleFullscreenChange = () => syncViewerFullscreenState();
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
     detachViewerInputListeners = () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
+    };
+    detachViewerFullscreenListener = () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
     };
 
     void syncAgentLifecycle();
@@ -1337,6 +1470,8 @@
   onDestroy(() => {
     detachViewerInputListeners?.();
     detachViewerInputListeners = null;
+    detachViewerFullscreenListener?.();
+    detachViewerFullscreenListener = null;
     clearInterval(metricsTimer);
     clearInterval(agentsTimer);
     if (approvalTimer) clearInterval(approvalTimer);
@@ -1380,19 +1515,43 @@
     </div>
   </header>
 
-  <section class="grid metrics">
-    <article class="card metric-card">
-      <h2>CPU</h2>
-      <p class="big">{metrics ? `${metrics.cpuUsage.toFixed(1)}%` : "-"}</p>
-    </article>
-    <article class="card metric-card">
-      <h2>RAM</h2>
-      <p class="big">{metrics ? `${metrics.ramUsage.toFixed(1)}%` : "-"}</p>
-    </article>
-    <article class="card metric-card">
-      <h2>Disque</h2>
-      <p class="big">{metrics ? `${metrics.diskUsage.toFixed(1)}%` : "-"}</p>
-    </article>
+  <section class="card metrics-panel">
+    <button class="metrics-summary" type="button" onclick={toggleMetricsPanel}>
+      <div>
+        <h2>Mesures de cet agent</h2>
+        <p class="hint top-gap">
+          {metricsPanelOpen ? "Cliquez pour masquer le detail." : "Cliquez pour afficher CPU, RAM et disque."}
+        </p>
+      </div>
+      <div class="row">
+        <span class={`pill ${metrics && !metricsError ? "ok" : "muted"}`}>
+          {metricsLoading ? "chargement" : metricsError ? "indisponible" : "mesures recues"}
+        </span>
+        <span class="pill muted">{metricsPanelOpen ? "masquer" : "ouvrir"}</span>
+      </div>
+    </button>
+
+    {#if metricsPanelOpen}
+      <div class="grid metrics top-gap">
+        <article class="metric-card metric-tile">
+          <h3>CPU</h3>
+          <p class="big">{metrics ? `${metrics.cpuUsage.toFixed(1)}%` : "-"}</p>
+        </article>
+        <article class="metric-card metric-tile">
+          <h3>RAM</h3>
+          <p class="big">{metrics ? `${metrics.ramUsage.toFixed(1)}%` : "-"}</p>
+        </article>
+        <article class="metric-card metric-tile">
+          <h3>Disque</h3>
+          <p class="big">{metrics ? `${metrics.diskUsage.toFixed(1)}%` : "-"}</p>
+        </article>
+      </div>
+      <p class="hint top-gap">
+        {metrics
+          ? `Derniere mesure: ${new Date(metrics.timestamp).toLocaleTimeString()}`
+          : metricsError || "Aucune mesure disponible pour le moment."}
+      </p>
+    {/if}
   </section>
 
   <section class="card">
@@ -1430,21 +1589,33 @@
 
   <section class="grid actions">
     <article class="card">
-      <h2>Connexion par code</h2>
-      <div class="row">
-        <input bind:value={connectionCode} placeholder="Code de connexion" />
-        <button onclick={startSessionWithCode} disabled={actionLoading}>Lancer</button>
+      <h2>Code de connexion de cet agent</h2>
+      <p class="hint top-gap">Partagez ce code au technicien pour un demarrage rapide.</p>
+      <div class="connection-code-card top-gap">
+        <div>
+          <span class="session-kv-label">Machine locale</span>
+          <strong>{localMachineId || "indisponible"}</strong>
+        </div>
+        <div class="connection-code-row">
+          <span class="connection-code-value">
+            {localConnectionCodeLoading ? "Chargement..." : localConnectionCode || "Code indisponible"}
+          </span>
+          <button onclick={copyLocalConnectionCode} disabled={!localConnectionCode}>Copier</button>
+        </div>
+        {#if connectionCodeCopied}
+          <p class="hint ok">Code copie.</p>
+        {/if}
+        {#if localConnectionCodeError}
+          <p class="error top-gap">{localConnectionCodeError}</p>
+        {/if}
       </div>
     </article>
 
     <article class="card">
-      <h2>Recherche par token</h2>
+      <h2>Connexion par code</h2>
       <div class="row">
-        <input bind:value={sessionTokenQuery} placeholder="Token de session" />
-        <button onclick={lookupSession} disabled={actionLoading}>Rechercher</button>
-      </div>
-      <div class="row top-gap">
-        <button class="danger" onclick={stopByToken} disabled={actionLoading}>Arreter la session</button>
+        <input bind:value={connectionCode} placeholder="Code de connexion" />
+        <button onclick={startSessionWithCode} disabled={actionLoading}>Lancer</button>
       </div>
     </article>
   </section>
@@ -1523,15 +1694,21 @@
   </section>
 
   {#if queriedSession?.status === "ACTIVE" && selectedFeature === "screen"}
-  <section class="card remote-session-card">
+  <section class:expanded={viewerExpanded} class="card remote-session-card">
     <div class="row between">
-      <div>
+      <div class="remote-session-heading">
         <h2>Controle distant</h2>
-        <p class="hint top-gap">Flux ecran en direct avec controle souris et clavier via WebRTC.</p>
+        <p class="hint top-gap">Acces visuel temps reel avec commandes souris et clavier sur la machine distante.</p>
       </div>
-      <div class="row">
-        <button onclick={connectSignaling} disabled={actionLoading || signalingConnected}>Reconnect</button>
-        <button onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>Disconnect</button>
+      <div class="row remote-session-actions">
+        <button onclick={toggleViewerExpanded}>
+          {viewerExpanded ? "Taille normale" : "Agrandir"}
+        </button>
+        <button onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream && !screenFrameUrl}>
+          {viewerFullscreenActive ? "Quitter plein ecran" : "Plein ecran"}
+        </button>
+        <button onclick={connectSignaling} disabled={actionLoading || signalingConnected}>Reconnecter</button>
+        <button class="danger-ghost" onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>Deconnecter</button>
       </div>
     </div>
 
@@ -1544,40 +1721,60 @@
     {/if}
 
     <div class="top-gap viewer-status-bar">
-      <div class="viewer-status-stack">
-        <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerConnectionState}</span>
-        <span class={`pill ${viewerRemoteStream || screenFrameUrl ? "ok" : "muted"}`}>
-          {viewerRemoteStream ? "webrtc" : screenFrameUrl ? "frame" : "waiting"}
-        </span>
-        <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
-          {queriedSession?.allowRemoteInput === false
-            ? "lecture seule"
-            : viewerDataChannelOpen
-              ? viewerKeyboardCaptured
-                ? "clavier + souris actifs"
-                : "souris active - cliquez la video pour le clavier"
-              : "input en attente"}
-        </span>
-        {#if viewerRemoteStream || screenFrameUrl}
-          <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
-        {/if}
-        {#if viewerStreamMbps !== null}
-          <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
-        {/if}
-        {#if viewerStreamFps !== null}
-          <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
-        {/if}
+      <div class="viewer-status-summary">
+        <div class="viewer-summary-tile">
+          <span class="session-kv-label">Etat</span>
+          <div class="viewer-status-stack">
+            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
+            <span class={`pill ${viewerRemoteStream || screenFrameUrl ? "ok" : "muted"}`}>
+              {viewerRemoteStream ? "flux live" : screenFrameUrl ? "apercu" : "en attente"}
+            </span>
+          </div>
+        </div>
+        <div class="viewer-summary-tile">
+          <span class="session-kv-label">Controle</span>
+          <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
+            {queriedSession?.allowRemoteInput === false
+              ? "lecture seule"
+              : viewerDataChannelOpen
+                ? viewerKeyboardCaptured
+                  ? "clavier + souris actifs"
+                  : "souris active - cliquez la video pour le clavier"
+                : "input en attente"}
+          </span>
+        </div>
+        <div class="viewer-summary-tile">
+          <span class="session-kv-label">Qualite</span>
+          <div class="viewer-status-stack">
+            <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
+            {#if viewerStreamMbps !== null}
+              <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
+            {/if}
+            {#if viewerStreamFps !== null}
+              <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
+            {/if}
+          </div>
+        </div>
+        <div class="viewer-summary-tile">
+          <span class="session-kv-label">Affichage</span>
+          <div class="viewer-status-stack">
+            {#if viewerRemoteStream || screenFrameUrl}
+              <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
+            {/if}
+            <span class="pill muted">{viewerFullscreenActive ? "plein ecran" : viewerExpanded ? "agrandi" : "standard"}</span>
+          </div>
+        </div>
       </div>
       <p class="hint control-hint">
-        Bougez la souris dans la video pour afficher les controles. Cliquez dans la video pour prendre la main clavier.
+        Bougez la souris dans la video pour afficher les commandes. Cliquez dans la video pour activer le clavier distant.
       </p>
     </div>
 
     <div class="top-gap screen-frame-panel">
-      <div class="video-shell" role="presentation" onmousemove={revealViewerControls}>
+      <div bind:this={viewerShellEl} class="video-shell" role="presentation" onmousemove={revealViewerControls}>
         <div class:visible={viewerControlsVisible || viewerConnectionState !== "connected"} class="remote-toolbar">
-          <div class="viewer-status-stack">
-            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerConnectionState}</span>
+          <div class="viewer-toolbar-group">
+            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
             <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
               {queriedSession?.allowRemoteInput === false
                 ? "lecture seule"
@@ -1586,7 +1783,8 @@
                   : "input en attente"}
             </span>
           </div>
-          <div class="viewer-status-stack">
+          <div class="viewer-toolbar-group">
+            <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
             {#if viewerStreamMbps !== null}
               <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
             {/if}
@@ -1596,6 +1794,15 @@
             {#if viewerRemoteStream || screenFrameUrl}
               <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
             {/if}
+            <button class="toolbar-btn" onclick={toggleViewerExpanded}>
+              {viewerExpanded ? "Normal" : "Agrandir"}
+            </button>
+            <button class="toolbar-btn" onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream && !screenFrameUrl}>
+              {viewerFullscreenActive ? "Quitter" : "Plein ecran"}
+            </button>
+            <button class="toolbar-btn danger-ghost" onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>
+              Deconnecter
+            </button>
           </div>
         </div>
 
@@ -1636,7 +1843,7 @@
     </div>
 
     <details class="debug-panel top-gap">
-      <summary>Debug signaling ({signalLogs.length})</summary>
+      <summary>Diagnostic signaling ({signalLogs.length})</summary>
 
       {#if signalLogs.length === 0}
         <p class="hint debug-empty">Aucun evenement signaling pour le moment.</p>
@@ -1910,6 +2117,35 @@
     background: linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.72));
   }
 
+  .metrics-panel {
+    display: grid;
+    gap: 12px;
+  }
+
+  .metrics-summary {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    padding: 0;
+  }
+
+  .metric-tile {
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 14px;
+    padding: 16px;
+  }
+
+  .metric-tile h3 {
+    margin: 0;
+    font-size: 1rem;
+    color: #cbd5e1;
+  }
+
   .agent-item {
     background: linear-gradient(180deg, rgba(15, 23, 42, 0.48), rgba(15, 23, 42, 0.24));
   }
@@ -1948,6 +2184,36 @@
 
   .session-toolbar {
     padding-top: 2px;
+  }
+
+  .connection-code-card {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 14px;
+    background: rgba(15, 23, 42, 0.42);
+  }
+
+  .connection-code-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .connection-code-value {
+    display: inline-flex;
+    align-items: center;
+    min-height: 48px;
+    padding: 0 16px;
+    border-radius: 12px;
+    border: 1px solid rgba(125, 211, 252, 0.22);
+    background: rgba(15, 23, 42, 0.75);
+    color: #e0f2fe;
+    font-size: 1.35rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
   }
 
   input,
@@ -2003,6 +2269,19 @@
     gap: 14px;
   }
 
+  .remote-session-card.expanded {
+    max-width: min(1500px, calc(100vw - 32px));
+  }
+
+  .remote-session-heading {
+    display: grid;
+    gap: 4px;
+  }
+
+  .remote-session-actions {
+    justify-content: flex-end;
+  }
+
   .viewer-status-bar,
   .viewer-status-stack {
     display: flex;
@@ -2014,6 +2293,22 @@
   .viewer-status-bar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .viewer-status-summary {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+  }
+
+  .viewer-summary-tile {
+    display: grid;
+    gap: 8px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: rgba(15, 23, 42, 0.42);
   }
 
   .control-hint {
@@ -2038,6 +2333,23 @@
     min-height: 320px;
   }
 
+  .remote-session-card.expanded .video-shell {
+    min-height: 72vh;
+  }
+
+  .video-shell:fullscreen {
+    border-radius: 0;
+    border: 0;
+    min-height: 100vh;
+    background: #020617;
+  }
+
+  .video-shell:fullscreen .viewer-video,
+  .video-shell:fullscreen .screen-preview {
+    max-height: 100vh;
+    height: 100vh;
+  }
+
   .remote-toolbar {
     position: absolute;
     top: 0;
@@ -2046,6 +2358,7 @@
     z-index: 2;
     display: flex;
     justify-content: space-between;
+    align-items: flex-start;
     gap: 12px;
     padding: 14px;
     background: linear-gradient(180deg, rgba(2, 6, 23, 0.94), rgba(2, 6, 23, 0.35) 72%, rgba(2, 6, 23, 0));
@@ -2058,6 +2371,27 @@
   .remote-toolbar.visible {
     opacity: 1;
     transform: translateY(0);
+  }
+
+  .viewer-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .toolbar-btn {
+    padding: 6px 10px;
+    min-height: 34px;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.24);
+  }
+
+  .danger-ghost {
+    border-color: rgba(248, 113, 113, 0.42);
+    color: #fecaca;
+    background: rgba(127, 29, 29, 0.18);
   }
 
   .viewer-video {
@@ -2275,6 +2609,10 @@
     .remote-toolbar {
       flex-direction: column;
       align-items: flex-start;
+    }
+
+    .remote-session-actions {
+      justify-content: flex-start;
     }
   }
 </style>
