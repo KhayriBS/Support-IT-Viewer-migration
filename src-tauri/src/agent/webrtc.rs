@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::sync::Arc;
 
+use super::input_handler::InputHandler;
+use super::signaling::SignalingClient;
 use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, RateControlMode, UsageType};
 use openh264::formats::{BgraSliceU8, YUVBuffer};
@@ -16,6 +18,8 @@ use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::interceptor::registry::Registry;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -30,7 +34,11 @@ pub struct AgentWebRtc {
 }
 
 impl AgentWebRtc {
-    pub async fn new() -> Result<Self, String> {
+    pub async fn new(
+        signaling: Arc<SignalingClient>,
+        input_handler: Arc<InputHandler>,
+        allow_remote_input: bool,
+    ) -> Result<Self, String> {
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -58,6 +66,84 @@ impl AgentWebRtc {
                 .await
                 .map_err(|e| format!("new_peer_connection failed: {e}"))?,
         );
+
+        let signaling_for_ice = Arc::clone(&signaling);
+        peer.on_ice_candidate(Box::new(move |candidate| {
+            let signaling = Arc::clone(&signaling_for_ice);
+            Box::pin(async move {
+                let Some(candidate) = candidate else {
+                    return;
+                };
+
+                match candidate.to_json() {
+                    Ok(init) => {
+                        let sdp_mid = init.sdp_mid.filter(|mid| !mid.is_empty());
+                        let payload = serde_json::json!({
+                            "candidate": init.candidate,
+                            "sdpMid": sdp_mid,
+                            "sdpMLineIndex": init.sdp_mline_index,
+                        });
+
+                        if let Err(err) = signaling.send_ice_candidate(payload).await {
+                            eprintln!("⚠️ Failed to send local ICE candidate: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("⚠️ Failed to serialize local ICE candidate: {err}");
+                    }
+                }
+            })
+        }));
+
+        peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
+            let input_handler = Arc::clone(&input_handler);
+            Box::pin(async move {
+                let label = channel.label().to_string();
+                println!("DataChannel recu: {label}");
+
+                let open_label = label.clone();
+                channel.on_open(Box::new(move || {
+                    Box::pin(async move {
+                        println!("DataChannel ouvert: {open_label}");
+                    })
+                }));
+
+                let close_label = label.clone();
+                channel.on_close(Box::new(move || {
+                    let close_label = close_label.clone();
+                    Box::pin(async move {
+                        println!("DataChannel ferme: {close_label}");
+                    })
+                }));
+
+                if label != "input" {
+                    return;
+                }
+
+                let message_label = label.clone();
+                channel.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let input_handler = Arc::clone(&input_handler);
+                    let message_label = message_label.clone();
+                    Box::pin(async move {
+                        if !msg.is_string {
+                            return;
+                        }
+
+                        let Ok(message) = String::from_utf8(msg.data.to_vec()) else {
+                            eprintln!("Message DataChannel invalide sur {message_label}");
+                            return;
+                        };
+
+                        if !allow_remote_input {
+                            println!("Input distant ignore (lecture seule)");
+                            return;
+                        }
+
+                        input_handler.handle_input(&message);
+                    })
+                }));
+            })
+        }));
 
         // Add a real outgoing H.264 video track (screen share).
         // The viewer already creates a recvonly transceiver for video.

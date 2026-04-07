@@ -18,6 +18,7 @@ use super::auth::{AgentAuthService, PendingSession};
 use super::file_transfer::{FileListResponse, FileTransferService};
 use super::input_handler::InputHandler;
 use super::metrics::MetricsCollector;
+use super::screen_capture::capture_primary_jpeg_base64;
 use super::signaling::{SignalEvent, SignalType, SignalingClient};
 use super::webrtc::AgentWebRtc;
 
@@ -235,7 +236,7 @@ pub async fn join_session(
 
     let allow_input       = pending.allow_remote_input;
     let allow_file_xfer   = pending.allow_file_transfer;
-    let input_handler     = InputHandler::new();
+    let input_handler     = Arc::new(InputHandler::new());
     let file_service      = FileTransferService::new();
     let state_for_signals = Arc::clone(&state);
     let token_clone       = pending.signaling_token.clone();
@@ -263,7 +264,7 @@ pub async fn join_session(
                         Arc::clone(&state_for_signals),
                         allow_input,
                         allow_file_xfer,
-                        &input_handler,
+                        Arc::clone(&input_handler),
                         &file_service,
                     ).await;
                     
@@ -313,7 +314,7 @@ async fn dispatch_signals(
     state: Arc<SharedState>,
     allow_input: bool,
     allow_file_xfer: bool,
-    input_handler: &InputHandler,
+    input_handler: Arc<InputHandler>,
     file_service: &FileTransferService,
 ) {
     // Upload state (mirrors _uploadingFilePath/_uploadingFileAppend in C#)
@@ -321,6 +322,7 @@ async fn dispatch_signals(
     let mut uploading_append = false;
     let mut webrtc: Option<AgentWebRtc> = None;
     let mut h264_sender_started = false;
+    let mut startup_preview_started = false;
 
     while let Some(msg) = event_rx.recv().await {
         let sig_client = {
@@ -338,7 +340,11 @@ async fn dispatch_signals(
                 println!("📥 Offer SDP reçu du viewer");
 
                 if webrtc.is_none() {
-                    match AgentWebRtc::new().await {
+                    match AgentWebRtc::new(
+                        Arc::clone(&sig),
+                        Arc::clone(&input_handler),
+                        allow_input,
+                    ).await {
                         Ok(pc) => {
                             println!("🔧 WebRTC initialisé");
                             webrtc = Some(pc);
@@ -357,6 +363,34 @@ async fn dispatch_signals(
                                 eprintln!("❌ Envoi ANSWER échoué: {e}");
                             } else {
                                 println!("📤 Answer SDP envoyé");
+
+                                if !startup_preview_started {
+                                    let preview_sig = Arc::clone(&sig);
+                                    tokio::spawn(async move {
+                                        for _ in 0..6 {
+                                            match capture_primary_jpeg_base64(55) {
+                                                Ok(frame) => {
+                                                    let payload = serde_json::json!({
+                                                        "kind": "screen-frame",
+                                                        "mime": "image/jpeg",
+                                                        "data": frame,
+                                                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                                                    });
+
+                                                    if let Err(err) = preview_sig.send_screen_frame(payload).await {
+                                                        eprintln!("⚠️ Envoi preview écran échoué: {err}");
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("⚠️ Capture preview écran échouée: {err}");
+                                                }
+                                            }
+
+                                            tokio::time::sleep(Duration::from_millis(900)).await;
+                                        }
+                                    });
+                                    startup_preview_started = true;
+                                }
 
                                 if !h264_sender_started {
                                     if let Some(pc) = webrtc.as_ref() {
@@ -499,10 +533,6 @@ async fn dispatch_signals(
             }
         }
 
-        // Pass input commands to the handler (when received via signaling
-        // as a fallback — the real path is via WebRTC DataChannel)
-        let _ = input_handler; // keep alive; unused until WebRTC integration
-        let _ = allow_input;
     }
 }
 

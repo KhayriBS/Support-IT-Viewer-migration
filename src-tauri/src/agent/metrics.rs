@@ -1,28 +1,8 @@
-//! System metrics collection module.
-//!
-//! Migrated from C# sources:
-//! - `AgentMetrics.cs`      → `AgentMetrics` struct
-//! - `CpuUsageReader.cs`    → `MetricsCollector::get_cpu_usage()`
-//! - `MemoryUsageReader.cs` → `MetricsCollector::get_ram_usage()`
-//! - `DiskUsageReader.cs`   → `MetricsCollector::get_disk_usage()`
-//!
-//! Key improvements over C#:
-//! - No `Thread.Sleep(500)` blocking call (sysinfo refreshes async-friendly)
-//! - Cross-platform (works on Linux/macOS too, not just Windows PerformanceCounter)
-//! - Thread-safe via `Mutex<System>` singleton
+
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use sysinfo::{Disks, System};
-
-// ─── AgentMetrics struct ──────────────────────────────────────────────────────
-// Equivalent C#:
-//   public class AgentMetrics {
-//       public double CpuUsage { get; set; }
-//       public double RamUsage { get; set; }
-//       public double DiskUsage { get; set; }
-//       public long Timestamp { get; set; }
-//   }
 
 /// System metrics snapshot sent to the signaling server via `POST /agents/metrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,26 +19,15 @@ pub struct AgentMetrics {
 }
 
 // ─── MetricsCollector ─────────────────────────────────────────────────────────
-// Replaces the three static C# classes (CpuUsageReader, MemoryUsageReader, DiskUsageReader)
-// with a single collector that holds a `sysinfo::System` instance.
 
-/// Collects system metrics (CPU, RAM, disk).
-///
-/// Holds a `sysinfo::System` that gets refreshed on each snapshot.
-/// The C# version used Windows `PerformanceCounter` with a blocking `Thread.Sleep(500)`.
-/// This version uses `sysinfo` which collects data without blocking.
 pub struct MetricsCollector {
     system: Mutex<System>,
 }
 
 impl MetricsCollector {
-    /// Creates a new `MetricsCollector`.
-    ///
-    /// Equivalent to the C# static constructors in `CpuUsageReader` and `MemoryUsageReader`
-    /// which called `cpuCounter.NextValue()` to prime the counter.
+
     pub fn new() -> Self {
         let mut sys = System::new_all();
-        // Prime the CPU measurement (like C#: cpuCounter.NextValue() in static ctor)
         sys.refresh_cpu_usage();
         Self {
             system: Mutex::new(sys),
@@ -66,16 +35,7 @@ impl MetricsCollector {
     }
 
     /// Collects a full metrics snapshot.
-    ///
-    /// Equivalent to the C# `Program.cs` block:
-    /// ```csharp
-    /// var metrics = new AgentMetrics {
-    ///     CpuUsage  = CpuUsageReader.GetCpuUsage(),
-    ///     RamUsage  = MemoryUsageReader.GetRamUsage(),
-    ///     DiskUsage = DiskUsageReader.GetDiskUsage("C"),
-    ///     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-    /// };
-    /// ```
+  
     pub fn collect(&self) -> AgentMetrics {
         let cpu = self.get_cpu_usage();
         let ram = self.get_ram_usage();
@@ -91,16 +51,7 @@ impl MetricsCollector {
     }
 
     /// Returns overall CPU usage as a percentage (0.0 – 100.0).
-    ///
-    /// C# equivalent (`CpuUsageReader.cs`):
-    /// ```csharp
-    /// private static readonly PerformanceCounter cpuCounter =
-    ///     new PerformanceCounter("Processor", "% Processor Time", "_Total");
-    /// public static float GetCpuUsage() {
-    ///     Thread.Sleep(500);  // ← REMOVED: sysinfo doesn't need this
-    ///     return (float)Math.Round(cpuCounter.NextValue(), 2);
-    /// }
-    /// ```
+
     pub fn get_cpu_usage(&self) -> f64 {
         let mut sys = self.system.lock().unwrap();
         sys.refresh_cpu_usage();
@@ -117,15 +68,7 @@ impl MetricsCollector {
     }
 
     /// Returns RAM usage as a percentage (0.0 – 100.0).
-    ///
-    /// C# equivalent (`MemoryUsageReader.cs`):
-    /// ```csharp
-    /// private static readonly PerformanceCounter ramCounter =
-    ///     new PerformanceCounter("Memory", "% Committed Bytes In Use");
-    /// public static float GetRamUsage() {
-    ///     return (float)Math.Round(ramCounter.NextValue(), 2);
-    /// }
-    /// ```
+
     pub fn get_ram_usage(&self) -> f64 {
         let mut sys = self.system.lock().unwrap();
         sys.refresh_memory();
@@ -141,20 +84,7 @@ impl MetricsCollector {
     }
 
     /// Returns disk usage for the primary drive as a percentage (0.0 – 100.0).
-    ///
-    /// C# equivalent (`DiskUsageReader.cs`):
-    /// ```csharp
-    /// public static float GetDiskUsage(string driveLetter = "C") {
-    ///     DriveInfo drive = new DriveInfo(driveLetter);
-    ///     if (!drive.IsReady) return 0;
-    ///     double total = drive.TotalSize;
-    ///     double free  = drive.TotalFreeSpace;
-    ///     double usedPercent = ((total - free) / total) * 100;
-    ///     return (float)Math.Round(usedPercent, 2);
-    /// }
-    /// ```
-    ///
-    /// On Windows, looks for the `C:\` drive. On other platforms, looks for `/`.
+ 
     pub fn get_disk_usage(&self) -> f64 {
         let disks = Disks::new_with_refreshed_list();
 

@@ -53,12 +53,44 @@
   let detachCloseListener: (() => void) | null = null;
   let detachErrorListener: (() => void) | null = null;
   let viewerPeerConnection: RTCPeerConnection | null = null;
+  let viewerControlChannel: RTCDataChannel | null = null;
+  let viewerAnswerReceived = false;
+  let viewerOfferRetryTimer: ReturnType<typeof setInterval> | null = null;
+  let viewerOfferRetryCount = 0;
+  const maxViewerOfferRetries = 8;
+  let viewerControlsTimer: ReturnType<typeof setTimeout> | null = null;
+  let detachViewerInputListeners: (() => void) | null = null;
   let viewerVideoEl = $state<HTMLVideoElement | null>(null);
   let viewerRemoteStream = $state<MediaStream | null>(null);
+  let viewerDataChannelOpen = $state(false);
+  let viewerKeyboardCaptured = $state(false);
+  let viewerConnectionState = $state<string>("idle");
+  let viewerControlsVisible = $state(true);
+  let viewerRemoteWidth = $state(1920);
+  let viewerRemoteHeight = $state(1080);
+  let viewerStreamMbps = $state<number | null>(null);
+  let viewerStreamFps = $state<number | null>(null);
   let screenFrameUrl = $state<string>("");
   let screenFrameAt = $state<string>("");
   let screenFrameCount = $state<number>(0);
   let screenFrameError = $state<string | null>(null);
+
+  interface RemoteInputEvent {
+    type: string;
+    x?: number;
+    y?: number;
+    button?: number;
+    deltaY?: number;
+    key?: string;
+    code?: string;
+    keyCode?: number;
+    modifiers?: {
+      ctrl?: boolean;
+      alt?: boolean;
+      shift?: boolean;
+      meta?: boolean;
+    };
+  }
 
   let metricsTimer: ReturnType<typeof setInterval>;
   let agentsTimer: ReturnType<typeof setInterval>;
@@ -423,18 +455,74 @@
     }
   }
 
+  function viewerStateClass(state: string) {
+    switch (state) {
+      case "connected":
+        return "ok";
+      case "failed":
+      case "disconnected":
+      case "closed":
+        return "error";
+      case "connecting":
+      case "new":
+        return "warn";
+      default:
+        return "muted";
+    }
+  }
+
+  function formatSignalPayload(type: SignalMessage["type"], payload: unknown) {
+    if (payload === undefined || payload === null) {
+      return "";
+    }
+
+    if (type === "OFFER" || type === "ANSWER") {
+      const record = payload as Record<string, unknown>;
+      const sdp = typeof record?.sdp === "string" ? record.sdp : "";
+      const label = typeof record?.type === "string" ? record.type : type.toLowerCase();
+      return `SDP ${label} • ${sdp.length} chars`;
+    }
+
+    if (type === "ICE") {
+      const record = payload as Record<string, unknown>;
+      const candidate = typeof record?.candidate === "string" ? record.candidate : "";
+      return candidate.length > 96 ? `${candidate.slice(0, 96)}...` : candidate || "ICE candidate";
+    }
+
+    if (type === "STREAM_STATS") {
+      const record = payload as Record<string, unknown>;
+      const mbps = Number(record?.mbps ?? 0);
+      const fps = Number(record?.fps ?? 0);
+      return `${mbps.toFixed(2)} Mbps • ${fps.toFixed(1)} FPS`;
+    }
+
+    if (type === "FILE_DATA") {
+      const record = payload as Record<string, unknown>;
+      if (typeof record?.chunkIndex === "number") {
+        return `File chunk ${record.chunkIndex}`;
+      }
+      return "Screen frame";
+    }
+
+    const payloadText = JSON.stringify(payload);
+    return payloadText.length > 180 ? `${payloadText.slice(0, 180)}...` : payloadText;
+  }
+
   function logSignal(direction: "in" | "out", msg: SignalMessage) {
-    const payloadText = msg.payload === undefined ? "" : JSON.stringify(msg.payload);
+    if (msg.type === "FILE_DATA" || msg.type === "STREAM_STATS") {
+      return;
+    }
+
     const next: SignalLogEntry = {
       timestamp: new Date().toLocaleTimeString(),
       direction,
       type: msg.type,
       from: msg.from ?? "",
       to: msg.to,
-      payload: payloadText
+      payload: formatSignalPayload(msg.type, msg.payload)
     };
 
-    signalLogs = [next, ...signalLogs].slice(0, 30);
+    signalLogs = [next, ...signalLogs].slice(0, 16);
   }
 
   function clearSignalingListeners() {
@@ -446,7 +534,290 @@
     detachErrorListener = null;
   }
 
+  function stopViewerOfferRetry() {
+    if (viewerOfferRetryTimer) {
+      clearInterval(viewerOfferRetryTimer);
+      viewerOfferRetryTimer = null;
+    }
+  }
+
+  function stopViewerControlsAutoHide() {
+    if (viewerControlsTimer) {
+      clearTimeout(viewerControlsTimer);
+      viewerControlsTimer = null;
+    }
+  }
+
+  function revealViewerControls() {
+    viewerControlsVisible = true;
+
+    if (viewerConnectionState !== "connected") {
+      stopViewerControlsAutoHide();
+      return;
+    }
+
+    stopViewerControlsAutoHide();
+    viewerControlsTimer = setTimeout(() => {
+      viewerControlsVisible = false;
+    }, 3000);
+  }
+
+  function configureViewerDataChannel(channel: RTCDataChannel) {
+    viewerControlChannel = channel;
+    viewerDataChannelOpen = channel.readyState === "open";
+
+    channel.onopen = () => {
+      viewerControlChannel = channel;
+      viewerDataChannelOpen = true;
+      screenFrameError = null;
+    };
+
+    channel.onclose = () => {
+      if (viewerControlChannel === channel) {
+        viewerDataChannelOpen = false;
+        viewerKeyboardCaptured = false;
+      }
+    };
+
+    channel.onerror = () => {
+      if (viewerControlChannel === channel) {
+        viewerDataChannelOpen = false;
+        viewerKeyboardCaptured = false;
+      }
+    };
+  }
+
+  function canSendViewerInput() {
+    const current = queriedSession ?? activeSession;
+    return (
+      selectedFeature === "screen" &&
+      current?.status === "ACTIVE" &&
+      current.allowRemoteInput !== false &&
+      viewerDataChannelOpen &&
+      !!viewerControlChannel
+    );
+  }
+
+  function canSendViewerKeyboardInput() {
+    return canSendViewerInput() && viewerKeyboardCaptured;
+  }
+
+  function sendViewerInput(event: RemoteInputEvent) {
+    if (!canSendViewerInput() || !viewerControlChannel) {
+      return false;
+    }
+
+    try {
+      viewerControlChannel.send(JSON.stringify(event));
+      return true;
+    } catch {
+      viewerDataChannelOpen = false;
+      viewerKeyboardCaptured = false;
+      return false;
+    }
+  }
+
+  function syncViewerVideoMetadata(videoEl: HTMLVideoElement) {
+    if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+      viewerRemoteWidth = videoEl.videoWidth;
+      viewerRemoteHeight = videoEl.videoHeight;
+    }
+  }
+
+  function handleViewerVideoFocus() {
+    viewerKeyboardCaptured = true;
+    revealViewerControls();
+  }
+
+  function handleViewerVideoBlur() {
+    viewerKeyboardCaptured = false;
+  }
+
+  function getViewerPointerPosition(event: MouseEvent) {
+    const videoEl = viewerVideoEl;
+    if (!videoEl) {
+      return null;
+    }
+
+    const rect = videoEl.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+
+    const scaleX = viewerRemoteWidth / rect.width;
+    const scaleY = viewerRemoteHeight / rect.height;
+    const x = Math.min(Math.max(Math.round((event.clientX - rect.left) * scaleX), 0), viewerRemoteWidth - 1);
+    const y = Math.min(Math.max(Math.round((event.clientY - rect.top) * scaleY), 0), viewerRemoteHeight - 1);
+
+    return { x, y };
+  }
+
+  function handleViewerMouseMove(event: MouseEvent) {
+    revealViewerControls();
+
+    if (!canSendViewerInput()) {
+      return;
+    }
+
+    const position = getViewerPointerPosition(event);
+    if (!position) {
+      return;
+    }
+
+    void sendViewerInput({
+      type: "mouse-move",
+      x: position.x,
+      y: position.y
+    });
+  }
+
+  function handleViewerMouseDown(event: MouseEvent) {
+    revealViewerControls();
+
+    if (!canSendViewerInput()) {
+      return;
+    }
+
+    event.preventDefault();
+    viewerVideoEl?.focus();
+
+    const position = getViewerPointerPosition(event);
+    if (!position) {
+      return;
+    }
+
+    void sendViewerInput({
+      type: "mouse-down",
+      button: event.button,
+      x: position.x,
+      y: position.y
+    });
+  }
+
+  function handleViewerMouseUp(event: MouseEvent) {
+    revealViewerControls();
+
+    if (!canSendViewerInput()) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const position = getViewerPointerPosition(event);
+    if (!position) {
+      return;
+    }
+
+    void sendViewerInput({
+      type: "mouse-up",
+      button: event.button,
+      x: position.x,
+      y: position.y
+    });
+  }
+
+  function handleViewerDoubleClick(event: MouseEvent) {
+    revealViewerControls();
+
+    if (!canSendViewerInput()) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const position = getViewerPointerPosition(event);
+    if (!position) {
+      return;
+    }
+
+    void sendViewerInput({
+      type: "dblclick",
+      button: event.button,
+      x: position.x,
+      y: position.y
+    });
+  }
+
+  function handleViewerWheel(event: WheelEvent) {
+    revealViewerControls();
+
+    if (!canSendViewerInput()) {
+      return;
+    }
+
+    event.preventDefault();
+    void sendViewerInput({
+      type: "wheel",
+      deltaY: event.deltaY
+    });
+  }
+
+  function isEditableTarget(target: EventTarget | null) {
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement
+    ) {
+      return true;
+    }
+
+    return target instanceof HTMLElement && target.isContentEditable;
+  }
+
+  function handleViewerDocumentKeyDown(event: KeyboardEvent) {
+    if (!canSendViewerKeyboardInput() || isEditableTarget(event.target)) {
+      return;
+    }
+
+    event.preventDefault();
+    void sendViewerInput({
+      type: "key-down",
+      key: event.key,
+      code: event.code,
+      modifiers: {
+        ctrl: event.ctrlKey,
+        alt: event.altKey,
+        shift: event.shiftKey,
+        meta: event.metaKey
+      }
+    });
+  }
+
+  function handleViewerDocumentKeyUp(event: KeyboardEvent) {
+    if (!canSendViewerKeyboardInput() || isEditableTarget(event.target)) {
+      return;
+    }
+
+    event.preventDefault();
+    void sendViewerInput({
+      type: "key-up",
+      key: event.key,
+      code: event.code
+    });
+  }
+
   function resetViewerPeerConnection() {
+    stopViewerOfferRetry();
+    stopViewerControlsAutoHide();
+    viewerAnswerReceived = false;
+    viewerOfferRetryCount = 0;
+    viewerDataChannelOpen = false;
+    viewerKeyboardCaptured = false;
+    viewerConnectionState = "idle";
+    viewerControlsVisible = true;
+    viewerRemoteWidth = 1920;
+    viewerRemoteHeight = 1080;
+    viewerStreamMbps = null;
+    viewerStreamFps = null;
+
+    try {
+      viewerControlChannel?.close();
+    } catch {
+      // ignore close errors
+    } finally {
+      viewerControlChannel = null;
+    }
+
     try {
       viewerPeerConnection?.close();
     } catch {
@@ -473,7 +844,37 @@
     screenFrameUrl = "";
     screenFrameAt = "";
     screenFrameCount = 0;
+    screenFrameError = null;
   }
+
+  $effect(() => {
+    const videoEl = viewerVideoEl;
+    const stream = viewerRemoteStream;
+
+    if (!videoEl) {
+      return;
+    }
+
+    const handleLoadedMetadata = () => {
+      syncViewerVideoMetadata(videoEl);
+    };
+    videoEl.addEventListener("loadedmetadata", handleLoadedMetadata);
+
+    if (videoEl.srcObject !== (stream ?? null)) {
+      videoEl.srcObject = stream;
+    }
+
+    if (stream) {
+      syncViewerVideoMetadata(videoEl);
+      void videoEl.play().catch(() => {
+        // Autoplay may still require a user gesture on some systems.
+      });
+    }
+
+    return () => {
+      videoEl.removeEventListener("loadedmetadata", handleLoadedMetadata);
+    };
+  });
 
   function ensureViewerPeerConnection(sessionId: string) {
     if (viewerPeerConnection) {
@@ -485,18 +886,30 @@
     });
 
     // Needed to produce an SDP offer even before media integration is complete.
-    pc.createDataChannel("control");
+    const inputChannel = pc.createDataChannel("input", { ordered: true });
+    configureViewerDataChannel(inputChannel);
     pc.addTransceiver("video", { direction: "recvonly" });
+
+    viewerConnectionState = pc.connectionState;
 
     pc.ontrack = (event) => {
       const stream = event.streams?.[0] ?? new MediaStream([event.track]);
       viewerRemoteStream = stream;
-      if (viewerVideoEl && viewerVideoEl.srcObject !== stream) {
-        viewerVideoEl.srcObject = stream;
-        void viewerVideoEl.play().catch(() => {
-          // Autoplay may be blocked until user gesture.
-        });
+      screenFrameError = null;
+    };
+
+    pc.onconnectionstatechange = () => {
+      viewerConnectionState = pc.connectionState;
+      if (pc.connectionState === "connected") {
+        revealViewerControls();
+        screenFrameError = null;
+      } else if (pc.connectionState === "failed") {
+        screenFrameError = "La connexion WebRTC a echoue.";
       }
+    };
+
+    pc.ondatachannel = (event) => {
+      configureViewerDataChannel(event.channel);
     };
 
     pc.onicecandidate = (event) => {
@@ -527,11 +940,10 @@
     return pc;
   }
 
-  async function sendViewerOffer(sessionId: string) {
-    const pc = ensureViewerPeerConnection(sessionId);
-    const offer = await pc.createOffer({ offerToReceiveVideo: true });
-    await pc.setLocalDescription(offer);
-
+  function sendViewerOfferPayload(
+    sessionId: string,
+    offer: Pick<RTCSessionDescriptionInit, "type" | "sdp">
+  ) {
     const offerMessage: SignalMessage = {
       type: "OFFER",
       to: "agent",
@@ -546,8 +958,61 @@
     logSignal("out", { ...offerMessage, from: "viewer" });
   }
 
+  function startViewerOfferRetry(
+    sessionId: string,
+    offer: Pick<RTCSessionDescriptionInit, "type" | "sdp">
+  ) {
+    stopViewerOfferRetry();
+    viewerOfferRetryCount = 0;
+
+    viewerOfferRetryTimer = setInterval(() => {
+      if (viewerAnswerReceived || viewerPeerConnection?.connectionState === "connected") {
+        stopViewerOfferRetry();
+        return;
+      }
+
+      if (!signalingClient.isConnected()) {
+        return;
+      }
+
+      if (viewerOfferRetryCount >= maxViewerOfferRetries) {
+        stopViewerOfferRetry();
+        if (!viewerAnswerReceived) {
+          screenFrameError = "Aucune reponse SDP recue. Le viewer a cesse de renvoyer l'offre.";
+        }
+        return;
+      }
+
+      viewerOfferRetryCount += 1;
+
+      try {
+        sendViewerOfferPayload(sessionId, offer);
+      } catch {
+        // ignore transient signaling send issues
+      }
+    }, 1000);
+  }
+
+  async function sendViewerOffer(sessionId: string) {
+    const pc = ensureViewerPeerConnection(sessionId);
+    const offer = await pc.createOffer({ offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+    viewerAnswerReceived = false;
+    screenFrameError = null;
+
+    sendViewerOfferPayload(sessionId, offer);
+    startViewerOfferRetry(sessionId, offer);
+  }
+
   async function handleIncomingSignal(message: SignalMessage) {
-    if (message.type === "FILE_DATA" || message.type === "STREAM_STATS") {
+    if (message.type === "STREAM_STATS") {
+      const payload = message.payload as Record<string, unknown> | null;
+      viewerStreamMbps = Number(payload?.mbps ?? 0);
+      viewerStreamFps = Number(payload?.fps ?? 0);
+      return;
+    }
+
+    if (message.type === "FILE_DATA") {
       const payload = message.payload as unknown;
 
       const extractFrame = (): { mime: string; data: string; timestamp?: string } | null => {
@@ -611,6 +1076,10 @@
         return;
       }
 
+      viewerAnswerReceived = true;
+      stopViewerOfferRetry();
+      screenFrameError = null;
+
       await pc.setRemoteDescription({
         type: payload.type as RTCSdpType,
         sdp: payload.sdp
@@ -629,11 +1098,15 @@
         return;
       }
 
-      await viewerPeerConnection.addIceCandidate({
-        candidate: payload.candidate,
-        sdpMid: payload.sdpMid ?? null,
-        sdpMLineIndex: payload.sdpMLineIndex ?? null
-      });
+      try {
+        await viewerPeerConnection.addIceCandidate({
+          candidate: payload.candidate,
+          sdpMid: payload.sdpMid ?? null,
+          sdpMLineIndex: payload.sdpMLineIndex ?? null
+        });
+      } catch (error) {
+        console.error("Failed to add remote ICE candidate", error);
+      }
     }
   }
 
@@ -647,6 +1120,12 @@
     });
     backendSessionSynced = true;
     backendSyncError = null;
+  }
+
+  function shouldBridgeSessionToLocalAgent(session: ControlSession) {
+    const targetMachineId = session.agentMachineId?.trim() ?? "";
+    const currentMachineId = localMachineId.trim();
+    return !!targetMachineId && !!currentMachineId && targetMachineId === currentMachineId;
   }
 
   async function leaveBackendSession() {
@@ -668,13 +1147,23 @@
     }
 
     signalingError = null;
+    signalLogs = [];
+    viewerStreamMbps = null;
+    viewerStreamFps = null;
+    revealViewerControls();
+
     try {
       await signalingClient.connect(current.signalingToken, "viewer", String(current.id));
-      try {
-        await joinBackendSession(current);
-      } catch (error) {
+      if (shouldBridgeSessionToLocalAgent(current)) {
+        try {
+          await joinBackendSession(current);
+        } catch (error) {
+          backendSessionSynced = false;
+          backendSyncError = String(error);
+        }
+      } else {
         backendSessionSynced = false;
-        backendSyncError = String(error);
+        backendSyncError = null;
       }
       clearSignalingListeners();
 
@@ -686,7 +1175,9 @@
       detachCloseListener = signalingClient.onClose(() => {
         signalingConnected = false;
         resetViewerPeerConnection();
-        void leaveBackendSession();
+        if (backendSessionSynced) {
+          void leaveBackendSession();
+        }
       });
 
       detachErrorListener = signalingClient.onError(() => {
@@ -721,7 +1212,11 @@
     resetViewerPeerConnection();
     clearSignalingListeners();
     signalingConnected = false;
-    await leaveBackendSession();
+    if (backendSessionSynced) {
+      await leaveBackendSession();
+    } else {
+      backendSyncError = null;
+    }
   }
 
   function sendChatSignal() {
@@ -819,6 +1314,15 @@
   }
 
   onMount(() => {
+    const handleKeyDown = (event: KeyboardEvent) => handleViewerDocumentKeyDown(event);
+    const handleKeyUp = (event: KeyboardEvent) => handleViewerDocumentKeyUp(event);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    detachViewerInputListeners = () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+
     void syncAgentLifecycle();
     void loadLocalMachineId();
     refreshMetrics();
@@ -831,6 +1335,8 @@
   });
 
   onDestroy(() => {
+    detachViewerInputListeners?.();
+    detachViewerInputListeners = null;
     clearInterval(metricsTimer);
     clearInterval(agentsTimer);
     if (approvalTimer) clearInterval(approvalTimer);
@@ -989,11 +1495,14 @@
   </section>
 
   {#if queriedSession?.status === "ACTIVE" && selectedFeature === "screen"}
-  <section class="card">
+  <section class="card remote-session-card">
     <div class="row between">
-      <h2>Screen (signaling video)</h2>
+      <div>
+        <h2>Controle distant</h2>
+        <p class="hint top-gap">Flux ecran en direct avec controle souris et clavier via WebRTC.</p>
+      </div>
       <div class="row">
-        <button onclick={connectSignaling} disabled={actionLoading || signalingConnected}>Connect</button>
+        <button onclick={connectSignaling} disabled={actionLoading || signalingConnected}>Reconnect</button>
         <button onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>Disconnect</button>
       </div>
     </div>
@@ -1006,50 +1515,116 @@
       <p class="error top-gap">{backendSyncError}</p>
     {/if}
 
-    {#if signalLogs.length === 0}
-      <p class="hint top-gap">Aucun signal recu pour le moment.</p>
-    {:else}
-      <div class="list top-gap">
-        {#each signalLogs as log, i (`${log.timestamp}-${i}`)}
-          <div class="item">
-            <p class="mono">
-              [{log.timestamp}] {log.direction.toUpperCase()} {log.type} {log.from} -&gt; {log.to}
-            </p>
-            <p class="hint mono">{log.payload || "(no payload)"}</p>
-          </div>
-        {/each}
+    <div class="top-gap viewer-status-bar">
+      <div class="viewer-status-stack">
+        <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerConnectionState}</span>
+        <span class={`pill ${viewerRemoteStream || screenFrameUrl ? "ok" : "muted"}`}>
+          {viewerRemoteStream ? "webrtc" : screenFrameUrl ? "frame" : "waiting"}
+        </span>
+        <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
+          {queriedSession?.allowRemoteInput === false
+            ? "lecture seule"
+            : viewerDataChannelOpen
+              ? viewerKeyboardCaptured
+                ? "clavier + souris actifs"
+                : "souris active - cliquez la video pour le clavier"
+              : "input en attente"}
+        </span>
+        {#if viewerRemoteStream || screenFrameUrl}
+          <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
+        {/if}
+        {#if viewerStreamMbps !== null}
+          <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
+        {/if}
+        {#if viewerStreamFps !== null}
+          <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
+        {/if}
       </div>
-    {/if}
+      <p class="hint control-hint">
+        Bougez la souris dans la video pour afficher les controles. Cliquez dans la video pour prendre la main clavier.
+      </p>
+    </div>
 
     <div class="top-gap screen-frame-panel">
-      <div class="row between">
-        <h3>Apercu ecran distant</h3>
-        <span class="pill {viewerRemoteStream || screenFrameUrl ? 'ok' : 'muted'}">
-          {viewerRemoteStream ? 'webrtc' : screenFrameUrl ? 'frame reçue' : 'en attente'}
-        </span>
-      </div>
+      <div class="video-shell" role="presentation" onmousemove={revealViewerControls}>
+        <div class:visible={viewerControlsVisible || viewerConnectionState !== "connected"} class="remote-toolbar">
+          <div class="viewer-status-stack">
+            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerConnectionState}</span>
+            <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
+              {queriedSession?.allowRemoteInput === false
+                ? "lecture seule"
+                : viewerDataChannelOpen
+                  ? "controle actif"
+                  : "input en attente"}
+            </span>
+          </div>
+          <div class="viewer-status-stack">
+            {#if viewerStreamMbps !== null}
+              <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
+            {/if}
+            {#if viewerStreamFps !== null}
+              <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
+            {/if}
+            {#if viewerRemoteStream || screenFrameUrl}
+              <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
+            {/if}
+          </div>
+        </div>
 
-      <div class="top-gap video-shell">
         {#if viewerRemoteStream}
-          <video class="viewer-video" bind:this={viewerVideoEl} autoplay playsinline muted></video>
+          <video
+            class="viewer-video"
+            class:active={canSendViewerInput()}
+            bind:this={viewerVideoEl}
+            autoplay
+            playsinline
+            muted
+            tabindex="0"
+            onfocus={handleViewerVideoFocus}
+            onblur={handleViewerVideoBlur}
+            onmousemove={handleViewerMouseMove}
+            onmousedown={handleViewerMouseDown}
+            onmouseup={handleViewerMouseUp}
+            onwheel={handleViewerWheel}
+            oncontextmenu={(event) => event.preventDefault()}
+          ></video>
         {:else if screenFrameUrl}
           <img class="screen-preview" src={screenFrameUrl} alt="Remote screen preview" />
         {:else}
           <div class="video-placeholder">
             <p>Aucune image reçue pour le moment.</p>
-            <p class="hint">Lance la session puis attends les frames envoyées par l’agent.</p>
+            <p class="hint">Lance la session puis attends les frames envoyees par l'agent.</p>
           </div>
         {/if}
       </div>
 
       {#if !viewerRemoteStream && screenFrameUrl}
-        <p class="hint mono">Frame #{screenFrameCount} · {screenFrameAt}</p>
+        <p class="hint mono">Frame #{screenFrameCount} - {screenFrameAt}</p>
       {/if}
 
       {#if screenFrameError}
         <p class="error top-gap">{screenFrameError}</p>
       {/if}
     </div>
+
+    <details class="debug-panel top-gap">
+      <summary>Debug signaling ({signalLogs.length})</summary>
+
+      {#if signalLogs.length === 0}
+        <p class="hint debug-empty">Aucun evenement signaling pour le moment.</p>
+      {:else}
+        {#each signalLogs as log, i (`${log.timestamp}-${i}`)}
+          <div class="signal-log">
+            <div class="signal-log-head">
+              <p class="mono">
+                [{log.timestamp}] {log.direction.toUpperCase()} {log.type} {log.from} -&gt; {log.to}
+              </p>
+            </div>
+            <p class="hint mono signal-log-payload">{log.payload || "(no payload)"}</p>
+          </div>
+        {/each}
+      {/if}
+    </details>
   </section>
   {/if}
 
@@ -1237,6 +1812,10 @@
     color: #fca5a5;
   }
 
+  .pill.error {
+    border-color: rgba(248, 113, 113, 0.45);
+  }
+
   .top-gap {
     margin-top: 10px;
   }
@@ -1313,6 +1892,28 @@
     color: #dbeafe;
   }
 
+  .remote-session-card {
+    display: grid;
+    gap: 14px;
+  }
+
+  .viewer-status-bar,
+  .viewer-status-stack {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .viewer-status-bar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .control-hint {
+    margin-top: 0;
+  }
+
   .screen-preview {
     width: 100%;
     max-height: 480px;
@@ -1331,6 +1932,28 @@
     min-height: 320px;
   }
 
+  .remote-toolbar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px;
+    background: linear-gradient(180deg, rgba(2, 6, 23, 0.94), rgba(2, 6, 23, 0.35) 72%, rgba(2, 6, 23, 0));
+    opacity: 0;
+    transform: translateY(-10px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    pointer-events: none;
+  }
+
+  .remote-toolbar.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
   .viewer-video {
     width: 100%;
     height: auto;
@@ -1338,6 +1961,15 @@
     display: block;
     background: #020617;
     object-fit: contain;
+  }
+
+  .viewer-video.active {
+    cursor: crosshair;
+  }
+
+  .viewer-video:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.9);
+    outline-offset: -2px;
   }
 
   .video-placeholder {
@@ -1352,6 +1984,48 @@
     color: #cbd5e1;
     background: linear-gradient(180deg, rgba(2, 6, 23, 0.6), rgba(2, 6, 23, 0.9));
     pointer-events: none;
+  }
+
+  .debug-panel {
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 12px;
+    background: rgba(15, 23, 42, 0.45);
+    overflow: hidden;
+  }
+
+  .debug-panel summary {
+    cursor: pointer;
+    padding: 12px 14px;
+    color: #cbd5e1;
+    font-weight: 600;
+    list-style: none;
+  }
+
+  .debug-panel summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .debug-empty {
+    padding: 0 14px 14px;
+  }
+
+  .signal-log {
+    display: grid;
+    gap: 6px;
+    padding: 12px 14px;
+    border-top: 1px solid rgba(148, 163, 184, 0.12);
+  }
+
+  .signal-log-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .signal-log-payload {
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   /* Approval Modal Styles */
@@ -1482,6 +2156,11 @@
 
     .approval-modal {
       padding: 24px;
+    }
+
+    .remote-toolbar {
+      flex-direction: column;
+      align-items: flex-start;
     }
   }
 </style>
