@@ -29,6 +29,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 pub struct AgentWebRtc {
+    signaling: Arc<SignalingClient>,
     peer: Arc<RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticRTP>,
 }
@@ -179,7 +180,11 @@ impl AgentWebRtc {
             Box::pin(async {})
         }));
 
-        Ok(Self { peer, video_track })
+        Ok(Self {
+            signaling,
+            peer,
+            video_track,
+        })
     }
 
     pub async fn handle_offer(&self, payload: &Value) -> Result<Value, String> {
@@ -234,6 +239,7 @@ impl AgentWebRtc {
     }
 
     pub fn start_h264_screen_sender(&self) {
+        let signaling = Arc::clone(&self.signaling);
         let peer = Arc::clone(&self.peer);
         let track = Arc::clone(&self.video_track);
 
@@ -262,6 +268,9 @@ impl AgentWebRtc {
             let mut timestamp: u32 = 0;
             let ts_step: u32 = 90000 / 12;
             let mut frame_index: u64 = 0;
+            let mut sent_bytes_in_window: usize = 0;
+            let mut sent_frames_in_window: usize = 0;
+            let mut stats_window_started_at = std::time::Instant::now();
 
             loop {
                 // Stop when the PeerConnection is gone/closing.
@@ -356,6 +365,7 @@ impl AgentWebRtc {
                 // Same timestamp for all packets of a frame.
                 let frame_ts = timestamp;
                 timestamp = timestamp.wrapping_add(ts_step);
+                let mut frame_sent = false;
 
                 for (i, frag) in payloads.iter().enumerate() {
                     if track.any_binding_paused().await {
@@ -386,7 +396,32 @@ impl AgentWebRtc {
                         break;
                     }
 
+                    frame_sent = true;
                     seq = seq.wrapping_add(1);
+                }
+
+                if frame_sent {
+                    sent_bytes_in_window += payload_bytes.len();
+                    sent_frames_in_window += 1;
+                }
+
+                let elapsed = stats_window_started_at.elapsed();
+                if elapsed >= std::time::Duration::from_secs(1) {
+                    let elapsed_sec = elapsed.as_secs_f64().max(0.001);
+                    let mbps = (sent_bytes_in_window as f64 * 8.0) / (elapsed_sec * 1_000_000.0);
+                    let fps = sent_frames_in_window as f64 / elapsed_sec;
+                    let bytes_per_second = (sent_bytes_in_window as f64 / elapsed_sec).round() as i64;
+
+                    if let Err(err) = signaling
+                        .send_stream_stats(mbps, fps, bytes_per_second)
+                        .await
+                    {
+                        eprintln!("⚠️ Failed to send stream stats: {err}");
+                    }
+
+                    sent_bytes_in_window = 0;
+                    sent_frames_in_window = 0;
+                    stats_window_started_at = std::time::Instant::now();
                 }
 
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;

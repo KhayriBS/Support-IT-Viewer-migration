@@ -1773,7 +1773,7 @@
     <div class="top-gap screen-frame-panel">
       <div bind:this={viewerShellEl} class="video-shell" role="presentation" onmousemove={revealViewerControls}>
         <div class:visible={viewerControlsVisible || viewerConnectionState !== "connected"} class="remote-toolbar">
-          <div class="viewer-toolbar-group">
+          <div class="viewer-toolbar-group viewer-toolbar-status">
             <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
             <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
               {queriedSession?.allowRemoteInput === false
@@ -1782,18 +1782,24 @@
                   ? "controle actif"
                   : "input en attente"}
             </span>
-          </div>
-          <div class="viewer-toolbar-group">
             <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
-            {#if viewerStreamMbps !== null}
-              <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
-            {/if}
-            {#if viewerStreamFps !== null}
-              <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
-            {/if}
+            <span class="telemetry-pill">
+              <span class="telemetry-label">LIVE</span>
+              <span class={`telemetry-dot ${viewerStreamMbps !== null || viewerStreamFps !== null ? "ok" : "muted"}`}></span>
+            </span>
+            <span class="telemetry-pill">
+              <span class="telemetry-label">FPS</span>
+              <strong>{viewerStreamFps !== null ? viewerStreamFps.toFixed(1) : "--"}</strong>
+            </span>
+            <span class="telemetry-pill">
+              <span class="telemetry-label">Mbps</span>
+              <strong>{viewerStreamMbps !== null ? viewerStreamMbps.toFixed(2) : "--"}</strong>
+            </span>
             {#if viewerRemoteStream || screenFrameUrl}
               <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
             {/if}
+          </div>
+          <div class="viewer-toolbar-group viewer-toolbar-actions">
             <button class="toolbar-btn" onclick={toggleViewerExpanded}>
               {viewerExpanded ? "Normal" : "Agrandir"}
             </button>
@@ -2371,7 +2377,6 @@
   .remote-toolbar.visible {
     opacity: 1;
     transform: translateY(0);
-    pointer-events: auto;
   }
 
   .viewer-toolbar-group {
@@ -2379,6 +2384,50 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+  }
+
+  .viewer-toolbar-status {
+    pointer-events: none;
+    max-width: min(72%, 860px);
+  }
+
+  .viewer-toolbar-actions {
+    pointer-events: auto;
+    margin-left: auto;
+    justify-content: flex-end;
+  }
+
+  .telemetry-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    background: rgba(15, 23, 42, 0.74);
+    color: #e2e8f0;
+    font-size: 0.82rem;
+  }
+
+  .telemetry-pill strong {
+    font-size: 0.92rem;
+    letter-spacing: 0.01em;
+  }
+
+  .telemetry-label {
+    color: #94a3b8;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .telemetry-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.12);
   }
 
   .toolbar-btn {
