@@ -1353,41 +1353,44 @@
 </svelte:head>
 
 <main>
-  <header>
-    <h1>Lumiere IT Dashboard</h1>
-    <div class="badges">
+  <header class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Support distant</p>
+      <h1>Lumiere IT</h1>
+      <p class="hero-text">
+        Console technicien pour lancer une session, voir l'etat de la machine cible et prendre la main a distance.
+      </p>
+    </div>
+    <div class="badges status-strip">
       <span class="badge" class:ok={!metricsError && !metricsLoading} class:error={!!metricsError}>
-        Local metrics: {metricsLoading ? "loading" : metricsError ? "error" : "ok"}
+        Mesures locales: {metricsLoading ? "chargement" : metricsError ? "erreur" : "ok"}
       </span>
       <span class="badge" class:ok={agentRunning} class:error={!agentRunning}>
-        Agent: {agentRunning ? "online" : "offline"}
+        Agent local: {agentRunning ? "actif" : "arret"}
       </span>
       <span class="badge" class:ok={!agentsError && !agentsLoading} class:error={!!agentsError}>
-        Backend API: {agentsLoading ? "loading" : agentsError ? "error" : "ok"}
+        API: {agentsLoading ? "chargement" : agentsError ? "erreur" : "ok"}
       </span>
       <span class="badge" class:ok={signalingConnected} class:error={!signalingConnected}>
-        Signaling WS: {signalingConnected ? "connected" : "disconnected"}
+        Signal: {signalingConnected ? "connecte" : "hors ligne"}
       </span>
       <span class="badge" class:ok={chatConnected} class:error={!chatConnected}>
-        Chat STOMP: {chatConnected ? "connected" : "fallback"}
-      </span>
-      <span class="badge" class:ok={backendSessionSynced} class:error={!backendSessionSynced}>
-        Tauri session: {backendSessionSynced ? "synced" : "idle"}
+        Chat: {chatConnected ? "connecte" : "attente"}
       </span>
     </div>
   </header>
 
   <section class="grid metrics">
-    <article class="card">
+    <article class="card metric-card">
       <h2>CPU</h2>
       <p class="big">{metrics ? `${metrics.cpuUsage.toFixed(1)}%` : "-"}</p>
     </article>
-    <article class="card">
+    <article class="card metric-card">
       <h2>RAM</h2>
       <p class="big">{metrics ? `${metrics.ramUsage.toFixed(1)}%` : "-"}</p>
     </article>
-    <article class="card">
-      <h2>Disk</h2>
+    <article class="card metric-card">
+      <h2>Disque</h2>
       <p class="big">{metrics ? `${metrics.diskUsage.toFixed(1)}%` : "-"}</p>
     </article>
   </section>
@@ -1410,14 +1413,14 @@
     {:else}
       <div class="list">
         {#each onlineAgents as agent (agent.id)}
-          <div class="item">
-            <div>
+          <div class="item agent-item">
+            <div class="agent-meta">
               <strong>{agent.machineId}</strong>
-              <p>{agent.hostname} - {agent.osInfo}</p>
+              <p class="hint">{agent.hostname} - {agent.osInfo}</p>
             </div>
             <div class="row">
               <span class={`pill ${statusClass(agent.status)}`}>{agent.status}</span>
-              <button onclick={() => startSession(agent.machineId)} disabled={actionLoading}>Start session</button>
+              <button onclick={() => startSession(agent.machineId)} disabled={actionLoading}>Se connecter</button>
             </div>
           </div>
         {/each}
@@ -1427,34 +1430,59 @@
 
   <section class="grid actions">
     <article class="card">
-      <h2>Start by code</h2>
+      <h2>Connexion par code</h2>
       <div class="row">
-        <input bind:value={connectionCode} placeholder="Connection code" />
-        <button onclick={startSessionWithCode} disabled={actionLoading}>Start</button>
+        <input bind:value={connectionCode} placeholder="Code de connexion" />
+        <button onclick={startSessionWithCode} disabled={actionLoading}>Lancer</button>
       </div>
     </article>
 
     <article class="card">
-      <h2>Session by token</h2>
+      <h2>Recherche par token</h2>
       <div class="row">
-        <input bind:value={sessionTokenQuery} placeholder="Session token" />
-        <button onclick={lookupSession} disabled={actionLoading}>Lookup</button>
+        <input bind:value={sessionTokenQuery} placeholder="Token de session" />
+        <button onclick={lookupSession} disabled={actionLoading}>Rechercher</button>
       </div>
       <div class="row top-gap">
-        <button class="danger" onclick={stopByToken} disabled={actionLoading}>Stop by token</button>
+        <button class="danger" onclick={stopByToken} disabled={actionLoading}>Arreter la session</button>
       </div>
     </article>
   </section>
 
-  <section class="card">
-    <h2>Session courante</h2>
+  <section class="card session-card">
+    <div class="row between">
+      <div>
+        <h2>Session courante</h2>
+        <p class="hint top-gap">Suivi de la machine cible et acces aux fonctions de support.</p>
+      </div>
+      {#if queriedSession}
+        <div class="row">
+          <span class={`pill ${statusClass(queriedSession.status)}`}>{queriedSession.status}</span>
+          <span class={`pill ${shouldBridgeSessionToLocalAgent(queriedSession) ? "warn" : "ok"}`}>
+            {shouldBridgeSessionToLocalAgent(queriedSession) ? "machine locale" : "machine distante"}
+          </span>
+        </div>
+      {/if}
+    </div>
+
     {#if queriedSession}
-      <div class="session">
-        <p><strong>ID:</strong> {queriedSession.id}</p>
-        <p><strong>Machine:</strong> {queriedSession.agentMachineId}</p>
-        <p><strong>Technicien:</strong> {queriedSession.technicianUsername}</p>
-        <p><strong>Status:</strong> {queriedSession.status}</p>
-        <p><strong>Token:</strong> <code>{queriedSession.signalingToken}</code></p>
+      <div class="session-grid top-gap">
+        <div class="session-kv">
+          <span class="session-kv-label">Machine cible</span>
+          <strong>{queriedSession.agentMachineId}</strong>
+        </div>
+        <div class="session-kv">
+          <span class="session-kv-label">Technicien</span>
+          <strong>{queriedSession.technicianUsername || "viewer"}</strong>
+        </div>
+        <div class="session-kv">
+          <span class="session-kv-label">Identifiant</span>
+          <strong>#{queriedSession.id}</strong>
+        </div>
+        <div class="session-kv">
+          <span class="session-kv-label">Token</span>
+          <code>{queriedSession.signalingToken}</code>
+        </div>
       </div>
 
       {#if waitingForApproval || queriedSession.status === "PENDING_APPROVAL"}
@@ -1464,12 +1492,12 @@
       {/if}
 
       {#if queriedSession.status === "ACTIVE"}
-        <div class="row top-gap feature-actions">
+        <div class="row top-gap feature-actions session-toolbar">
           <button
             class:selected={selectedFeature === "screen"}
             onclick={() => chooseFeature("screen")}
           >
-            Screen
+            Ecran distant
           </button>
           <button
             class:selected={selectedFeature === "chat"}
@@ -1481,7 +1509,7 @@
             class:selected={selectedFeature === "files"}
             onclick={() => chooseFeature("files")}
           >
-            Transfert fichier
+            Fichiers
           </button>
         </div>
       {/if}
@@ -1747,6 +1775,36 @@
     font-weight: 700;
   }
 
+  .hero {
+    align-items: flex-end;
+    padding: 6px 0 2px;
+  }
+
+  .hero-copy {
+    display: grid;
+    gap: 8px;
+    max-width: 720px;
+  }
+
+  .eyebrow {
+    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.72rem;
+    color: #7dd3fc;
+  }
+
+  .hero-text {
+    margin: 0;
+    color: #cbd5e1;
+    max-width: 62ch;
+    line-height: 1.5;
+  }
+
+  .status-strip {
+    justify-content: flex-end;
+  }
+
   .grid {
     display: grid;
     gap: 12px;
@@ -1763,15 +1821,18 @@
   .card {
     background: rgba(15, 23, 42, 0.8);
     border: 1px solid rgba(148, 163, 184, 0.2);
-    border-radius: 12px;
-    padding: 14px;
-    backdrop-filter: blur(6px);
+    border-radius: 16px;
+    padding: 16px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 18px 38px rgba(2, 6, 23, 0.18);
   }
 
   .big {
-    font-size: 2rem;
-    margin-top: 8px;
+    font-size: 2.15rem;
+    margin-top: 12px;
     margin-bottom: 0;
+    font-weight: 700;
+    letter-spacing: -0.03em;
   }
 
   .badges,
@@ -1788,10 +1849,11 @@
 
   .badge,
   .pill {
-    padding: 4px 8px;
+    padding: 5px 10px;
     border-radius: 999px;
     border: 1px solid rgba(148, 163, 184, 0.35);
     font-size: 0.8rem;
+    background: rgba(15, 23, 42, 0.36);
   }
 
   .ok {
@@ -1842,6 +1904,50 @@
     justify-content: space-between;
     gap: 10px;
     flex-wrap: wrap;
+  }
+
+  .metric-card {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.72));
+  }
+
+  .agent-item {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.48), rgba(15, 23, 42, 0.24));
+  }
+
+  .agent-meta {
+    display: grid;
+    gap: 4px;
+  }
+
+  .session-card {
+    display: grid;
+    gap: 12px;
+  }
+
+  .session-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px;
+  }
+
+  .session-kv {
+    display: grid;
+    gap: 6px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: rgba(15, 23, 42, 0.46);
+  }
+
+  .session-kv-label {
+    color: #94a3b8;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .session-toolbar {
+    padding-top: 2px;
   }
 
   input,
@@ -2147,6 +2253,14 @@
   @media (max-width: 700px) {
     main {
       padding: 14px;
+    }
+
+    .hero {
+      align-items: flex-start;
+    }
+
+    .status-strip {
+      justify-content: flex-start;
     }
 
     input {
