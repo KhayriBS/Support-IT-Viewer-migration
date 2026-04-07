@@ -1,0 +1,2 @@
+cargo:rustc-link-search=native=C:\Users\NTS\Desktop\lumiere\lumiere-tech-it\src-tauri\target-check-temp\debug\build\webview2-com-sys-7dfab17c773ecc9d\out\x64
+cargo:rustc-link-lib=advapi32

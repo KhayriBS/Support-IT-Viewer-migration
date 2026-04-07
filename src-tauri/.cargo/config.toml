@@ -1,0 +1,4 @@
+[build]
+# Workaround for Windows security/AV blocking executable creation under protected folders (e.g. Desktop).
+# Redirect build artifacts to a user-writable location.
+target-dir = "C:/Users/NTS/AppData/Local/lumiere-tech-it/cargo-target"
