@@ -1,8 +1,12 @@
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::input_handler::InputHandler;
 use super::signaling::SignalingClient;
+use super::video_encoder::{
+    FfmpegRtpBridge, VideoEncoderBackend, VideoEncoderPreset, VideoEncoderSelection,
+};
 use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, RateControlMode, UsageType};
 use openh264::formats::{BgraSliceU8, YUVBuffer};
@@ -10,28 +14,79 @@ use openh264::OpenH264API;
 use rtp::codecs::h264::H264Payloader;
 use rtp::packet::Packet;
 use rtp::packetizer::Payloader;
-use webrtc::api::media_engine::{MIME_TYPE_H264};
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_local::TrackLocalWriter;
-
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::MIME_TYPE_H264;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::interceptor::registry::Registry;
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::TrackLocalWriter;
+use webrtc_util::marshal::Unmarshal;
 
 pub struct AgentWebRtc {
     signaling: Arc<SignalingClient>,
     peer: Arc<RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticRTP>,
+}
+
+struct StreamStatsWindow {
+    started_at: Instant,
+    sent_bytes: usize,
+    sent_frames: usize,
+}
+
+impl StreamStatsWindow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            sent_bytes: 0,
+            sent_frames: 0,
+        }
+    }
+
+    fn record_frame(&mut self, frame_bytes: usize) {
+        self.sent_bytes += frame_bytes;
+        self.sent_frames += 1;
+    }
+
+    fn record_rtp_packet(&mut self, packet: &Packet) {
+        self.sent_bytes += packet.payload.len();
+        if packet.header.marker {
+            self.sent_frames += 1;
+        }
+    }
+
+    async fn flush_if_due(&mut self, signaling: &Arc<SignalingClient>) {
+        let elapsed = self.started_at.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+
+        let elapsed_sec = elapsed.as_secs_f64().max(0.001);
+        let mbps = (self.sent_bytes as f64 * 8.0) / (elapsed_sec * 1_000_000.0);
+        let fps = self.sent_frames as f64 / elapsed_sec;
+        let bytes_per_second = (self.sent_bytes as f64 / elapsed_sec).round() as i64;
+
+        if let Err(err) = signaling
+            .send_stream_stats(mbps, fps, bytes_per_second)
+            .await
+        {
+            eprintln!("Failed to send stream stats: {err}");
+        }
+
+        self.started_at = Instant::now();
+        self.sent_bytes = 0;
+        self.sent_frames = 0;
+    }
 }
 
 impl AgentWebRtc {
@@ -86,11 +141,11 @@ impl AgentWebRtc {
                         });
 
                         if let Err(err) = signaling.send_ice_candidate(payload).await {
-                            eprintln!("⚠️ Failed to send local ICE candidate: {err}");
+                            eprintln!("Failed to send local ICE candidate: {err}");
                         }
                     }
                     Err(err) => {
-                        eprintln!("⚠️ Failed to serialize local ICE candidate: {err}");
+                        eprintln!("Failed to serialize local ICE candidate: {err}");
                     }
                 }
             })
@@ -146,14 +201,14 @@ impl AgentWebRtc {
             })
         }));
 
-        // Add a real outgoing H.264 video track (screen share).
-        // The viewer already creates a recvonly transceiver for video.
         let video_track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90000,
                 channels: 0,
-                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f".to_owned(),
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
+                        .to_owned(),
                 rtcp_feedback: vec![],
             },
             "video".to_owned(),
@@ -161,21 +216,20 @@ impl AgentWebRtc {
         ));
 
         let rtp_sender = peer
-            .add_track(Arc::clone(&video_track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+            .add_track(
+                Arc::clone(&video_track)
+                    as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>,
+            )
             .await
             .map_err(|e| format!("add_track failed: {e}"))?;
 
-        // Drain RTCP packets so the sender doesn't stall.
         tokio::spawn(async move {
-            while rtp_sender.read_rtcp().await.is_ok() {
-                // ignore
-            }
+            while rtp_sender.read_rtcp().await.is_ok() {}
         });
 
-        // Keep parity with legacy logs for easier debugging.
         let peer_for_state = Arc::clone(&peer);
         peer.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-            println!("🔗 WebRTC connection state: {state:?}");
+            println!("WebRTC connection state: {state:?}");
             let _ = &peer_for_state;
             Box::pin(async {})
         }));
@@ -244,187 +298,48 @@ impl AgentWebRtc {
         let track = Arc::clone(&self.video_track);
 
         tokio::spawn(async move {
-            // Encoder tuned for real-time screen content.
-            let api = OpenH264API::from_source();
-            let config = EncoderConfig::new()
-                .usage_type(UsageType::ScreenContentRealTime)
-                .rate_control_mode(RateControlMode::Bitrate)
-                .set_bitrate_bps(2_000_000)
-                .max_frame_rate(12.0)
-                .enable_skip_frame(true)
-                .set_multiple_thread_idc(0);
+            let selection = VideoEncoderSelection::resolve();
+            println!(
+                "Video encoder selected: {} (target={} FPS, bitrate={} Mbps)",
+                selection.backend.label(),
+                selection.preset.target_fps,
+                selection.preset.bitrate_bps as f64 / 1_000_000.0
+            );
 
-            let mut encoder = match Encoder::with_api_config(api, config) {
-                Ok(enc) => enc,
-                Err(err) => {
-                    eprintln!("❌ OpenH264 encoder init failed: {err}");
-                    return;
+            let result = match selection.backend {
+                VideoEncoderBackend::OpenH264Software => {
+                    run_openh264_screen_sender(&signaling, &peer, &track, selection.preset).await
+                }
+                backend => {
+                    match run_ffmpeg_rtp_screen_sender(
+                        &signaling,
+                        &peer,
+                        &track,
+                        backend,
+                        selection.preset,
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(err) => {
+                            eprintln!(
+                                "Hardware encoder {} failed: {err}. Falling back to software OpenH264.",
+                                backend.label()
+                            );
+                            run_openh264_screen_sender(
+                                &signaling,
+                                &peer,
+                                &track,
+                                selection.preset,
+                            )
+                            .await
+                        }
+                    }
                 }
             };
 
-            let mut payloader = H264Payloader::default();
-            let mtu: usize = 1200;
-            let mut seq: u16 = 1;
-            let mut timestamp: u32 = 0;
-            let ts_step: u32 = 90000 / 12;
-            let mut frame_index: u64 = 0;
-            let mut sent_bytes_in_window: usize = 0;
-            let mut sent_frames_in_window: usize = 0;
-            let mut stats_window_started_at = std::time::Instant::now();
-
-            loop {
-                // Stop when the PeerConnection is gone/closing.
-                match peer.connection_state() {
-                    RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
-                    _ => {}
-                }
-
-                // Wait for negotiation/bindings. Treat "no bindings" as paused.
-                if track.all_binding_paused().await || peer.connection_state() != RTCPeerConnectionState::Connected {
-                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                    continue;
-                }
-
-                // Capture screen (BGRA) on Windows.
-                let frame = match screenshots::Screen::all()
-                    .map_err(|e| e.to_string())
-                    .and_then(|screens| {
-                        screens
-                            .first()
-                            .ok_or_else(|| "No screen detected".to_string())
-                            .and_then(|screen| screen.capture().map_err(|e| e.to_string()))
-                    }) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        eprintln!("⚠️ Screen capture failed: {err}");
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        continue;
-                    }
-                };
-
-                let width = frame.width() as usize;
-                let height = frame.height() as usize;
-                let raw = frame.into_raw();
-
-                // Ensure even dimensions for I420.
-                let even_w = width & !1;
-                let even_h = height & !1;
-                if even_w < 2 || even_h < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                }
-
-                let bgra_even: Vec<u8> = if even_w == width && even_h == height {
-                    raw
-                } else {
-                    let mut out = vec![0u8; even_w * even_h * 4];
-                    for y in 0..even_h {
-                        let src_row = &raw[(y * width * 4)..(y * width * 4 + even_w * 4)];
-                        let dst_row = &mut out[(y * even_w * 4)..(y * even_w * 4 + even_w * 4)];
-                        dst_row.copy_from_slice(src_row);
-                    }
-                    out
-                };
-
-                // Convert BGRA -> I420 using openh264's converter.
-                let bgra = BgraSliceU8::new(&bgra_even, (even_w, even_h));
-                let yuv = YUVBuffer::from_rgb_source(bgra);
-
-                // Force a keyframe periodically.
-                frame_index += 1;
-                if frame_index % 90 == 0 {
-                    encoder.force_intra_frame();
-                }
-
-                // IMPORTANT: OpenH264's `EncodedBitStream` borrows internal encoder state and is
-                // not `Send`; materialize it into a `Vec<u8>` immediately so we don't hold it
-                // across any `.await` points.
-                let encoded = match encoder.encode(&yuv).map(|bs| bs.to_vec()) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        eprintln!("⚠️ H264 encode failed: {err}");
-                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                        continue;
-                    }
-                };
-                if encoded.is_empty() {
-                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                    continue;
-                }
-
-                let payload_bytes = Bytes::from(encoded);
-                let payloads = match payloader.payload(mtu, &payload_bytes) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        eprintln!("⚠️ H264 payload split failed: {err}");
-                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                        continue;
-                    }
-                };
-
-                // Same timestamp for all packets of a frame.
-                let frame_ts = timestamp;
-                timestamp = timestamp.wrapping_add(ts_step);
-                let mut frame_sent = false;
-
-                for (i, frag) in payloads.iter().enumerate() {
-                    if track.any_binding_paused().await {
-                        // Don't advance seq if sending is blocked internally.
-                        break;
-                    }
-
-                    let is_last = i + 1 == payloads.len();
-                    let pkt = Packet {
-                        header: rtp::header::Header {
-                            version: 2,
-                            padding: false,
-                            extension: false,
-                            marker: is_last,
-                            payload_type: 0,
-                            sequence_number: seq,
-                            timestamp: frame_ts,
-                            ssrc: 0,
-                            csrc: vec![],
-                            extension_profile: 0,
-                            extensions: vec![],
-                            extensions_padding: 0,
-                        },
-                        payload: frag.clone(),
-                    };
-
-                    if track.write_rtp(&pkt).await.is_err() {
-                        break;
-                    }
-
-                    frame_sent = true;
-                    seq = seq.wrapping_add(1);
-                }
-
-                if frame_sent {
-                    sent_bytes_in_window += payload_bytes.len();
-                    sent_frames_in_window += 1;
-                }
-
-                let elapsed = stats_window_started_at.elapsed();
-                if elapsed >= std::time::Duration::from_secs(1) {
-                    let elapsed_sec = elapsed.as_secs_f64().max(0.001);
-                    let mbps = (sent_bytes_in_window as f64 * 8.0) / (elapsed_sec * 1_000_000.0);
-                    let fps = sent_frames_in_window as f64 / elapsed_sec;
-                    let bytes_per_second = (sent_bytes_in_window as f64 / elapsed_sec).round() as i64;
-
-                    if let Err(err) = signaling
-                        .send_stream_stats(mbps, fps, bytes_per_second)
-                        .await
-                    {
-                        eprintln!("⚠️ Failed to send stream stats: {err}");
-                    }
-
-                    sent_bytes_in_window = 0;
-                    sent_frames_in_window = 0;
-                    stats_window_started_at = std::time::Instant::now();
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            if let Err(err) = result {
+                eprintln!("Video sender stopped with error: {err}");
             }
         });
     }
@@ -454,4 +369,253 @@ impl AgentWebRtc {
             .await
             .map_err(|e| format!("add_ice_candidate failed: {e}"))
     }
+}
+
+async fn run_openh264_screen_sender(
+    signaling: &Arc<SignalingClient>,
+    peer: &Arc<RTCPeerConnection>,
+    track: &Arc<TrackLocalStaticRTP>,
+    preset: VideoEncoderPreset,
+) -> Result<(), String> {
+    let api = OpenH264API::from_source();
+    let config = EncoderConfig::new()
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .set_bitrate_bps(preset.bitrate_bps)
+        .max_frame_rate(preset.target_fps as f32)
+        .enable_skip_frame(true)
+        .set_multiple_thread_idc(0);
+
+    let mut encoder = Encoder::with_api_config(api, config)
+        .map_err(|err| format!("OpenH264 encoder init failed: {err}"))?;
+    let mut payloader = H264Payloader::default();
+    let frame_interval = frame_interval_for(preset);
+    let keyframe_interval = (preset.target_fps.max(1) as u64).saturating_mul(5);
+    let mut seq: u16 = 1;
+    let mut timestamp: u32 = 0;
+    let ts_step: u32 = 90000 / preset.target_fps.max(1);
+    let mut frame_index: u64 = 0;
+    let mut stats = StreamStatsWindow::new();
+
+    loop {
+        match peer.connection_state() {
+            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+            _ => {}
+        }
+
+        if !stream_is_ready(peer, track).await {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            continue;
+        }
+
+        let (width, height, bgra_frame) = match capture_primary_screen_even_bgra() {
+            Ok(frame) => frame,
+            Err(err) => {
+                eprintln!("Screen capture failed: {err}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+
+        let bgra = BgraSliceU8::new(&bgra_frame, (width, height));
+        let yuv = YUVBuffer::from_rgb_source(bgra);
+
+        frame_index += 1;
+        if keyframe_interval > 0 && frame_index % keyframe_interval == 0 {
+            encoder.force_intra_frame();
+        }
+
+        let encoded = match encoder.encode(&yuv).map(|bitstream| bitstream.to_vec()) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("H264 encode failed: {err}");
+                tokio::time::sleep(frame_interval).await;
+                continue;
+            }
+        };
+        if encoded.is_empty() {
+            tokio::time::sleep(frame_interval).await;
+            continue;
+        }
+
+        let payload_bytes = Bytes::from(encoded);
+        let payloads = match payloader.payload(1200, &payload_bytes) {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                eprintln!("H264 payload split failed: {err}");
+                tokio::time::sleep(frame_interval).await;
+                continue;
+            }
+        };
+
+        let frame_ts = timestamp;
+        timestamp = timestamp.wrapping_add(ts_step);
+        let mut frame_sent = false;
+
+        for (index, fragment) in payloads.iter().enumerate() {
+            if track.any_binding_paused().await {
+                break;
+            }
+
+            let packet = Packet {
+                header: rtp::header::Header {
+                    version: 2,
+                    padding: false,
+                    extension: false,
+                    marker: index + 1 == payloads.len(),
+                    payload_type: 0,
+                    sequence_number: seq,
+                    timestamp: frame_ts,
+                    ssrc: 0,
+                    csrc: vec![],
+                    extension_profile: 0,
+                    extensions: vec![],
+                    extensions_padding: 0,
+                },
+                payload: fragment.clone(),
+            };
+
+            if track.write_rtp(&packet).await.is_err() {
+                break;
+            }
+
+            frame_sent = true;
+            seq = seq.wrapping_add(1);
+        }
+
+        if frame_sent {
+            stats.record_frame(payload_bytes.len());
+        }
+        stats.flush_if_due(signaling).await;
+        tokio::time::sleep(frame_interval).await;
+    }
+
+    Ok(())
+}
+
+async fn run_ffmpeg_rtp_screen_sender(
+    signaling: &Arc<SignalingClient>,
+    peer: &Arc<RTCPeerConnection>,
+    track: &Arc<TrackLocalStaticRTP>,
+    backend: VideoEncoderBackend,
+    preset: VideoEncoderPreset,
+) -> Result<(), String> {
+    let frame_interval = frame_interval_for(preset);
+    let mut bridge: Option<FfmpegRtpBridge> = None;
+    let mut active_dimensions: Option<(usize, usize)> = None;
+    let mut stats = StreamStatsWindow::new();
+
+    loop {
+        match peer.connection_state() {
+            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+            _ => {}
+        }
+
+        if !stream_is_ready(peer, track).await {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            continue;
+        }
+
+        let (width, height, bgra_frame) = capture_primary_screen_even_bgra()?;
+        if active_dimensions != Some((width, height)) {
+            if let Some(existing) = bridge.as_mut() {
+                existing.shutdown().await;
+            }
+
+            bridge = Some(FfmpegRtpBridge::spawn(backend, width, height, preset).await?);
+            active_dimensions = Some((width, height));
+        }
+
+        let active_bridge = bridge
+            .as_mut()
+            .ok_or_else(|| "FFmpeg bridge unavailable after spawn".to_string())?;
+        active_bridge.write_frame(&bgra_frame).await?;
+        drain_ffmpeg_packets(track, active_bridge, &mut stats).await?;
+        stats.flush_if_due(signaling).await;
+        tokio::time::sleep(frame_interval).await;
+    }
+
+    if let Some(existing) = bridge.as_mut() {
+        existing.shutdown().await;
+    }
+
+    Ok(())
+}
+
+async fn drain_ffmpeg_packets(
+    track: &Arc<TrackLocalStaticRTP>,
+    bridge: &mut FfmpegRtpBridge,
+    stats: &mut StreamStatsWindow,
+) -> Result<(), String> {
+    let mut packet_buffer = vec![0u8; 64 * 1024];
+    let mut idle_polls = 0;
+
+    loop {
+        match bridge.try_read_packet(&mut packet_buffer).await? {
+            Some(size) => {
+                idle_polls = 0;
+
+                let mut raw = &packet_buffer[..size];
+                let packet =
+                    Packet::unmarshal(&mut raw).map_err(|err| format!("rtp parse failed: {err}"))?;
+
+                if track.write_rtp(&packet).await.is_err() {
+                    break;
+                }
+
+                stats.record_rtp_packet(&packet);
+            }
+            None => {
+                idle_polls += 1;
+                if idle_polls >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn stream_is_ready(peer: &Arc<RTCPeerConnection>, track: &Arc<TrackLocalStaticRTP>) -> bool {
+    !track.all_binding_paused().await
+        && peer.connection_state() == RTCPeerConnectionState::Connected
+}
+
+fn frame_interval_for(preset: VideoEncoderPreset) -> Duration {
+    Duration::from_secs_f64(1.0 / preset.target_fps.max(1) as f64)
+}
+
+fn capture_primary_screen_even_bgra() -> Result<(usize, usize, Vec<u8>), String> {
+    let frame = screenshots::Screen::all()
+        .map_err(|err| err.to_string())
+        .and_then(|screens| {
+            screens
+                .first()
+                .ok_or_else(|| "No screen detected".to_string())
+                .and_then(|screen| screen.capture().map_err(|err| err.to_string()))
+        })?;
+
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let raw = frame.into_raw();
+    let even_width = width & !1;
+    let even_height = height & !1;
+    if even_width < 2 || even_height < 2 {
+        return Err("Captured frame is too small".to_string());
+    }
+
+    let bgra_even = if even_width == width && even_height == height {
+        raw
+    } else {
+        let mut out = vec![0u8; even_width * even_height * 4];
+        for y in 0..even_height {
+            let src_row = &raw[(y * width * 4)..(y * width * 4 + even_width * 4)];
+            let dst_row = &mut out[(y * even_width * 4)..(y * even_width * 4 + even_width * 4)];
+            dst_row.copy_from_slice(src_row);
+        }
+        out
+    };
+
+    Ok((even_width, even_height, bgra_even))
 }

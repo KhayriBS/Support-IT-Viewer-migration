@@ -6,3 +6,4 @@ pub mod file_transfer;
 pub mod session;
 pub mod webrtc;
 pub mod screen_capture;
+pub mod video_encoder;
