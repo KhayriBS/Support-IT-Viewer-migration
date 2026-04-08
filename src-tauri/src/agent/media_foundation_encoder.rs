@@ -201,11 +201,15 @@ mod imp {
 
                 configure_media_types(&transform, width as u32, height as u32, target_fps, bitrate_bps)?;
 
+                let mut input_stream_count = 0u32;
                 let mut output_stream_count = 0u32;
                 transform
-                    .GetStreamCount(null_mut(), &mut output_stream_count as *mut u32)
+                    .GetStreamCount(
+                        &mut input_stream_count as *mut u32,
+                        &mut output_stream_count as *mut u32,
+                    )
                     .map_err(|err| format!("GetStreamCount failed: {err}"))?;
-                if output_stream_count == 0 {
+                if input_stream_count == 0 || output_stream_count == 0 {
                     return Err("H264 MFT exposes no output stream".to_string());
                 }
                 let output_stream_id = 0u32;

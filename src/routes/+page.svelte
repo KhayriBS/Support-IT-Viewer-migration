@@ -44,6 +44,10 @@
 
   const signalingClient = new SignalingClient();
   const chatClient = new ChatRealtimeClient();
+
+  const uiDebugEnabled =
+    import.meta.env.DEV &&
+    String((import.meta as unknown as { env?: Record<string, unknown> }).env?.VITE_UI_DEBUG ?? "") === "1";
   let signalingConnected = $state(false);
   let signalingError = $state<string | null>(null);
   let backendSessionSynced = $state(false);
@@ -611,6 +615,10 @@
   }
 
   function logSignal(direction: "in" | "out", msg: SignalMessage) {
+    if (!uiDebugEnabled) {
+      return;
+    }
+
     if (msg.type === "FILE_DATA" || msg.type === "STREAM_STATS") {
       return;
     }
@@ -996,11 +1004,13 @@
 
     pc.ontrack = (event) => {
       const stream = event.streams?.[0] ?? new MediaStream([event.track]);
-      console.info("[viewer] remote track received", {
-        kind: event.track.kind,
-        id: event.track.id,
-        streamId: stream.id
-      });
+      if (uiDebugEnabled) {
+        console.info("[viewer] remote track received", {
+          kind: event.track.kind,
+          id: event.track.id,
+          streamId: stream.id
+        });
+      }
       viewerRemoteStream = stream;
       screenFrameError = null;
     };
@@ -1212,7 +1222,9 @@
           sdpMLineIndex: payload.sdpMLineIndex ?? null
         });
       } catch (error) {
-        console.error("Failed to add remote ICE candidate", error);
+        if (uiDebugEnabled) {
+          console.error("Failed to add remote ICE candidate", error);
+        }
       }
     }
   }
@@ -1853,24 +1865,26 @@
       {/if}
     </div>
 
-    <details class="debug-panel top-gap">
-      <summary>Diagnostic signaling ({signalLogs.length})</summary>
+    {#if uiDebugEnabled}
+      <details class="debug-panel top-gap">
+        <summary>Diagnostic signaling ({signalLogs.length})</summary>
 
-      {#if signalLogs.length === 0}
-        <p class="hint debug-empty">Aucun evenement signaling pour le moment.</p>
-      {:else}
-        {#each signalLogs as log, i (`${log.timestamp}-${i}`)}
-          <div class="signal-log">
-            <div class="signal-log-head">
-              <p class="mono">
-                [{log.timestamp}] {log.direction.toUpperCase()} {log.type} {log.from} -&gt; {log.to}
-              </p>
+        {#if signalLogs.length === 0}
+          <p class="hint debug-empty">Aucun evenement signaling pour le moment.</p>
+        {:else}
+          {#each signalLogs as log, i (`${log.timestamp}-${i}`)}
+            <div class="signal-log">
+              <div class="signal-log-head">
+                <p class="mono">
+                  [{log.timestamp}] {log.direction.toUpperCase()} {log.type} {log.from} -&gt; {log.to}
+                </p>
+              </div>
+              <p class="hint mono signal-log-payload">{log.payload || "(no payload)"}</p>
             </div>
-            <p class="hint mono signal-log-payload">{log.payload || "(no payload)"}</p>
-          </div>
-        {/each}
-      {/if}
-    </details>
+          {/each}
+        {/if}
+      </details>
+    {/if}
   </section>
   {/if}
 

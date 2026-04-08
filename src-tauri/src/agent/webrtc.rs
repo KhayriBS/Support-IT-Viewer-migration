@@ -89,9 +89,82 @@ fn parse_h264_payload_type_from_sdp(sdp: &str) -> Option<u8> {
     None
 }
 
+fn parse_first_ssrc_from_sdp(sdp: &str) -> Option<u32> {
+    for raw in sdp.lines() {
+        let line = raw.trim();
+        let Some(rest) = line.strip_prefix("a=ssrc:") else {
+            continue;
+        };
+        // Example: a=ssrc:123456789 cname:...
+        let mut chars = rest.chars();
+        let mut num = String::new();
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii_digit() {
+                num.push(ch);
+            } else {
+                break;
+            }
+        }
+        if num.is_empty() {
+            continue;
+        }
+        if let Ok(value) = num.parse::<u32>() {
+            if value != 0 {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 async fn resolve_h264_payload_type(peer: &Arc<RTCPeerConnection>) -> Option<u8> {
     let local = peer.local_description().await?;
     parse_h264_payload_type_from_sdp(&local.sdp)
+}
+
+async fn resolve_video_ssrc(peer: &Arc<RTCPeerConnection>) -> Option<u32> {
+    let local = peer.local_description().await?;
+    parse_first_ssrc_from_sdp(&local.sdp)
+}
+
+fn reorder_and_cache_sps_pps<'a>(
+    nalus: Vec<&'a [u8]>,
+    cached_sps: &mut Option<Vec<u8>>,
+    cached_pps: &mut Option<Vec<u8>>,
+) -> (Vec<&'a [u8]>, bool) {
+    let mut sps: Vec<&'a [u8]> = Vec::new();
+    let mut pps: Vec<&'a [u8]> = Vec::new();
+    let mut others: Vec<&'a [u8]> = Vec::new();
+    let mut has_idr = false;
+
+    for nal in nalus {
+        let Some(&first) = nal.first() else {
+            continue;
+        };
+        let nal_type = first & 0x1f;
+        match nal_type {
+            5 => {
+                has_idr = true;
+                others.push(nal);
+            }
+            7 => {
+                *cached_sps = Some(nal.to_vec());
+                sps.push(nal);
+            }
+            8 => {
+                *cached_pps = Some(nal.to_vec());
+                pps.push(nal);
+            }
+            _ => others.push(nal),
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(sps.len() + pps.len() + others.len() + 2);
+
+    ordered.extend_from_slice(&sps);
+    ordered.extend_from_slice(&pps);
+    ordered.extend_from_slice(&others);
+    (ordered, has_idr)
 }
 
 macro_rules! vlog {
@@ -581,8 +654,11 @@ async fn run_openh264_screen_sender(
     let mut payloader = H264Payloader::default();
     let frame_interval = frame_interval_for(preset);
     let keyframe_interval = (preset.target_fps.max(1) as u64).saturating_mul(5);
-    let stream_ssrc = derive_stream_ssrc();
+    let mut stream_ssrc: u32 = 0;
+    let mut negotiated_ssrc: Option<u32> = None;
     let mut negotiated_payload_type: Option<u8> = None;
+    let mut cached_sps: Option<Vec<u8>> = None;
+    let mut cached_pps: Option<Vec<u8>> = None;
     let mut seq: u16 = 1;
     let mut timestamp: u32 = 0;
     let ts_step: u32 = 90000 / preset.target_fps.max(1);
@@ -616,6 +692,12 @@ async fn run_openh264_screen_sender(
         }
 
         let payload_type = negotiated_payload_type.unwrap_or(96);
+
+        if negotiated_ssrc.is_none() {
+            negotiated_ssrc = resolve_video_ssrc(peer).await;
+            stream_ssrc = negotiated_ssrc.unwrap_or_else(derive_stream_ssrc);
+            println!("Using video SSRC: {stream_ssrc}");
+        }
 
         let capture_start = Instant::now();
         let mut reused_last_frame = false;
@@ -688,7 +770,8 @@ async fn run_openh264_screen_sender(
         }
 
         let payload_start = Instant::now();
-        let nalus = split_annexb_nalus(&encoded);
+        let raw_nalus = split_annexb_nalus(&encoded);
+        let (nalus, has_idr) = reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
         let nal_summary = summarize_nalus(&nalus);
         let payload_ms = payload_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -698,7 +781,68 @@ async fn run_openh264_screen_sender(
 
         let send_start = Instant::now();
         let mut total_fragments = 0usize;
-        for (nal_index, nal) in nalus.iter().enumerate() {
+        // If IDR is present but SPS/PPS missing in this access unit, prepend cached SPS/PPS (if any)
+        // as copied Bytes so lifetimes are correct.
+        let mut prefix: Vec<Bytes> = Vec::new();
+        if has_idr {
+            if !nal_summary.has_sps {
+                if let Some(sps) = cached_sps.as_deref() {
+                    prefix.push(Bytes::copy_from_slice(sps));
+                }
+            }
+            if !nal_summary.has_pps {
+                if let Some(pps) = cached_pps.as_deref() {
+                    prefix.push(Bytes::copy_from_slice(pps));
+                }
+            }
+        }
+
+        // Send optional prefix first (SPS/PPS), then the ordered NALs.
+        let total_nals_to_send = prefix.len() + nalus.len();
+        let mut nal_cursor = 0usize;
+
+        for bytes in prefix {
+            nal_cursor += 1;
+            let payloads = match payloader.payload(1200, &bytes) {
+                Ok(chunks) => chunks,
+                Err(err) => {
+                    eprintln!("H264 payload split failed: {err}");
+                    continue;
+                }
+            };
+            total_fragments = total_fragments.saturating_add(payloads.len());
+            let last_nal = nal_cursor == total_nals_to_send;
+            for (index, fragment) in payloads.iter().enumerate() {
+                if track.any_binding_paused().await {
+                    break;
+                }
+                let marker = last_nal && (index + 1 == payloads.len());
+                let packet = Packet {
+                    header: rtp::header::Header {
+                        version: 2,
+                        padding: false,
+                        extension: false,
+                        marker,
+                        payload_type,
+                        sequence_number: seq,
+                        timestamp: frame_ts,
+                        ssrc: stream_ssrc,
+                        csrc: vec![],
+                        extension_profile: 0,
+                        extensions: vec![],
+                        extensions_padding: 0,
+                    },
+                    payload: fragment.clone(),
+                };
+                if track.write_rtp(&packet).await.is_err() {
+                    break;
+                }
+                frame_sent = true;
+                seq = seq.wrapping_add(1);
+            }
+        }
+
+        for nal in nalus.iter() {
             if nal.is_empty() {
                 continue;
             }
@@ -713,7 +857,8 @@ async fn run_openh264_screen_sender(
             };
             total_fragments = total_fragments.saturating_add(payloads.len());
 
-            let last_nal = nal_index + 1 == nalus.len();
+            nal_cursor += 1;
+            let last_nal = nal_cursor == total_nals_to_send;
             for (index, fragment) in payloads.iter().enumerate() {
                 if track.any_binding_paused().await {
                     break;
@@ -790,8 +935,11 @@ async fn run_media_foundation_screen_sender(
 ) -> Result<(), String> {
     let frame_period = frame_interval_for(preset);
     let mut payloader = H264Payloader::default();
-    let stream_ssrc = derive_stream_ssrc();
+    let mut stream_ssrc: u32 = 0;
+    let mut negotiated_ssrc: Option<u32> = None;
     let mut negotiated_payload_type: Option<u8> = None;
+    let mut cached_sps: Option<Vec<u8>> = None;
+    let mut cached_pps: Option<Vec<u8>> = None;
     let mut seq: u16 = 1;
     let mut timestamp: u32 = 0;
     let ts_step: u32 = 90000 / preset.target_fps.max(1);
@@ -832,6 +980,12 @@ async fn run_media_foundation_screen_sender(
         }
 
         let payload_type = negotiated_payload_type.unwrap_or(96);
+
+        if negotiated_ssrc.is_none() {
+            negotiated_ssrc = resolve_video_ssrc(peer).await;
+            stream_ssrc = negotiated_ssrc.unwrap_or_else(derive_stream_ssrc);
+            println!("Using video SSRC: {stream_ssrc}");
+        }
 
         let capture_start = Instant::now();
         let mut reused_last_frame = false;
@@ -894,7 +1048,8 @@ async fn run_media_foundation_screen_sender(
                 continue;
             }
 
-            let nalus = split_annexb_nalus(&unit.data);
+            let raw_nalus = split_annexb_nalus(&unit.data);
+            let (nalus, has_idr) = reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
             let unit_summary = summarize_nalus(&nalus);
             nal_summary.nalus = nal_summary.nalus.saturating_add(unit_summary.nalus);
             nal_summary.has_sps |= unit_summary.has_sps;
@@ -903,7 +1058,65 @@ async fn run_media_foundation_screen_sender(
 
             let last_unit = unit_index + 1 == units_len;
 
-            for (nal_index, nal) in nalus.iter().enumerate() {
+            let mut prefix: Vec<Bytes> = Vec::new();
+            if has_idr {
+                if !unit_summary.has_sps {
+                    if let Some(sps) = cached_sps.as_deref() {
+                        prefix.push(Bytes::copy_from_slice(sps));
+                    }
+                }
+                if !unit_summary.has_pps {
+                    if let Some(pps) = cached_pps.as_deref() {
+                        prefix.push(Bytes::copy_from_slice(pps));
+                    }
+                }
+            }
+
+            let total_nals_to_send = prefix.len() + nalus.len();
+            let mut nal_cursor = 0usize;
+            for bytes in prefix {
+                nal_cursor += 1;
+                total_payload_bytes = total_payload_bytes.saturating_add(bytes.len());
+                let payloads = match payloader.payload(1200, &bytes) {
+                    Ok(chunks) => chunks,
+                    Err(err) => {
+                        eprintln!("H264 payload split failed (Media Foundation): {err}");
+                        continue;
+                    }
+                };
+                total_fragments = total_fragments.saturating_add(payloads.len());
+                let last_nal = last_unit && (nal_cursor == total_nals_to_send);
+                for (index, fragment) in payloads.iter().enumerate() {
+                    if track.any_binding_paused().await {
+                        break;
+                    }
+                    let marker = last_nal && (index + 1 == payloads.len());
+                    let packet = Packet {
+                        header: rtp::header::Header {
+                            version: 2,
+                            padding: false,
+                            extension: false,
+                            marker,
+                            payload_type,
+                            sequence_number: seq,
+                            timestamp: frame_ts,
+                            ssrc: stream_ssrc,
+                            csrc: vec![],
+                            extension_profile: 0,
+                            extensions: vec![],
+                            extensions_padding: 0,
+                        },
+                        payload: fragment.clone(),
+                    };
+                    if track.write_rtp(&packet).await.is_err() {
+                        break;
+                    }
+                    frame_sent = true;
+                    seq = seq.wrapping_add(1);
+                }
+            }
+
+            for nal in nalus.iter() {
                 if nal.is_empty() {
                     continue;
                 }
@@ -919,7 +1132,8 @@ async fn run_media_foundation_screen_sender(
                 };
                 total_fragments = total_fragments.saturating_add(payloads.len());
 
-                let last_nal = last_unit && (nal_index + 1 == nalus.len());
+                nal_cursor += 1;
+                let last_nal = last_unit && (nal_cursor == total_nals_to_send);
                 for (index, fragment) in payloads.iter().enumerate() {
                     if track.any_binding_paused().await {
                         break;
