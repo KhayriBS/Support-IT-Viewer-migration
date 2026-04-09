@@ -660,8 +660,8 @@ async fn run_openh264_screen_sender(
     let mut cached_sps: Option<Vec<u8>> = None;
     let mut cached_pps: Option<Vec<u8>> = None;
     let mut seq: u16 = 1;
-    let mut timestamp: u32 = 0;
-    let ts_step: u32 = 90000 / preset.target_fps.max(1);
+    let stream_clock_start = Instant::now();
+    let mut last_rtp_ts: u32 = 0;
     let mut frame_index: u64 = 0;
     let mut stats = StreamStatsWindow::new();
     let mut capturer = DxgiDesktopDuplicator::new()?;
@@ -775,8 +775,11 @@ async fn run_openh264_screen_sender(
         let nal_summary = summarize_nalus(&nalus);
         let payload_ms = payload_start.elapsed().as_secs_f64() * 1000.0;
 
-        let frame_ts = timestamp;
-        timestamp = timestamp.wrapping_add(ts_step);
+        let mut frame_ts = rtp_timestamp_90khz_from_instant(&stream_clock_start);
+        if frame_ts <= last_rtp_ts {
+            frame_ts = last_rtp_ts.wrapping_add(1);
+        }
+        last_rtp_ts = frame_ts;
         let mut frame_sent = false;
 
         let send_start = Instant::now();
@@ -921,7 +924,11 @@ async fn run_openh264_screen_sender(
             }
         }
         stats.flush_if_due(signaling).await;
-        tokio::time::sleep(frame_interval).await;
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_interval {
+            tokio::time::sleep(frame_interval - elapsed).await;
+        }
     }
 
     Ok(())
@@ -941,8 +948,8 @@ async fn run_media_foundation_screen_sender(
     let mut cached_sps: Option<Vec<u8>> = None;
     let mut cached_pps: Option<Vec<u8>> = None;
     let mut seq: u16 = 1;
-    let mut timestamp: u32 = 0;
-    let ts_step: u32 = 90000 / preset.target_fps.max(1);
+    let stream_clock_start = Instant::now();
+    let mut last_rtp_ts: u32 = 0;
     let mut frame_counter: u64 = 0;
     let mut stats = StreamStatsWindow::new();
     let mut capturer = DxgiDesktopDuplicator::new()?;
@@ -1035,8 +1042,11 @@ async fn run_media_foundation_screen_sender(
             continue;
         }
 
-        let frame_ts = timestamp;
-        timestamp = timestamp.wrapping_add(ts_step);
+        let mut frame_ts = rtp_timestamp_90khz_from_instant(&stream_clock_start);
+        if frame_ts <= last_rtp_ts {
+            frame_ts = last_rtp_ts.wrapping_add(1);
+        }
+        last_rtp_ts = frame_ts;
         let mut frame_sent = false;
         let mut total_payload_bytes = 0usize;
         let mut total_fragments = 0usize;
@@ -1201,6 +1211,15 @@ async fn run_media_foundation_screen_sender(
     }
 
     Ok(())
+}
+
+fn rtp_timestamp_90khz_from_instant(start: &Instant) -> u32 {
+    // RTP video timestamps are based on a 90kHz clock.
+    // Using a monotonic Instant keeps timestamps aligned with real time even when
+    // capture/encode time varies (prevents jittery playback).
+    let nanos = start.elapsed().as_nanos();
+    let ticks = (nanos.saturating_mul(90_000)) / 1_000_000_000;
+    ticks as u32
 }
 
 async fn run_ffmpeg_rtp_screen_sender(
