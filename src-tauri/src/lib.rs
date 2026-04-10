@@ -10,6 +10,7 @@ use tauri::State;
 pub mod agent;
 
 use agent::metrics::{AgentMetrics, MetricsCollector};
+use agent::webrtc::IceServerConfig;
 use agent::session::{
     get_file_list, join_session, leave_session, send_chat_message, start_agent, stop_agent,
     AgentStatus, SharedState,
@@ -124,6 +125,11 @@ fn get_file_list_cmd(path: String) -> FileListResponse {
     get_file_list(&path)
 }
 
+#[tauri::command]
+async fn get_ice_servers_cmd() -> Result<Vec<IceServerConfig>, String> {
+    Ok(agent::webrtc::resolve_ice_servers_for_frontend().await)
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 /// Legacy greet command (kept for Tauri template compatibility).
@@ -157,6 +163,8 @@ pub fn run() {
             send_chat,
             // file transfer
             get_file_list_cmd,
+            // webrtc
+            get_ice_servers_cmd,
             // legacy
             greet,
         ])

@@ -43,7 +43,7 @@ pub struct AgentAuthService {
 }
 
 impl AgentAuthService {
-    /// Creates a new service. `server_url` example: `"http://192.168.218.49:8080"`.
+    /// Creates a new service. `server_url` example: `"http://192.168.1.179:8080"`.
     pub fn new(server_url: impl Into<String>) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))

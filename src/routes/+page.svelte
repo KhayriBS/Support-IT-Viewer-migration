@@ -77,6 +77,7 @@
   let viewerFullscreenActive = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
+  let viewerIceServers = $state<RTCIceServer[]>([{ urls: "stun:stun.l.google.com:19302" }]);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
   let screenFrameUrl = $state<string>("");
@@ -577,6 +578,84 @@
     return "qualite excellente";
   }
 
+  function resolveIceServers(): RTCIceServer[] {
+    const env = (import.meta as unknown as { env?: Record<string, unknown> }).env ?? {};
+    const raw = typeof env.VITE_ICE_SERVERS === "string" ? env.VITE_ICE_SERVERS.trim() : "";
+
+    if (!raw) {
+      return [{ urls: "stun:stun.l.google.com:19302" }];
+    }
+
+    if (raw.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          return parsed as RTCIceServer[];
+        }
+      } catch {
+        // ignore parsing errors
+      }
+      return [{ urls: "stun:stun.l.google.com:19302" }];
+    }
+
+    const urls = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (urls.length === 0) {
+      return [{ urls: "stun:stun.l.google.com:19302" }];
+    }
+
+    return [{ urls }];
+  }
+
+  async function refreshViewerIceServers() {
+    try {
+      const servers = await invoke<Array<{ urls: string[] | string; username?: string; credential?: string }>>(
+        "get_ice_servers_cmd"
+      );
+
+      if (!Array.isArray(servers) || servers.length === 0) {
+        viewerIceServers = resolveIceServers();
+        return;
+      }
+
+      const normalized: RTCIceServer[] = [];
+      for (const server of servers) {
+        const urls = Array.isArray(server.urls)
+          ? server.urls.filter((url): url is string => typeof url === "string" && !!url.trim())
+          : typeof server.urls === "string" && server.urls.trim()
+            ? [server.urls.trim()]
+            : [];
+
+        if (urls.length === 0) {
+          continue;
+        }
+
+        const iceServer: RTCIceServer = {
+          urls: urls.length === 1 ? urls[0] : urls
+        };
+
+        if (typeof server.username === "string") {
+          iceServer.username = server.username;
+        }
+        if (typeof server.credential === "string") {
+          iceServer.credential = server.credential;
+        }
+
+        normalized.push(iceServer);
+      }
+      viewerIceServers = normalized;
+
+      if (viewerIceServers.length === 0) {
+        viewerIceServers = resolveIceServers();
+      }
+    } catch {
+      viewerIceServers = resolveIceServers();
+    }
+  }
+
   function formatSignalPayload(type: SignalMessage["type"], payload: unknown) {
     if (payload === undefined || payload === null) {
       return "";
@@ -992,7 +1071,7 @@
     }
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      iceServers: viewerIceServers
     });
 
     // Needed to produce an SDP offer even before media integration is complete.
@@ -1475,6 +1554,7 @@
 
     void syncAgentLifecycle();
     void loadLocalMachineId();
+    void refreshViewerIceServers();
     refreshMetrics();
     refreshOnlineAgents();
     void checkPendingApproval();

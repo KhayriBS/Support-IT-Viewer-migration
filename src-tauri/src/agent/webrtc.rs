@@ -1,5 +1,7 @@
 use serde_json::Value;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -34,6 +36,217 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IceServerConfig {
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+fn default_ice_servers() -> Vec<IceServerConfig> {
+    vec![IceServerConfig {
+        urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+        username: None,
+        credential: None,
+    }]
+}
+
+fn read_env_or_local(key: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(key) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Standard command (`npm run tauri dev/build`) may not inject process env vars.
+    // Fall back to reading local .env files from common working directories.
+    let candidates = [Path::new(".env.local"), Path::new("../.env.local")];
+
+    for path in candidates {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((name, value)) = line.split_once('=') else {
+                continue;
+            };
+
+            if name.trim() != key {
+                continue;
+            }
+
+            let mut parsed = value.trim().to_string();
+            if parsed.len() >= 2 {
+                let quoted_with_single = parsed.starts_with('\'') && parsed.ends_with('\'');
+                let quoted_with_double = parsed.starts_with('"') && parsed.ends_with('"');
+                if quoted_with_single || quoted_with_double {
+                    parsed = parsed[1..parsed.len() - 1].to_string();
+                }
+            }
+
+            if !parsed.is_empty() {
+                return Some(parsed);
+            }
+        }
+    }
+
+    None
+}
+
+fn to_rtc_ice_servers(input: &[IceServerConfig]) -> Vec<RTCIceServer> {
+    input
+        .iter()
+        .map(|server| RTCIceServer {
+            urls: server.urls.clone(),
+            username: server.username.clone().unwrap_or_default(),
+            credential: server.credential.clone().unwrap_or_default(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn parse_ice_servers_from_json(raw: &str) -> Option<Vec<IceServerConfig>> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let array = if let Some(items) = value.as_array() {
+        items.clone()
+    } else {
+        value
+            .get("iceServers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()?
+    };
+
+    let mut servers = Vec::new();
+    for item in array {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+
+        let urls = if let Some(urls_array) = obj.get("urls").and_then(serde_json::Value::as_array) {
+            urls_array
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        } else if let Some(single) = obj.get("urls").and_then(serde_json::Value::as_str) {
+            vec![single.to_string()]
+        } else if let Some(single) = obj.get("url").and_then(serde_json::Value::as_str) {
+            vec![single.to_string()]
+        } else {
+            Vec::new()
+        };
+
+        if urls.is_empty() {
+            continue;
+        }
+
+        let username = obj
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let credential = obj
+            .get("credential")
+            .or_else(|| obj.get("password"))
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+
+        servers.push(IceServerConfig {
+            urls,
+            username,
+            credential,
+        });
+    }
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
+fn load_ice_servers_from_env() -> Option<Vec<IceServerConfig>> {
+    // Supports either:
+    // - LUMIERE_ICE_SERVERS='[{"urls":["stun:..." ]},{"urls":["turn:..."],"username":"u","credential":"p"}]'
+    // - LUMIERE_ICE_SERVERS='stun:stun.l.google.com:19302,turn:turn.example.com:3478'
+    let raw = read_env_or_local("LUMIERE_ICE_SERVERS").map(|s| s.trim().to_string());
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return None;
+    };
+
+    if raw.starts_with('[') {
+        return parse_ice_servers_from_json(&raw);
+    }
+
+    let urls: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if urls.is_empty() {
+        return None;
+    }
+
+    Some(vec![IceServerConfig {
+        urls,
+        username: None,
+        credential: None,
+    }])
+}
+
+async fn load_ice_servers_from_metered() -> Option<Vec<IceServerConfig>> {
+    let domain = read_env_or_local("LUMIERE_METERED_DOMAIN")?
+        .trim()
+        .to_string();
+    let api_key = read_env_or_local("LUMIERE_METERED_API_KEY")?
+        .trim()
+        .to_string();
+    if domain.is_empty() || api_key.is_empty() {
+        return None;
+    }
+
+    let endpoint = format!(
+        "https://{domain}/api/v1/turn/credentials?apiKey={api_key}",
+        domain = domain,
+        api_key = api_key
+    );
+
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
+    let body = response.text().await.ok()?;
+    parse_ice_servers_from_json(&body)
+}
+
+pub async fn resolve_ice_servers_for_frontend() -> Vec<IceServerConfig> {
+    if let Some(env_servers) = load_ice_servers_from_env() {
+        return env_servers;
+    }
+    if let Some(metered_servers) = load_ice_servers_from_metered().await {
+        return metered_servers;
+    }
+    default_ice_servers()
+}
+
+async fn resolve_ice_servers_for_peer() -> Vec<RTCIceServer> {
+    let servers = resolve_ice_servers_for_frontend().await;
+    to_rtc_ice_servers(&servers)
+}
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc_util::marshal::Unmarshal;
 
@@ -347,10 +560,7 @@ impl AgentWebRtc {
             .build();
 
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
+            ice_servers: resolve_ice_servers_for_peer().await,
             ..Default::default()
         };
 

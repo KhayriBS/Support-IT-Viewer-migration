@@ -1,7 +1,7 @@
 import type { SignalMessage } from "$lib/api/types";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "")
-  ?? "http://192.168.218.49:8080";
+  ?? "http://192.168.1.179:8080";
 
 const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined)?.replace(/\/$/, "")
   ?? API_URL.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
