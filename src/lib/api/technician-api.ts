@@ -10,7 +10,7 @@ import type {
 } from "$lib/api/types";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "")
-  ?? "http://192.168.1.179:8080";
+  ?? "http://196.187.133.6:8080";
 
 type HttpMethod = "GET" | "POST";
 
