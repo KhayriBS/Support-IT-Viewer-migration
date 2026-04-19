@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use super::desktop_duplication::{DesktopFrame, DxgiDesktopDuplicator};
 use super::media_foundation_encoder::MediaFoundationEncoderWorker;
@@ -28,6 +29,7 @@ use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -48,11 +50,22 @@ pub struct IceServerConfig {
 }
 
 fn default_ice_servers() -> Vec<IceServerConfig> {
-    vec![IceServerConfig {
-        urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-        username: None,
-        credential: None,
-    }]
+    vec![
+        IceServerConfig {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            username: None,
+            credential: None,
+        },
+        IceServerConfig {
+            urls: vec![
+                "turn:openrelay.metered.ca:80".to_owned(),
+                "turn:openrelay.metered.ca:443".to_owned(),
+                "turns:openrelay.metered.ca:443".to_owned(),
+            ],
+            username: Some("openrelayproject".to_owned()),
+            credential: Some("openrelayproject".to_owned()),
+        },
+    ]
 }
 
 fn read_env_or_local(key: &str) -> Option<String> {
@@ -107,11 +120,62 @@ fn read_env_or_local(key: &str) -> Option<String> {
 fn to_rtc_ice_servers(input: &[IceServerConfig]) -> Vec<RTCIceServer> {
     input
         .iter()
-        .map(|server| RTCIceServer {
-            urls: server.urls.clone(),
-            username: server.username.clone().unwrap_or_default(),
-            credential: server.credential.clone().unwrap_or_default(),
-            ..Default::default()
+        .filter_map(|server| {
+            // `webrtc-rs` may fail peer initialization with `turns:` URLs on some builds.
+            // Keep STUN/TURN entries and drop only unsupported TURNS entries on the agent side
+            // so SDP answer generation is never blocked.
+            let urls: Vec<String> = server
+                .urls
+                .iter()
+                .filter_map(|url| {
+                    let trimmed = url.trim();
+                    if trimmed.is_empty() || trimmed.starts_with("turns:") {
+                        return None;
+                    }
+                    Some(trimmed.to_string())
+                })
+                .collect();
+
+            if urls.is_empty() {
+                return None;
+            }
+
+            let has_turn = urls
+                .iter()
+                .any(|url| url.starts_with("turn:"));
+            let username = server
+                .username
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let credential = server
+                .credential
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+
+            if has_turn && (username.is_empty() || credential.is_empty()) {
+                eprintln!(
+                    "Skipping TURN ICE server without credentials: {:?}",
+                    urls
+                );
+                return None;
+            }
+
+            let mut rtc_ice = RTCIceServer {
+                urls,
+                username,
+                credential,
+                ..Default::default()
+            };
+
+            if has_turn {
+                rtc_ice.credential_type = RTCIceCredentialType::Password;
+            }
+
+            Some(rtc_ice)
         })
         .collect()
 }
@@ -486,6 +550,7 @@ pub struct AgentWebRtc {
     signaling: Arc<SignalingClient>,
     peer: Arc<RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticRTP>,
+    pending_remote_ice: Mutex<Vec<RTCIceCandidateInit>>,
 }
 
 struct StreamStatsWindow {
@@ -679,7 +744,17 @@ impl AgentWebRtc {
         let peer_for_state = Arc::clone(&peer);
         peer.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             println!("WebRTC connection state: {state:?}");
-            let _ = &peer_for_state;
+            if state == RTCPeerConnectionState::Failed {
+                let peer_for_recovery = Arc::clone(&peer_for_state);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if peer_for_recovery.connection_state() == RTCPeerConnectionState::Failed {
+                        eprintln!(
+                            "WebRTC still failed after delay; waiting for signaling renegotiation"
+                        );
+                    }
+                });
+            }
             Box::pin(async {})
         }));
 
@@ -687,6 +762,7 @@ impl AgentWebRtc {
             signaling,
             peer,
             video_track,
+            pending_remote_ice: Mutex::new(Vec::new()),
         })
     }
 
@@ -714,7 +790,16 @@ impl AgentWebRtc {
             .await
             .map_err(|e| format!("set_remote_description failed: {e}"))?;
 
-        let mut gather_complete = self.peer.gathering_complete_promise().await;
+        // Apply any ICE candidates that arrived before remote description was set.
+        let pending_candidates = {
+            let mut queue = self.pending_remote_ice.lock().await;
+            std::mem::take(&mut *queue)
+        };
+        for candidate in pending_candidates {
+            if let Err(err) = self.peer.add_ice_candidate(candidate).await {
+                eprintln!("Failed to apply queued remote ICE candidate: {err}");
+            }
+        }
 
         let answer = self
             .peer
@@ -726,8 +811,6 @@ impl AgentWebRtc {
             .set_local_description(answer)
             .await
             .map_err(|e| format!("set_local_description failed: {e}"))?;
-
-        let _ = gather_complete.recv().await;
 
         let local = self
             .peer
@@ -837,10 +920,18 @@ impl AgentWebRtc {
             init.sdp_mline_index = Some(index as u16);
         }
 
-        self.peer
-            .add_ice_candidate(init)
-            .await
-            .map_err(|e| format!("add_ice_candidate failed: {e}"))
+        match self.peer.add_ice_candidate(init.clone()).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.to_ascii_lowercase().contains("remote description") {
+                    let mut queue = self.pending_remote_ice.lock().await;
+                    queue.push(init);
+                    return Ok(());
+                }
+                Err(format!("add_ice_candidate failed: {err}"))
+            }
+        }
     }
 }
 

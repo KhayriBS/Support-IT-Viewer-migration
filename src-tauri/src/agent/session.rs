@@ -11,6 +11,8 @@
 //!   stop_agent()  → graceful shutdown
 
 use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{interval, Duration};
 
@@ -255,6 +257,17 @@ pub async fn join_session(
             
             match client.connect(&token_clone, event_tx).await {
                 Ok(_) => {
+                    if let Err(err) = client
+                        .send(super::signaling::SignalMessage::new(
+                            SignalType::Join,
+                            "viewer",
+                            Some(serde_json::json!({ "role": "agent" })),
+                        ))
+                        .await
+                    {
+                        eprintln!("⚠️ Envoi JOIN agent échoué: {err}");
+                    }
+
                     println!("⏳ En attente de l'OFFER du viewer…");
                     reconnect_delay = Duration::from_secs(1); // reset backoff on successful connect
                     
@@ -323,6 +336,7 @@ async fn dispatch_signals(
     let mut webrtc: Option<AgentWebRtc> = None;
     let mut h264_sender_started = false;
     let mut startup_preview_started = false;
+    let mut last_offer_fingerprint: Option<u64> = None;
 
     while let Some(msg) = event_rx.recv().await {
         let sig_client = {
@@ -338,6 +352,24 @@ async fn dispatch_signals(
             // ── SDP Offer → create Answer ──────────────────────────────
             SignalType::Offer => {
                 println!("📥 Offer SDP reçu du viewer");
+
+                let current_offer_fingerprint = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("sdp"))
+                    .and_then(|value| value.as_str())
+                    .map(|sdp| {
+                        let mut hasher = DefaultHasher::new();
+                        sdp.hash(&mut hasher);
+                        hasher.finish()
+                    });
+
+                if current_offer_fingerprint.is_some()
+                    && current_offer_fingerprint == last_offer_fingerprint
+                {
+                    println!("⚠️ OFFER dupliqué ignoré (même SDP)");
+                    continue;
+                }
 
                 if webrtc.is_none() {
                     match AgentWebRtc::new(
@@ -359,6 +391,7 @@ async fn dispatch_signals(
                 if let (Some(pc), Some(payload)) = (webrtc.as_ref(), msg.payload.as_ref()) {
                     match pc.handle_offer(payload).await {
                         Ok(answer_payload) => {
+                            last_offer_fingerprint = current_offer_fingerprint;
                             if let Err(e) = sig.send_answer(answer_payload).await {
                                 eprintln!("❌ Envoi ANSWER échoué: {e}");
                             } else {
@@ -437,6 +470,14 @@ async fn dispatch_signals(
                 println!("🚪 Signal LEAVE reçu — fermeture de la session");
                 leave_session(Arc::clone(&state)).await;
                 break;
+            }
+
+            SignalType::Error => {
+                if let Some(payload) = &msg.payload {
+                    eprintln!("⚠️ Signal ERROR serveur: {payload}");
+                } else {
+                    eprintln!("⚠️ Signal ERROR serveur sans payload");
+                }
             }
 
             // ── File: list request ────────────────────────────────────

@@ -17,7 +17,9 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter,
         IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        DXGI_OUTPUT_DESC,
     };
+    use screenshots::Screen;
 
     #[derive(Clone, Debug)]
     pub struct DesktopFrame {
@@ -101,12 +103,18 @@ mod imp {
     }
 
     pub struct DxgiDesktopDuplicator {
-        device: ID3D11Device,
-        context: ID3D11DeviceContext,
-        duplication: IDXGIOutputDuplication,
+        device: Option<ID3D11Device>,
+        context: Option<ID3D11DeviceContext>,
+        duplication: Option<IDXGIOutputDuplication>,
+        fallback_screen: Option<Screen>,
         staging_texture: Option<ID3D11Texture2D>,
         cached_width: u32,
         cached_height: u32,
+    }
+
+    fn utf16_fixed_to_string(input: &[u16]) -> String {
+        let end = input.iter().position(|c| *c == 0).unwrap_or(input.len());
+        String::from_utf16_lossy(&input[..end])
     }
 
     impl DxgiDesktopDuplicator {
@@ -114,47 +122,149 @@ mod imp {
             unsafe {
                 let factory: IDXGIFactory1 =
                     CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))?;
-                let adapter: IDXGIAdapter1 = factory
-                    .EnumAdapters1(0)
-                    .map_err(|err| format!("EnumAdapters1 failed: {err}"))?;
-                let base_adapter: IDXGIAdapter = adapter
-                    .cast()
-                    .map_err(|err| format!("IDXGIAdapter1 cast failed: {err}"))?;
-                let output = adapter
-                    .EnumOutputs(0)
-                    .map_err(|err| format!("EnumOutputs failed: {err}"))?;
-                let output1: IDXGIOutput1 = output
-                    .cast()
-                    .map_err(|err| format!("IDXGIOutput1 cast failed: {err}"))?;
-
                 let feature_levels: [D3D_FEATURE_LEVEL; 2] =
                     [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-                let mut device = None;
-                let mut context = None;
 
-                D3D11CreateDevice(
-                    Some(&base_adapter),
-                    D3D_DRIVER_TYPE_UNKNOWN,
-                    None,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    Some(&feature_levels),
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )
-                .map_err(|err| format!("D3D11CreateDevice failed: {err}"))?;
+                let mut last_error = "No DXGI output scanned".to_string();
 
-                let device = device.ok_or_else(|| "D3D11 device unavailable".to_string())?;
-                let context = context.ok_or_else(|| "D3D11 context unavailable".to_string())?;
-                let duplication = output1
-                    .DuplicateOutput(&device)
-                    .map_err(|err| format!("DuplicateOutput failed: {err}"))?;
+                for adapter_index in 0..16u32 {
+                    let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
+                        Ok(adapter) => adapter,
+                        Err(_) => break,
+                    };
+
+                    let adapter_desc = match adapter.GetDesc1() {
+                        Ok(desc) => desc,
+                        Err(err) => {
+                            last_error =
+                                format!("GetDesc1 failed on adapter #{adapter_index}: {err}");
+                            continue;
+                        }
+                    };
+                    let adapter_name = utf16_fixed_to_string(&adapter_desc.Description);
+
+                    let base_adapter: IDXGIAdapter = match adapter.cast() {
+                        Ok(adapter) => adapter,
+                        Err(err) => {
+                            last_error = format!("Adapter cast failed on #{adapter_index}: {err}");
+                            continue;
+                        }
+                    };
+
+                    let mut device = None;
+                    let mut context = None;
+                    if let Err(err) = D3D11CreateDevice(
+                        Some(&base_adapter),
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        None,
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        Some(&feature_levels),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    ) {
+                        last_error = format!("D3D11CreateDevice failed on adapter #{adapter_index}: {err}");
+                        continue;
+                    }
+
+                    let Some(device) = device else {
+                        last_error = format!("D3D11 device unavailable on adapter #{adapter_index}");
+                        continue;
+                    };
+                    let Some(context) = context else {
+                        last_error = format!("D3D11 context unavailable on adapter #{adapter_index}");
+                        continue;
+                    };
+
+                    for output_index in 0..16u32 {
+                        let output = match adapter.EnumOutputs(output_index) {
+                            Ok(output) => output,
+                            Err(_) => break,
+                        };
+
+                        let output_desc: DXGI_OUTPUT_DESC = match output.GetDesc() {
+                            Ok(desc) => desc,
+                            Err(err) => {
+                                last_error = format!(
+                                    "GetDesc failed on adapter #{adapter_index} output #{output_index}: {err}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        if !output_desc.AttachedToDesktop.as_bool() {
+                            println!(
+                                "DXGI skip output #{output_index} on adapter #{adapter_index} ({adapter_name}): not attached to desktop"
+                            );
+                            continue;
+                        }
+
+                        let output1: IDXGIOutput1 = match output.cast() {
+                            Ok(output1) => output1,
+                            Err(err) => {
+                                last_error = format!(
+                                    "IDXGIOutput1 cast failed on adapter #{adapter_index} output #{output_index}: {err}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        match output1.DuplicateOutput(&device) {
+                            Ok(duplication) => {
+                                let width = (output_desc.DesktopCoordinates.right
+                                    - output_desc.DesktopCoordinates.left)
+                                    .max(0) as u32;
+                                let height = (output_desc.DesktopCoordinates.bottom
+                                    - output_desc.DesktopCoordinates.top)
+                                    .max(0) as u32;
+                                println!(
+                                    "DXGI selected adapter #{adapter_index} ({adapter_name}) output #{output_index}: {}x{}",
+                                    width,
+                                    height
+                                );
+
+                                return Ok(Self {
+                                    device: Some(device),
+                                    context: Some(context),
+                                    duplication: Some(duplication),
+                                    fallback_screen: None,
+                                    staging_texture: None,
+                                    cached_width: 0,
+                                    cached_height: 0,
+                                });
+                            }
+                            Err(err) => {
+                                last_error = format!(
+                                    "DuplicateOutput failed on adapter #{adapter_index} ({adapter_name}) output #{output_index}: {err}"
+                                );
+                                println!("{last_error}");
+                            }
+                        }
+                    }
+                }
+
+                let screens = Screen::all()
+                    .map_err(|err| format!("Aucun output DXGI valide. Fallback screenshots indisponible: {err}. Dernier diagnostic DXGI: {last_error}"))?;
+                let fallback_screen = screens
+                    .iter()
+                    .copied()
+                    .find(|s| s.display_info.is_primary)
+                    .or_else(|| screens.first().copied())
+                    .ok_or_else(|| format!("Aucun écran disponible pour fallback screenshots. Dernier diagnostic DXGI: {last_error}"))?;
+
+                println!(
+                    "DXGI indisponible, fallback screenshots activé sur display {} ({}x{})",
+                    fallback_screen.display_info.id,
+                    fallback_screen.display_info.width,
+                    fallback_screen.display_info.height
+                );
 
                 Ok(Self {
-                    device,
-                    context,
-                    duplication,
+                    device: None,
+                    context: None,
+                    duplication: None,
+                    fallback_screen: Some(fallback_screen),
                     staging_texture: None,
                     cached_width: 0,
                     cached_height: 0,
@@ -166,12 +276,41 @@ mod imp {
             &mut self,
             timeout_ms: u32,
         ) -> Result<Option<DesktopFrame>, String> {
+            if let Some(screen) = self.fallback_screen {
+                if timeout_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (timeout_ms.min(33)) as u64,
+                    ));
+                }
+
+                let rgba = screen
+                    .capture()
+                    .map_err(|err| format!("screenshots capture failed: {err}"))?;
+                let width = rgba.width() as usize;
+                let height = rgba.height() as usize;
+                let mut bgra = rgba.into_raw();
+                for px in bgra.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+
+                return Ok(Some(DesktopFrame {
+                    width,
+                    height,
+                    stride: width * 4,
+                    captured_at: Instant::now(),
+                    bgra,
+                }));
+            }
+
             unsafe {
+                let duplication = self
+                    .duplication
+                    .as_ref()
+                    .ok_or_else(|| "DXGI duplication unavailable".to_string())?
+                    .clone();
                 let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
                 let mut desktop_resource: Option<IDXGIResource> = None;
-                match self
-                    .duplication
-                    .AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
+                match duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
                 {
                     Ok(()) => {}
                     Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -204,10 +343,14 @@ mod imp {
                     .cast()
                     .map_err(|err| format!("Staging->Resource cast failed: {err}"))?;
 
-                self.context.CopyResource(&staging_resource, &source_resource);
+                let context = self
+                    .context
+                    .as_ref()
+                    .ok_or_else(|| "D3D11 context unavailable".to_string())?;
+                context.CopyResource(&staging_resource, &source_resource);
 
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context
+                context
                     .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                     .map_err(|err| format!("Map staging texture failed: {err}"))?;
 
@@ -223,8 +366,8 @@ mod imp {
                     dst_row.copy_from_slice(src_row);
                 }
 
-                self.context.Unmap(staging, 0);
-                let _ = self.duplication.ReleaseFrame();
+                context.Unmap(staging, 0);
+                let _ = duplication.ReleaseFrame();
 
                 Ok(Some(DesktopFrame {
                     width,
@@ -261,7 +404,11 @@ mod imp {
             };
 
             let mut staging = None;
-            self.device
+            let device = self
+                .device
+                .as_ref()
+                .ok_or_else(|| "D3D11 device unavailable".to_string())?;
+            device
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging))
                 .map_err(|err| format!("CreateTexture2D staging failed: {err}"))?;
 

@@ -1,7 +1,7 @@
 import type { SignalMessage } from "$lib/api/types";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "")
-  ?? "http://196.187.133.6:8080";
+  ?? "https://signaling-server-tgsj.onrender.com";
 
 const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined)?.replace(/\/$/, "")
   ?? API_URL.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");

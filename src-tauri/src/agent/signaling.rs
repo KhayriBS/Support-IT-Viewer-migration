@@ -171,8 +171,16 @@ impl SignalingClient {
                             Err(e) => eprintln!("⚠️ Parse signal error: {e} — {text}"),
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        println!("🔌 Serveur a fermé la connexion");
+                    Ok(Message::Close(frame)) => {
+                        if let Some(frame) = frame {
+                            println!(
+                                "🔌 Serveur a fermé la connexion (code: {}, reason: {})",
+                                frame.code,
+                                frame.reason
+                            );
+                        } else {
+                            println!("🔌 Serveur a fermé la connexion (sans détail)");
+                        }
                         break;
                     }
                     Err(e) => {

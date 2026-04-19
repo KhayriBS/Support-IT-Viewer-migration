@@ -59,6 +59,8 @@
   let detachErrorListener: (() => void) | null = null;
   let viewerPeerConnection: RTCPeerConnection | null = null;
   let viewerControlChannel: RTCDataChannel | null = null;
+  let viewerSignalProcessing: Promise<void> = Promise.resolve();
+  let pendingViewerIceCandidates: RTCIceCandidateInit[] = [];
   let viewerAnswerReceived = false;
   let viewerOfferRetryTimer: ReturnType<typeof setInterval> | null = null;
   let viewerOfferRetryCount = 0;
@@ -77,7 +79,19 @@
   let viewerFullscreenActive = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
-  let viewerIceServers = $state<RTCIceServer[]>([{ urls: "stun:stun.l.google.com:19302" }]);
+  const defaultViewerIceServers: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    {
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turns:openrelay.metered.ca:443"
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ];
+  let viewerIceServers = $state<RTCIceServer[]>(defaultViewerIceServers);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
   let screenFrameUrl = $state<string>("");
@@ -583,7 +597,7 @@
     const raw = typeof env.VITE_ICE_SERVERS === "string" ? env.VITE_ICE_SERVERS.trim() : "";
 
     if (!raw) {
-      return [{ urls: "stun:stun.l.google.com:19302" }];
+      return defaultViewerIceServers;
     }
 
     if (raw.startsWith("[")) {
@@ -595,7 +609,7 @@
       } catch {
         // ignore parsing errors
       }
-      return [{ urls: "stun:stun.l.google.com:19302" }];
+      return defaultViewerIceServers;
     }
 
     const urls = raw
@@ -604,7 +618,7 @@
       .filter(Boolean);
 
     if (urls.length === 0) {
-      return [{ urls: "stun:stun.l.google.com:19302" }];
+      return defaultViewerIceServers;
     }
 
     return [{ urls }];
@@ -989,6 +1003,8 @@
     stopViewerOfferRetry();
     stopViewerControlsAutoHide();
     viewerAnswerReceived = false;
+    viewerSignalProcessing = Promise.resolve();
+    pendingViewerIceCandidates = [];
     viewerOfferRetryCount = 0;
     viewerDataChannelOpen = false;
     viewerKeyboardCaptured = false;
@@ -1201,6 +1217,16 @@
   }
 
   async function handleIncomingSignal(message: SignalMessage) {
+    if (message.type === "ERROR") {
+      const payload = message.payload as Record<string, unknown> | null;
+      const reason =
+        (typeof payload?.error === "string" && payload.error) ||
+        (typeof payload?.message === "string" && payload.message) ||
+        "Erreur signaling recue depuis l'agent.";
+      screenFrameError = reason;
+      return;
+    }
+
     if (message.type === "STREAM_STATS") {
       const payload = message.payload as Record<string, unknown> | null;
       viewerStreamMbps = Number(payload?.mbps ?? 0);
@@ -1280,6 +1306,20 @@
         type: payload.type as RTCSdpType,
         sdp: payload.sdp
       });
+
+      if (pendingViewerIceCandidates.length > 0) {
+        const queued = pendingViewerIceCandidates;
+        pendingViewerIceCandidates = [];
+        for (const candidate of queued) {
+          try {
+            await pc.addIceCandidate(candidate);
+          } catch (error) {
+            if (uiDebugEnabled) {
+              console.error("Failed to apply queued remote ICE candidate", error);
+            }
+          }
+        }
+      }
       return;
     }
 
@@ -1294,12 +1334,20 @@
         return;
       }
 
+      const candidateInit: RTCIceCandidateInit = {
+        candidate: payload.candidate,
+        sdpMid: payload.sdpMid ?? null,
+        sdpMLineIndex: payload.sdpMLineIndex ?? null
+      };
+
+      const pc = viewerPeerConnection;
+      if (!pc.remoteDescription) {
+        pendingViewerIceCandidates.push(candidateInit);
+        return;
+      }
+
       try {
-        await viewerPeerConnection.addIceCandidate({
-          candidate: payload.candidate,
-          sdpMid: payload.sdpMid ?? null,
-          sdpMLineIndex: payload.sdpMLineIndex ?? null
-        });
+        await pc.addIceCandidate(candidateInit);
       } catch (error) {
         if (uiDebugEnabled) {
           console.error("Failed to add remote ICE candidate", error);
@@ -1393,7 +1441,13 @@
 
       detachMessageListener = signalingClient.onMessage((message) => {
         logSignal("in", message);
-        void handleIncomingSignal(message);
+        viewerSignalProcessing = viewerSignalProcessing
+          .then(() => handleIncomingSignal(message))
+          .catch((error) => {
+            if (uiDebugEnabled) {
+              console.error("Signal processing failed", error);
+            }
+          });
       });
 
       detachCloseListener = signalingClient.onClose(() => {
