@@ -57,6 +57,9 @@
   let detachMessageListener: (() => void) | null = null;
   let detachCloseListener: (() => void) | null = null;
   let detachErrorListener: (() => void) | null = null;
+  let signalingManualDisconnect = false;
+  let signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let signalingReconnectAttempts = 0;
   let viewerPeerConnection: RTCPeerConnection | null = null;
   let viewerControlChannel: RTCDataChannel | null = null;
   let viewerSignalProcessing: Promise<void> = Promise.resolve();
@@ -73,6 +76,11 @@
   let viewerRemoteStream = $state<MediaStream | null>(null);
   let viewerDataChannelOpen = $state(false);
   let viewerKeyboardCaptured = $state(false);
+  let lastViewerMouseMoveSentAt = 0;
+  let lastViewerWheelSentAt = 0;
+  let lastViewerPointerSent: { x: number; y: number } | null = null;
+  const viewerMouseMoveMinIntervalMs = 1000 / 90;
+  const viewerWheelMinIntervalMs = 1000 / 60;
   let viewerConnectionState = $state<string>("idle");
   let viewerControlsVisible = $state(true);
   let viewerExpanded = $state(false);
@@ -94,6 +102,14 @@
   let viewerIceServers = $state<RTCIceServer[]>(defaultViewerIceServers);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
+  let viewerPlaybackProfile = $state<"responsive" | "quality">("responsive");
+  let viewerProfileManualOverride = false;
+  let viewerProfileAutoUpgradeTimer: ReturnType<typeof setTimeout> | null = null;
+  const viewerAutoUpgradeDelayMs = 7000;
+  const viewerAutoUpgradeMinMbps = 1.8;
+  const viewerAutoUpgradeMinFps = 28;
+  const streamProfileSignalEnabled =
+    String((import.meta.env.VITE_ENABLE_STREAM_PROFILE_SIGNAL ?? "")).trim().toLowerCase() === "true";
   let screenFrameUrl = $state<string>("");
   let screenFrameAt = $state<string>("");
   let screenFrameCount = $state<number>(0);
@@ -737,6 +753,28 @@
     detachErrorListener = null;
   }
 
+  function stopSignalingReconnect() {
+    if (signalingReconnectTimer) {
+      clearTimeout(signalingReconnectTimer);
+      signalingReconnectTimer = null;
+    }
+  }
+
+  function scheduleSignalingReconnect() {
+    stopSignalingReconnect();
+    const current = queriedSession ?? activeSession;
+    if (!current || current.status !== "ACTIVE") {
+      return;
+    }
+
+    signalingReconnectAttempts += 1;
+    const delayMs = Math.min(1000 * 2 ** (signalingReconnectAttempts - 1), 10000);
+    signalingReconnectTimer = setTimeout(() => {
+      signalingReconnectTimer = null;
+      void connectSignaling();
+    }, delayMs);
+  }
+
   function stopViewerOfferRetry() {
     if (viewerOfferRetryTimer) {
       clearInterval(viewerOfferRetryTimer);
@@ -827,6 +865,117 @@
     }
   }
 
+  function viewerPlayoutDelayHint(): number {
+    return viewerPlaybackProfile === "quality" ? 0.12 : 0.0;
+  }
+
+  function applyViewerJitterBufferProfile(pc: RTCPeerConnection | null) {
+    if (!pc) {
+      return;
+    }
+
+    const playoutDelay = viewerPlayoutDelayHint();
+    for (const receiver of pc.getReceivers()) {
+      if (receiver.track?.kind !== "video") {
+        continue;
+      }
+
+      const receiverWithHint = receiver as RTCRtpReceiver & { playoutDelayHint?: number };
+      try {
+        receiverWithHint.playoutDelayHint = playoutDelay;
+      } catch {
+        // Some browsers expose playoutDelayHint as readonly or behind flags.
+      }
+    }
+  }
+
+  function stopViewerAutoUpgradeTimer() {
+    if (viewerProfileAutoUpgradeTimer) {
+      clearTimeout(viewerProfileAutoUpgradeTimer);
+      viewerProfileAutoUpgradeTimer = null;
+    }
+  }
+
+  function sendViewerPlaybackProfile(
+    profile: "responsive" | "quality",
+    options?: { manualOverride?: boolean }
+  ) {
+    viewerPlaybackProfile = profile;
+    if (options?.manualOverride) {
+      viewerProfileManualOverride = true;
+    }
+
+    applyViewerJitterBufferProfile(viewerPeerConnection);
+
+    if (!streamProfileSignalEnabled) {
+      return;
+    }
+
+    const current = queriedSession ?? activeSession;
+    if (!signalingConnected || !current?.id) {
+      return;
+    }
+
+    const profileMessage: SignalMessage = {
+      type: "STREAM_PROFILE",
+      to: "agent",
+      sessionId: String(current.id),
+      payload: {
+        profile
+      }
+    };
+
+    try {
+      signalingClient.send(profileMessage, "viewer");
+      logSignal("out", { ...profileMessage, from: "viewer" });
+    } catch {
+      // Ignore transient signaling send issues.
+    }
+  }
+
+  function maybeAutoUpgradeViewerProfile() {
+    const isEligible =
+      signalingConnected &&
+      viewerConnectionState === "connected" &&
+      viewerPlaybackProfile === "responsive" &&
+      !viewerProfileManualOverride &&
+      (viewerStreamMbps ?? 0) >= viewerAutoUpgradeMinMbps &&
+      (viewerStreamFps ?? 0) >= viewerAutoUpgradeMinFps;
+
+    if (!isEligible) {
+      stopViewerAutoUpgradeTimer();
+      return;
+    }
+
+    if (viewerProfileAutoUpgradeTimer) {
+      return;
+    }
+
+    viewerProfileAutoUpgradeTimer = setTimeout(() => {
+      viewerProfileAutoUpgradeTimer = null;
+
+      const stillEligible =
+        signalingConnected &&
+        viewerConnectionState === "connected" &&
+        viewerPlaybackProfile === "responsive" &&
+        !viewerProfileManualOverride &&
+        (viewerStreamMbps ?? 0) >= viewerAutoUpgradeMinMbps &&
+        (viewerStreamFps ?? 0) >= viewerAutoUpgradeMinFps;
+
+      if (!stillEligible) {
+        return;
+      }
+
+      sendViewerPlaybackProfile("quality");
+    }, viewerAutoUpgradeDelayMs);
+  }
+
+  function toggleViewerPlaybackProfile() {
+    stopViewerAutoUpgradeTimer();
+    const nextProfile = viewerPlaybackProfile === "quality" ? "responsive" : "quality";
+    sendViewerPlaybackProfile(nextProfile, { manualOverride: true });
+  }
+
   function handleViewerVideoFocus() {
     viewerKeyboardCaptured = true;
     revealViewerControls();
@@ -866,6 +1015,18 @@
     if (!position) {
       return;
     }
+
+    const now = performance.now();
+    if (now - lastViewerMouseMoveSentAt < viewerMouseMoveMinIntervalMs) {
+      return;
+    }
+
+    if (lastViewerPointerSent && lastViewerPointerSent.x === position.x && lastViewerPointerSent.y === position.y) {
+      return;
+    }
+
+    lastViewerMouseMoveSentAt = now;
+    lastViewerPointerSent = position;
 
     void sendViewerInput({
       type: "mouse-move",
@@ -948,6 +1109,13 @@
       return;
     }
 
+    const now = performance.now();
+    if (now - lastViewerWheelSentAt < viewerWheelMinIntervalMs) {
+      event.preventDefault();
+      return;
+    }
+    lastViewerWheelSentAt = now;
+
     event.preventDefault();
     void sendViewerInput({
       type: "wheel",
@@ -1008,12 +1176,18 @@
     viewerOfferRetryCount = 0;
     viewerDataChannelOpen = false;
     viewerKeyboardCaptured = false;
+    lastViewerMouseMoveSentAt = 0;
+    lastViewerWheelSentAt = 0;
+    lastViewerPointerSent = null;
     viewerConnectionState = "idle";
     viewerControlsVisible = true;
     viewerRemoteWidth = 1920;
     viewerRemoteHeight = 1080;
     viewerStreamMbps = null;
     viewerStreamFps = null;
+    stopViewerAutoUpgradeTimer();
+    viewerProfileManualOverride = false;
+    viewerPlaybackProfile = "responsive";
 
     try {
       viewerControlChannel?.close();
@@ -1108,6 +1282,7 @@
       }
       viewerRemoteStream = stream;
       screenFrameError = null;
+      applyViewerJitterBufferProfile(pc);
     };
 
     pc.onconnectionstatechange = () => {
@@ -1115,6 +1290,8 @@
       if (pc.connectionState === "connected") {
         revealViewerControls();
         screenFrameError = null;
+        applyViewerJitterBufferProfile(pc);
+        maybeAutoUpgradeViewerProfile();
       } else if (pc.connectionState === "failed") {
         screenFrameError = "La connexion WebRTC a echoue.";
       }
@@ -1231,6 +1408,7 @@
       const payload = message.payload as Record<string, unknown> | null;
       viewerStreamMbps = Number(payload?.mbps ?? 0);
       viewerStreamFps = Number(payload?.fps ?? 0);
+      maybeAutoUpgradeViewerProfile();
       return;
     }
 
@@ -1306,6 +1484,8 @@
         type: payload.type as RTCSdpType,
         sdp: payload.sdp
       });
+      sendViewerPlaybackProfile(viewerPlaybackProfile);
+      maybeAutoUpgradeViewerProfile();
 
       if (pendingViewerIceCandidates.length > 0) {
         const queued = pendingViewerIceCandidates;
@@ -1412,6 +1592,10 @@
   }
 
   async function connectSignaling() {
+    if (signalingConnected) {
+      return;
+    }
+
     const current = queriedSession ?? activeSession;
     if (!current) {
       signalingError = "Demarrez ou chargez une session avant la connexion signaling.";
@@ -1422,10 +1606,16 @@
     signalLogs = [];
     viewerStreamMbps = null;
     viewerStreamFps = null;
+    stopViewerAutoUpgradeTimer();
+    stopSignalingReconnect();
+    viewerProfileManualOverride = false;
+    viewerPlaybackProfile = "responsive";
     revealViewerControls();
+    signalingManualDisconnect = false;
 
     try {
       await signalingClient.connect(current.signalingToken, "viewer", String(current.id));
+      signalingReconnectAttempts = 0;
       if (shouldBridgeSessionToLocalAgent(current)) {
         try {
           await joinBackendSession(current);
@@ -1453,9 +1643,21 @@
       detachCloseListener = signalingClient.onClose(() => {
         signalingConnected = false;
         resetViewerPeerConnection();
-        if (backendSessionSynced) {
-          void leaveBackendSession();
+
+        if (signalingManualDisconnect) {
+          stopSignalingReconnect();
+          if (backendSessionSynced) {
+            void leaveBackendSession();
+          }
+          return;
         }
+
+        // Unexpected socket close: keep backend session alive and reconnect signaling.
+        signalingError = "Signal perdu, tentative de reconnexion...";
+        if (backendSessionSynced) {
+          backendSyncError = null;
+        }
+        scheduleSignalingReconnect();
       });
 
       detachErrorListener = signalingClient.onError(() => {
@@ -1479,17 +1681,26 @@
       signalingClient.disconnect();
       resetViewerPeerConnection();
       signalingConnected = false;
-      backendSessionSynced = false;
-      backendSyncError = null;
+      if (signalingManualDisconnect) {
+        backendSessionSynced = false;
+        backendSyncError = null;
+      }
       signalingError = String(error);
+
+      if (!signalingManualDisconnect) {
+        scheduleSignalingReconnect();
+      }
     }
   }
 
   async function disconnectSignaling() {
+    signalingManualDisconnect = true;
+    stopSignalingReconnect();
     signalingClient.disconnect();
     resetViewerPeerConnection();
     clearSignalingListeners();
     signalingConnected = false;
+    signalingReconnectAttempts = 0;
     if (backendSessionSynced) {
       await leaveBackendSession();
     } else {
@@ -1951,6 +2162,9 @@
             {/if}
           </div>
           <div class="viewer-toolbar-group viewer-toolbar-actions">
+            <button class="toolbar-btn" onclick={toggleViewerPlaybackProfile}>
+              {viewerPlaybackProfile === "quality" ? "Mode qualite" : "Mode reactif"}
+            </button>
             <button class="toolbar-btn" onclick={toggleViewerExpanded}>
               {viewerExpanded ? "Normal" : "Agrandir"}
             </button>

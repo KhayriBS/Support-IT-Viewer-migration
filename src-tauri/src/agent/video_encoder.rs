@@ -60,8 +60,8 @@ impl VideoEncoderBackend {
                 bitrate_bps: 8_000_000,
             },
             Self::OpenH264Software => VideoEncoderPreset {
-                target_fps: 12,
-                bitrate_bps: 2_000_000,
+                target_fps: 20,
+                bitrate_bps: 3_000_000,
             },
         }
     }
@@ -146,7 +146,7 @@ impl FfmpegRtpBridge {
             UdpSocket::from_std(std_socket).map_err(|err| format!("from_std udp failed: {err}"))?;
 
         let bitrate = preset.bitrate_bps.to_string();
-        let gop = (preset.target_fps.saturating_mul(2)).max(30).to_string();
+        let gop = (preset.target_fps.saturating_mul(5)).max(60).to_string();
         let mut command = Command::new(ffmpeg_binary);
         command
             .arg("-hide_banner")
@@ -169,6 +169,8 @@ impl FfmpegRtpBridge {
             .arg(encoder_name)
             .args(ffmpeg_backend_args(backend))
             .arg("-b:v")
+            .arg(&bitrate)
+            .arg("-minrate")
             .arg(&bitrate)
             .arg("-maxrate")
             .arg(&bitrate)

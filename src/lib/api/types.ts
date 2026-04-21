@@ -87,6 +87,7 @@ export type SignalType =
   | "LEAVE"
   | "CHAT"
   | "STREAM_STATS"
+  | "STREAM_PROFILE"
   | "ERROR"
   | "FILE_LIST_REQUEST"
   | "FILE_LIST"

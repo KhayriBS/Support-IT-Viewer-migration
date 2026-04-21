@@ -50,6 +50,7 @@ hostname = "0.4"
 # ── Windows APIs : DXGI (screen capture) + user32 (input) ─────────
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
+    "Win32_Media",
     # user32 — mouse_event, SetCursorPos, keybd_event, VkKeyScan
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

@@ -26,6 +26,7 @@ pub enum SignalType {
     Leave,
     Chat,
     StreamStats,
+    StreamProfile,
     Error,
     FileListRequest,
     FileList,
@@ -159,6 +160,7 @@ impl SignalingClient {
 
         // Task: receive loop (mirrors ReceiveLoopAsync)
         let event_tx_clone = event_tx.clone();
+        let tx_slot = Arc::clone(&self.tx);
         tokio::spawn(async move {
             while let Some(result) = stream.next().await {
                 match result {
@@ -178,8 +180,34 @@ impl SignalingClient {
                                 frame.code,
                                 frame.reason
                             );
+
+                            let payload = serde_json::json!({
+                                "kind": "socket-close",
+                                "code": u16::from(frame.code),
+                                "reason": frame.reason,
+                            });
+                            let _ = event_tx_clone.send(SignalMessage {
+                                signal_type: SignalType::Error,
+                                from: "system".to_string(),
+                                to: "agent".to_string(),
+                                session_id: None,
+                                payload: Some(payload),
+                            });
                         } else {
                             println!("🔌 Serveur a fermé la connexion (sans détail)");
+
+                            let payload = serde_json::json!({
+                                "kind": "socket-close",
+                                "code": serde_json::Value::Null,
+                                "reason": "",
+                            });
+                            let _ = event_tx_clone.send(SignalMessage {
+                                signal_type: SignalType::Error,
+                                from: "system".to_string(),
+                                to: "agent".to_string(),
+                                session_id: None,
+                                payload: Some(payload),
+                            });
                         }
                         break;
                     }
@@ -190,6 +218,7 @@ impl SignalingClient {
                     _ => {}
                 }
             }
+            *tx_slot.lock().await = None;
             println!("🔌 Receive loop terminée");
         });
 

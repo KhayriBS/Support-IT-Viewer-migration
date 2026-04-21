@@ -1,7 +1,9 @@
 #[cfg(windows)]
 mod imp {
+    use crate::agent::desktop_duplication;
     use std::mem::ManuallyDrop;
     use std::ptr::null_mut;
+    use std::sync::Arc;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
     use std::thread::{self, JoinHandle};
 
@@ -39,7 +41,8 @@ mod imp {
         Encode {
             width: usize,
             height: usize,
-            nv12: Vec<u8>,
+            bgra: Arc<Vec<u8>>,
+            force_keyframe: bool,
         },
         Shutdown,
     }
@@ -65,6 +68,7 @@ mod imp {
                 .spawn(move || {
                     let mut active_dimensions: Option<(usize, usize)> = None;
                     let mut encoder: Option<MediaFoundationH264Encoder> = None;
+                    let mut nv12_scratch: Vec<u8> = Vec::new();
 
                     if initial_width >= 2 && initial_height >= 2 {
                         match MediaFoundationH264Encoder::new(
@@ -86,7 +90,7 @@ mod imp {
                     while let Ok(command) = command_rx.recv() {
                         match command {
                             WorkerCommand::Shutdown => break,
-                            WorkerCommand::Encode { width, height, nv12 } => {
+                            WorkerCommand::Encode { width, height, bgra, force_keyframe } => {
                                 if active_dimensions != Some((width, height)) {
                                     match MediaFoundationH264Encoder::new(
                                         width,
@@ -112,7 +116,19 @@ mod imp {
                                     continue;
                                 };
 
-                                match active_encoder.encode_nv12(width, height, &nv12) {
+                                if force_keyframe {
+                                    let _ = active_encoder.force_keyframe();
+                                }
+
+                                desktop_duplication::bgra_to_nv12_packed(
+                                    width,
+                                    height,
+                                    width * 4,
+                                    &bgra,
+                                    &mut nv12_scratch,
+                                );
+
+                                match active_encoder.encode_nv12(width, height, &nv12_scratch) {
                                     Ok(encoded) => {
                                         let _ = response_tx.send(WorkerResponse::Encoded(encoded));
                                     }
@@ -133,17 +149,19 @@ mod imp {
             })
         }
 
-        pub fn encode_nv12(
+        pub fn encode_bgra(
             &mut self,
             width: usize,
             height: usize,
-            nv12_bytes: Vec<u8>,
+            bgra_bytes: Arc<Vec<u8>>,
+            force_keyframe: bool,
         ) -> Result<Vec<EncodedAccessUnit>, String> {
             self.command_tx
                 .send(WorkerCommand::Encode {
                     width,
                     height,
-                    nv12: nv12_bytes,
+                    bgra: bgra_bytes,
+                    force_keyframe,
                 })
                 .map_err(|err| format!("Media Foundation worker send failed: {err}"))?;
 
@@ -270,6 +288,17 @@ mod imp {
                     Err(err) if err.code() == MF_E_NOTACCEPTING => Ok(vec![]),
                     Err(err) => Err(format!("ProcessInput failed: {err}")),
                 }
+            }
+        }
+
+        /// Drain and restart the MFT so the next submitted frame is encoded as an IDR keyframe.
+        pub fn force_keyframe(&mut self) -> Result<(), String> {
+            unsafe {
+                let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+                self.frame_index = 0;
+                Ok(())
             }
         }
     }
@@ -535,11 +564,12 @@ mod imp_stub {
             Err("Media Foundation H264 encoder is only available on Windows".to_string())
         }
 
-        pub fn encode_nv12(
+        pub fn encode_bgra(
             &mut self,
             _width: usize,
             _height: usize,
-            _nv12_bytes: Vec<u8>,
+            _bgra_bytes: std::sync::Arc<Vec<u8>>,
+            _force_keyframe: bool,
         ) -> Result<Vec<EncodedAccessUnit>, String> {
             Err("Media Foundation H264 encoder is only available on Windows".to_string())
         }

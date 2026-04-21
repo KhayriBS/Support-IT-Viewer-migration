@@ -9,30 +9,52 @@ const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined)?.replace(/\/$
 export class SignalingClient {
   private socket: WebSocket | null = null;
   private currentSessionId: string | null = null;
+  private connectPromise: Promise<void> | null = null;
 
   connect(signalingToken: string, role: "viewer" | "agent", sessionId?: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.socket?.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve();
+    }
+    if (this.socket?.readyState === WebSocket.CONNECTING && this.connectPromise) {
+      return this.connectPromise;
+    }
 
+    if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
+      try {
+        this.socket.close();
+      } catch {
+        // ignore stale socket close errors
+      }
+      this.socket = null;
+    }
+
+    this.connectPromise = new Promise((resolve, reject) => {
       this.currentSessionId = sessionId ?? null;
       const sessionParam = sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : "";
       const wsUrl = `${WS_URL}/ws/signaling?token=${encodeURIComponent(signalingToken)}&role=${role}${sessionParam}`;
 
       this.socket = new WebSocket(wsUrl);
-      this.socket.onopen = () => resolve();
-      this.socket.onerror = () => reject(new Error("WebSocket connection failed"));
+      this.socket.onopen = () => {
+        this.connectPromise = null;
+        resolve();
+      };
+      this.socket.onerror = () => {
+        this.connectPromise = null;
+        reject(new Error("WebSocket connection failed"));
+      };
       this.socket.onclose = () => {
         this.socket = null;
+        this.connectPromise = null;
       };
     });
+
+    return this.connectPromise;
   }
 
   disconnect() {
     this.socket?.close();
     this.socket = null;
+    this.connectPromise = null;
   }
 
   isConnected() {

@@ -2,11 +2,15 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, watch, Mutex};
+
+#[cfg(windows)]
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod, TIMERR_NOERROR};
 
 use super::desktop_duplication::{DesktopFrame, DxgiDesktopDuplicator};
 use super::media_foundation_encoder::MediaFoundationEncoderWorker;
@@ -550,6 +554,8 @@ pub struct AgentWebRtc {
     signaling: Arc<SignalingClient>,
     peer: Arc<RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticRTP>,
+    rtcp_feedback: Arc<RtcpFeedbackState>,
+    stream_profile_tx: watch::Sender<StreamQualityProfile>,
     pending_remote_ice: Mutex<Vec<RTCIceCandidateInit>>,
 }
 
@@ -557,6 +563,400 @@ struct StreamStatsWindow {
     started_at: Instant,
     sent_bytes: usize,
     sent_frames: usize,
+}
+
+#[derive(Clone)]
+struct CapturedScreenFrame {
+    width: usize,
+    height: usize,
+    bgra_frame: Arc<Vec<u8>>,
+    reused_last_frame: bool,
+    capture_ms: f64,
+    frame_counter: u64,
+}
+
+#[derive(Clone)]
+struct EncodedScreenFrame {
+    width: usize,
+    height: usize,
+    reused_last_frame: bool,
+    capture_ms: f64,
+    encode_ms: f64,
+    frame_counter: u64,
+    dropped_before_encode: u64,
+    encoded_units: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdaptiveVideoConfig {
+    target_fps: u32,
+    bitrate_bps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamQualityProfile {
+    Responsive,
+    Quality,
+}
+
+impl StreamQualityProfile {
+    pub fn from_payload(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "responsive" | "reactive" | "reactif" => Some(Self::Responsive),
+            "quality" | "qualite" => Some(Self::Quality),
+            _ => None,
+        }
+    }
+}
+
+fn profile_target_for_preset(
+    profile: StreamQualityProfile,
+    preset: VideoEncoderPreset,
+) -> AdaptiveVideoConfig {
+    let base = AdaptiveVideoConfig {
+        target_fps: preset.target_fps.max(1),
+        bitrate_bps: preset.bitrate_bps,
+    };
+
+    match profile {
+        StreamQualityProfile::Quality => base,
+        StreamQualityProfile::Responsive => AdaptiveVideoConfig {
+            target_fps: base.target_fps.min(30),
+            bitrate_bps: base.bitrate_bps.min(4_000_000),
+        },
+    }
+}
+
+struct AdaptiveRateController {
+    current: AdaptiveVideoConfig,
+    ceiling: AdaptiveVideoConfig,
+    min_fps: u32,
+    min_bitrate_bps: u32,
+    last_adjust_at: Instant,
+    stress_ema: f64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AdaptiveFeedback {
+    dropped_before_encode: u64,
+    dropped_before_send: u64,
+    send_error: bool,
+    rtcp_nack_delta: u64,
+    rtcp_pli_delta: u64,
+    rtcp_fir_delta: u64,
+    rtcp_feedback_stale: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RtcpDelta {
+    total: u64,
+    nack: u64,
+    pli: u64,
+    fir: u64,
+    feedback_stale: bool,
+}
+
+#[derive(Default)]
+struct RtcpFeedbackState {
+    total_reports: AtomicU64,
+    nack_reports: AtomicU64,
+    pli_reports: AtomicU64,
+    fir_reports: AtomicU64,
+    last_feedback_unix_ms: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RtcpFeedbackSnapshot {
+    total_reports: u64,
+    nack_reports: u64,
+    pli_reports: u64,
+    fir_reports: u64,
+    last_feedback_unix_ms: u64,
+}
+
+impl RtcpFeedbackState {
+    fn mark_feedback_from_packet_text(&self, packet_text: &str) {
+        self.total_reports.fetch_add(1, Ordering::Relaxed);
+
+        let lowercase = packet_text.to_ascii_lowercase();
+        if lowercase.contains("nack") {
+            self.nack_reports.fetch_add(1, Ordering::Relaxed);
+        }
+        if lowercase.contains("picturelossindication") || lowercase.contains(" pli") {
+            self.pli_reports.fetch_add(1, Ordering::Relaxed);
+        }
+        if lowercase.contains("fullintrarequest") || lowercase.contains(" fir") {
+            self.fir_reports.fetch_add(1, Ordering::Relaxed);
+        }
+
+        self.last_feedback_unix_ms
+            .store(unix_time_millis(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RtcpFeedbackSnapshot {
+        RtcpFeedbackSnapshot {
+            total_reports: self.total_reports.load(Ordering::Relaxed),
+            nack_reports: self.nack_reports.load(Ordering::Relaxed),
+            pli_reports: self.pli_reports.load(Ordering::Relaxed),
+            fir_reports: self.fir_reports.load(Ordering::Relaxed),
+            last_feedback_unix_ms: self.last_feedback_unix_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn collect_rtcp_delta(
+    rtcp_feedback: &Arc<RtcpFeedbackState>,
+    last_snapshot: &mut RtcpFeedbackSnapshot,
+) -> RtcpDelta {
+    let current = rtcp_feedback.snapshot();
+    let delta = RtcpDelta {
+        total: current
+            .total_reports
+            .saturating_sub(last_snapshot.total_reports),
+        nack: current
+            .nack_reports
+            .saturating_sub(last_snapshot.nack_reports),
+        pli: current
+            .pli_reports
+            .saturating_sub(last_snapshot.pli_reports),
+        fir: current
+            .fir_reports
+            .saturating_sub(last_snapshot.fir_reports),
+        feedback_stale: current.last_feedback_unix_ms > 0
+            && unix_time_millis().saturating_sub(current.last_feedback_unix_ms) > 5_000,
+    };
+    *last_snapshot = current;
+    delta
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+impl AdaptiveRateController {
+    fn new(initial: AdaptiveVideoConfig) -> Self {
+        Self {
+            current: initial,
+            ceiling: initial,
+            min_fps: 10,
+            min_bitrate_bps: 800_000,
+            last_adjust_at: Instant::now(),
+            stress_ema: 0.0,
+        }
+    }
+
+    fn on_feedback(&mut self, feedback: AdaptiveFeedback) -> Option<AdaptiveVideoConfig> {
+        let now = Instant::now();
+
+        let hard_congestion = feedback.send_error
+            || feedback.dropped_before_send > 0
+            || feedback.rtcp_pli_delta > 0
+            || feedback.rtcp_fir_delta > 0;
+        let network_congestion = feedback.rtcp_nack_delta >= 2;
+        let local_encode_pressure = feedback.dropped_before_encode > 2
+            && feedback.dropped_before_send == 0
+            && !feedback.send_error
+            && feedback.rtcp_nack_delta == 0
+            && feedback.rtcp_pli_delta == 0
+            && feedback.rtcp_fir_delta == 0;
+
+        let instant_stress = {
+            let mut score = 0.0;
+            score += (feedback.dropped_before_encode.min(5) as f64) * 0.20;
+            score += (feedback.dropped_before_send.min(5) as f64) * 1.25;
+            score += (feedback.rtcp_nack_delta.min(6) as f64) * 0.8;
+            score += (feedback.rtcp_pli_delta.min(4) as f64) * 2.8;
+            score += (feedback.rtcp_fir_delta.min(4) as f64) * 3.5;
+            if feedback.send_error {
+                score += 4.0;
+            }
+            if feedback.rtcp_feedback_stale && score > 0.0 {
+                score += 0.5;
+            }
+            score.min(20.0)
+        };
+
+        self.stress_ema = self.stress_ema * 0.75 + instant_stress * 0.25;
+
+        if hard_congestion && now.duration_since(self.last_adjust_at) >= Duration::from_millis(700) {
+            self.last_adjust_at = now;
+            let next_fps = self.current.target_fps.saturating_sub(7).max(self.min_fps);
+            let next_bitrate = ((self.current.bitrate_bps as f64) * 0.80) as u32;
+            let next_bitrate = next_bitrate.max(self.min_bitrate_bps);
+            return self.set_if_changed(next_fps, next_bitrate);
+        }
+
+        if local_encode_pressure
+            && now.duration_since(self.last_adjust_at) >= Duration::from_millis(1500)
+        {
+            self.last_adjust_at = now;
+            let next_fps = self.current.target_fps.saturating_sub(2).max(self.min_fps);
+            let next_bitrate = self.current.bitrate_bps;
+            return self.set_if_changed(next_fps, next_bitrate);
+        }
+
+        if (self.stress_ema >= 3.0 || network_congestion)
+            && now.duration_since(self.last_adjust_at) >= Duration::from_millis(1300)
+        {
+            self.last_adjust_at = now;
+            let next_fps = self.current.target_fps.saturating_sub(3).max(self.min_fps);
+            let next_bitrate = ((self.current.bitrate_bps as f64) * 0.89) as u32;
+            let next_bitrate = next_bitrate.max(self.min_bitrate_bps);
+            return self.set_if_changed(next_fps, next_bitrate);
+        }
+
+        if self.stress_ema <= 0.6
+            && !hard_congestion
+            && now.duration_since(self.last_adjust_at) >= Duration::from_secs(3)
+        {
+            self.last_adjust_at = now;
+            let next_fps = (self.current.target_fps + 2).min(self.ceiling.target_fps.max(self.min_fps));
+            let next_bitrate = (self.current.bitrate_bps + 500_000).min(self.ceiling.bitrate_bps);
+            return self.set_if_changed(next_fps, next_bitrate);
+        }
+
+        None
+    }
+
+    fn set_if_changed(&mut self, target_fps: u32, bitrate_bps: u32) -> Option<AdaptiveVideoConfig> {
+        let next = AdaptiveVideoConfig {
+            target_fps,
+            bitrate_bps,
+        };
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+
+    fn apply_profile_limit(&mut self, limit: AdaptiveVideoConfig) -> Option<AdaptiveVideoConfig> {
+        self.ceiling = AdaptiveVideoConfig {
+            target_fps: limit.target_fps.max(self.min_fps),
+            bitrate_bps: limit.bitrate_bps.max(self.min_bitrate_bps),
+        };
+
+        let clamped_fps = self.current.target_fps.min(self.ceiling.target_fps);
+        let clamped_bitrate = self.current.bitrate_bps.min(self.ceiling.bitrate_bps);
+        self.set_if_changed(clamped_fps, clamped_bitrate)
+    }
+}
+
+fn frame_interval_for_target_fps(target_fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / target_fps.max(1) as f64)
+}
+
+#[cfg(windows)]
+struct WindowsTimerResolutionGuard {
+    period_ms: u32,
+    enabled: bool,
+}
+
+#[cfg(windows)]
+impl WindowsTimerResolutionGuard {
+    fn new(period_ms: u32) -> Self {
+        let enabled = unsafe { timeBeginPeriod(period_ms) == TIMERR_NOERROR };
+        if !enabled {
+            eprintln!("timeBeginPeriod({period_ms}) failed; frame pacing may jitter under load");
+        }
+        Self { period_ms, enabled }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsTimerResolutionGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = unsafe { timeEndPeriod(self.period_ms) };
+        }
+    }
+}
+
+async fn sleep_until_deadline_precise(deadline: Instant) {
+    let now = Instant::now();
+    if now >= deadline {
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let coarse_sleep_threshold = Duration::from_millis(2);
+        let spin_window = Duration::from_millis(1);
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining > coarse_sleep_threshold {
+            tokio::time::sleep(remaining.saturating_sub(spin_window)).await;
+        }
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        tokio::time::sleep(deadline.saturating_duration_since(now)).await;
+    }
+}
+
+async fn pace_capture_loop(next_deadline: &mut Instant, target_fps: u32) {
+    let interval = frame_interval_for_target_fps(target_fps);
+    let now = Instant::now();
+
+    if *next_deadline <= now {
+        *next_deadline = now + interval;
+        return;
+    }
+
+    sleep_until_deadline_precise(*next_deadline).await;
+    *next_deadline += interval;
+}
+
+fn create_openh264_encoder(config: AdaptiveVideoConfig) -> Result<Encoder, String> {
+    let api = OpenH264API::from_source();
+    let encoder_config = EncoderConfig::new()
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .set_bitrate_bps(config.bitrate_bps)
+        .max_frame_rate(config.target_fps as f32)
+        .enable_skip_frame(true)
+        .set_multiple_thread_idc(0);
+
+    Encoder::with_api_config(api, encoder_config)
+        .map_err(|err| format!("OpenH264 encoder init failed: {err}"))
+}
+
+async fn recv_latest_broadcast<T: Clone>(
+    rx: &mut broadcast::Receiver<T>,
+    dropped_counter: &mut u64,
+) -> Option<T> {
+    let mut latest = loop {
+        match rx.recv().await {
+            Ok(value) => break value,
+            Err(broadcast::error::RecvError::Closed) => return None,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                *dropped_counter = dropped_counter.saturating_add(skipped);
+            }
+        }
+    };
+
+    loop {
+        match rx.try_recv() {
+            Ok(newer) => {
+                *dropped_counter = dropped_counter.saturating_add(1);
+                latest = newer;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                *dropped_counter = dropped_counter.saturating_add(skipped);
+            }
+        }
+    }
+
+    Some(latest)
 }
 
 impl StreamStatsWindow {
@@ -735,10 +1135,19 @@ impl AgentWebRtc {
             .await
             .map_err(|e| format!("add_track failed: {e}"))?;
 
+        let rtcp_feedback = Arc::new(RtcpFeedbackState::default());
+        let (stream_profile_tx, _) = watch::channel(StreamQualityProfile::Quality);
+
         println!("WebRTC video track created: screen/H264");
 
+        let rtcp_feedback_for_task = Arc::clone(&rtcp_feedback);
         tokio::spawn(async move {
-            while rtp_sender.read_rtcp().await.is_ok() {}
+            while let Ok((packets, _)) = rtp_sender.read_rtcp().await {
+                for packet in packets {
+                    let packet_text = format!("{:?}", packet);
+                    rtcp_feedback_for_task.mark_feedback_from_packet_text(&packet_text);
+                }
+            }
         });
 
         let peer_for_state = Arc::clone(&peer);
@@ -762,8 +1171,20 @@ impl AgentWebRtc {
             signaling,
             peer,
             video_track,
+            rtcp_feedback,
+            stream_profile_tx,
             pending_remote_ice: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn set_stream_profile(&self, profile: StreamQualityProfile) {
+        let _ = self.stream_profile_tx.send(profile);
+    }
+
+    pub async fn close(&self) {
+        if let Err(err) = self.peer.close().await {
+            eprintln!("Failed to close WebRTC peer: {err}");
+        }
     }
 
     pub async fn handle_offer(&self, payload: &Value) -> Result<Value, String> {
@@ -828,6 +1249,8 @@ impl AgentWebRtc {
         let signaling = Arc::clone(&self.signaling);
         let peer = Arc::clone(&self.peer);
         let track = Arc::clone(&self.video_track);
+        let rtcp_feedback = Arc::clone(&self.rtcp_feedback);
+        let stream_profile_rx = self.stream_profile_tx.subscribe();
 
         tokio::spawn(async move {
             let selection = VideoEncoderSelection::resolve();
@@ -840,7 +1263,15 @@ impl AgentWebRtc {
 
             let result = match selection.backend {
                 VideoEncoderBackend::OpenH264Software => {
-                    run_openh264_screen_sender(&signaling, &peer, &track, selection.preset).await
+                    run_openh264_screen_sender(
+                        &signaling,
+                        &peer,
+                        &track,
+                        selection.preset,
+                        Arc::clone(&rtcp_feedback),
+                        stream_profile_rx.clone(),
+                    )
+                    .await
                 }
                 VideoEncoderBackend::MediaFoundationH264 => {
                     match run_media_foundation_screen_sender(
@@ -848,6 +1279,8 @@ impl AgentWebRtc {
                         &peer,
                         &track,
                         selection.preset,
+                        Arc::clone(&rtcp_feedback),
+                        stream_profile_rx.clone(),
                     )
                     .await
                     {
@@ -861,6 +1294,8 @@ impl AgentWebRtc {
                                 &peer,
                                 &track,
                                 selection.preset,
+                                Arc::clone(&rtcp_feedback),
+                                stream_profile_rx.clone(),
                             )
                             .await
                         }
@@ -887,6 +1322,8 @@ impl AgentWebRtc {
                                 &peer,
                                 &track,
                                 selection.preset,
+                                Arc::clone(&rtcp_feedback),
+                                stream_profile_rx.clone(),
                             )
                             .await
                         }
@@ -940,21 +1377,14 @@ async fn run_openh264_screen_sender(
     peer: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticRTP>,
     preset: VideoEncoderPreset,
+    rtcp_feedback: Arc<RtcpFeedbackState>,
+    mut stream_profile_rx: watch::Receiver<StreamQualityProfile>,
 ) -> Result<(), String> {
-    let api = OpenH264API::from_source();
-    let config = EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
-        .rate_control_mode(RateControlMode::Bitrate)
-        .set_bitrate_bps(preset.bitrate_bps)
-        .max_frame_rate(preset.target_fps as f32)
-        .enable_skip_frame(true)
-        .set_multiple_thread_idc(0);
-
-    let mut encoder = Encoder::with_api_config(api, config)
-        .map_err(|err| format!("OpenH264 encoder init failed: {err}"))?;
+    let initial_profile = *stream_profile_rx.borrow();
+    let initial_config = profile_target_for_preset(initial_profile, preset);
+    let (adaptive_tx, adaptive_rx) = watch::channel(initial_config);
+    let force_idr_hint = Arc::new(AtomicBool::new(false));
     let mut payloader = H264Payloader::default();
-    let frame_interval = frame_interval_for(preset);
-    let keyframe_interval = (preset.target_fps.max(1) as u64).saturating_mul(5);
     let mut stream_ssrc: u32 = 0;
     let mut negotiated_ssrc: Option<u32> = None;
     let mut negotiated_payload_type: Option<u8> = None;
@@ -963,18 +1393,213 @@ async fn run_openh264_screen_sender(
     let mut seq: u16 = 1;
     let stream_clock_start = Instant::now();
     let mut last_rtp_ts: u32 = 0;
-    let mut frame_index: u64 = 0;
     let mut stats = StreamStatsWindow::new();
-    let mut capturer = DxgiDesktopDuplicator::new()?;
-    let scale_target = resolve_scale_request();
-    let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
 
+    let (capture_tx, mut capture_rx) = broadcast::channel::<CapturedScreenFrame>(2);
+    let (encoded_tx, mut encoded_rx) = broadcast::channel::<EncodedScreenFrame>(2);
+
+    let capture_peer = Arc::clone(peer);
+    let capture_track = Arc::clone(track);
+    let capture_cfg_rx = adaptive_rx.clone();
+    let capture_task = tokio::spawn(async move {
+        #[cfg(windows)]
+        let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
+
+        let mut capturer = match DxgiDesktopDuplicator::new() {
+            Ok(capturer) => capturer,
+            Err(err) => {
+                eprintln!("DXGI capturer init failed: {err}");
+                return;
+            }
+        };
+
+        let scale_target = resolve_scale_request();
+        let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
+        let mut frame_counter: u64 = 0;
+        let mut next_capture_deadline = Instant::now() + frame_interval_for_target_fps(initial_config.target_fps);
+
+        loop {
+            let capture_config = *capture_cfg_rx.borrow();
+            match capture_peer.connection_state() {
+                RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+                _ => {}
+            }
+
+            if !stream_is_ready(&capture_peer, &capture_track).await {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                continue;
+            }
+
+            let capture_start = Instant::now();
+            let mut reused_last_frame = false;
+            let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
+                &mut capturer,
+                scale_target,
+            ) {
+                Ok(Some((w, h, frame))) => {
+                    let arc = Arc::new(frame);
+                    last_capture = Some((w, h, Arc::clone(&arc)));
+                    (w, h, arc)
+                }
+                Ok(None) => {
+                    if let Some((w, h, ref arc)) = last_capture {
+                        reused_last_frame = true;
+                        (w, h, Arc::clone(arc))
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(4)).await;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Screen capture failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            frame_counter = frame_counter.saturating_add(1);
+            let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
+
+            let frame = CapturedScreenFrame {
+                width,
+                height,
+                bgra_frame,
+                reused_last_frame,
+                capture_ms,
+                frame_counter,
+            };
+            let _ = capture_tx.send(frame);
+
+            pace_capture_loop(&mut next_capture_deadline, capture_config.target_fps).await;
+        }
+    });
+
+    let mut encode_cfg_rx = adaptive_rx.clone();
+    let force_idr_hint_for_encode = Arc::clone(&force_idr_hint);
+    let encode_task = tokio::spawn(async move {
+        let mut active_config = *encode_cfg_rx.borrow();
+        let mut encoder = match create_openh264_encoder(active_config) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                eprintln!("OpenH264 encoder init failed: {err}");
+                return;
+            }
+        };
+
+        let mut dropped_capture_frames: u64 = 0;
+        loop {
+            let Some(frame) = recv_latest_broadcast(&mut capture_rx, &mut dropped_capture_frames).await else {
+                break;
+            };
+
+            let dropped_before_encode = std::mem::take(&mut dropped_capture_frames);
+
+            let latest_config = *encode_cfg_rx.borrow_and_update();
+            if latest_config != active_config {
+                match create_openh264_encoder(latest_config) {
+                    Ok(new_encoder) => {
+                        encoder = new_encoder;
+                        active_config = latest_config;
+                        println!(
+                            "OpenH264 adaptive reconfigure: {} FPS, {:.2} Mbps",
+                            active_config.target_fps,
+                            active_config.bitrate_bps as f64 / 1_000_000.0
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("OpenH264 reconfigure failed: {err}");
+                    }
+                }
+            }
+
+            if frame.frame_counter % active_config.target_fps.max(1) as u64 == 0 {
+                println!(
+                    "Captured {} frames via DXGI at {}x{} for software H264 pipeline",
+                    frame.frame_counter, frame.width, frame.height
+                );
+            }
+
+            let keyframe_interval = (active_config.target_fps.max(1) as u64).saturating_mul(5);
+            let force_keyframe = frame.frame_counter == 1
+                || (keyframe_interval > 0 && frame.frame_counter % keyframe_interval == 0)
+                || force_idr_hint_for_encode.swap(false, Ordering::Relaxed);
+            let width = frame.width;
+            let height = frame.height;
+            let bgra_frame = Arc::clone(&frame.bgra_frame);
+            let encode_start = Instant::now();
+
+            let join_result = tokio::task::spawn_blocking(move || {
+                let bgra = BgraSliceU8::new(&bgra_frame, (width, height));
+                let yuv = YUVBuffer::from_rgb_source(bgra);
+
+                if force_keyframe {
+                    encoder.force_intra_frame();
+                }
+
+                let result = encoder.encode(&yuv).map(|bitstream| bitstream.to_vec());
+                (result, encoder)
+            })
+            .await;
+
+            let (encoded_result, active_encoder) = match join_result {
+                Ok(value) => value,
+                Err(e) => {
+                    eprintln!("spawn_blocking failed: {e}");
+                    break;
+                }
+            };
+            encoder = active_encoder;
+
+            let encoded = match encoded_result {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!("H264 encode failed: {err}");
+                    continue;
+                }
+            };
+            if encoded.is_empty() {
+                continue;
+            }
+
+            let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+            let packet = EncodedScreenFrame {
+                width: frame.width,
+                height: frame.height,
+                reused_last_frame: frame.reused_last_frame,
+                capture_ms: frame.capture_ms,
+                encode_ms,
+                frame_counter: frame.frame_counter,
+                dropped_before_encode,
+                encoded_units: vec![encoded],
+            };
+            let _ = encoded_tx.send(packet);
+        }
+    });
+
+    let mut dropped_encoded_frames: u64 = 0;
+    let mut controller = AdaptiveRateController::new(initial_config);
+    let mut last_rtcp_snapshot = rtcp_feedback.snapshot();
     loop {
-        let frame_start = Instant::now();
+        let profile_limit = profile_target_for_preset(*stream_profile_rx.borrow_and_update(), preset);
+        if let Some(updated) = controller.apply_profile_limit(profile_limit) {
+            let _ = adaptive_tx.send(updated);
+            println!(
+                "OpenH264 profile target: {} FPS, {:.2} Mbps",
+                updated.target_fps,
+                updated.bitrate_bps as f64 / 1_000_000.0
+            );
+        }
+
         match peer.connection_state() {
             RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
             _ => {}
         }
+
+        let Some(frame) = recv_latest_broadcast(&mut encoded_rx, &mut dropped_encoded_frames).await else {
+            break;
+        };
+
+        let dropped_before_send = std::mem::take(&mut dropped_encoded_frames);
 
         if !stream_is_ready(peer, track).await {
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1000,237 +1625,190 @@ async fn run_openh264_screen_sender(
             println!("Using video SSRC: {stream_ssrc}");
         }
 
-        let capture_start = Instant::now();
-        let mut reused_last_frame = false;
-        let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
-            &mut capturer,
-            scale_target,
-        ) {
-            Ok(Some((w, h, frame))) => {
-                let arc = Arc::new(frame);
-                last_capture = Some((w, h, Arc::clone(&arc)));
-                (w, h, arc)
-            }
-            Ok(None) => {
-                if let Some((w, h, ref arc)) = last_capture {
-                    reused_last_frame = true;
-                    (w, h, Arc::clone(arc))
-                } else {
-                    tokio::time::sleep(Duration::from_millis(4)).await;
-                    continue;
-                }
-            }
-            Err(err) => {
-                eprintln!("Screen capture failed: {err}");
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-        };
-        let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
-
-        frame_index += 1;
-        if frame_index % preset.target_fps.max(1) as u64 == 0 {
-            println!(
-                "Captured {} frames via DXGI at {}x{} for software H264 pipeline",
-                frame_index, width, height
-            );
-        }
-
-        let force_keyframe = frame_index == 1
-            || (keyframe_interval > 0 && frame_index % keyframe_interval == 0);
-        let encode_start = Instant::now();
-        let (encoded_result, returned_encoder) = tokio::task::spawn_blocking(move || {
-            let bgra = BgraSliceU8::new(&bgra_frame, (width, height));
-            let yuv = YUVBuffer::from_rgb_source(bgra);
-
-            if force_keyframe {
-                encoder.force_intra_frame();
-            }
-
-            let result = encoder.encode(&yuv).map(|bitstream| bitstream.to_vec());
-            (result, encoder)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed: {e}"))?;
-
-        let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
-
-        encoder = returned_encoder;
-
-        let encoded = match encoded_result {
-            Ok(data) => data,
-            Err(err) => {
-                eprintln!("H264 encode failed: {err}");
-                tokio::time::sleep(frame_interval).await;
-                continue;
-            }
-        };
-        if encoded.is_empty() {
-            tokio::time::sleep(frame_interval).await;
-            continue;
-        }
-
-        let payload_start = Instant::now();
-        let raw_nalus = split_annexb_nalus(&encoded);
-        let (nalus, has_idr) = reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
-        let nal_summary = summarize_nalus(&nalus);
-        let payload_ms = payload_start.elapsed().as_secs_f64() * 1000.0;
-
+        let frame_start = Instant::now();
         let mut frame_ts = rtp_timestamp_90khz_from_instant(&stream_clock_start);
         if frame_ts <= last_rtp_ts {
             frame_ts = last_rtp_ts.wrapping_add(1);
         }
         last_rtp_ts = frame_ts;
         let mut frame_sent = false;
-
-        let send_start = Instant::now();
+        let mut send_error = false;
         let mut total_fragments = 0usize;
-        // If IDR is present but SPS/PPS missing in this access unit, prepend cached SPS/PPS (if any)
-        // as copied Bytes so lifetimes are correct.
-        let mut prefix: Vec<Bytes> = Vec::new();
-        if has_idr {
-            if !nal_summary.has_sps {
-                if let Some(sps) = cached_sps.as_deref() {
-                    prefix.push(Bytes::copy_from_slice(sps));
+        let mut total_payload_bytes = 0usize;
+
+        for encoded in frame.encoded_units {
+            let payload_start = Instant::now();
+            let raw_nalus = split_annexb_nalus(&encoded);
+            let (nalus, has_idr) =
+                reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
+            let nal_summary = summarize_nalus(&nalus);
+            let payload_ms = payload_start.elapsed().as_secs_f64() * 1000.0;
+
+            let mut prefix: Vec<Bytes> = Vec::new();
+            if has_idr {
+                if !nal_summary.has_sps {
+                    if let Some(sps) = cached_sps.as_deref() {
+                        prefix.push(Bytes::copy_from_slice(sps));
+                    }
+                }
+                if !nal_summary.has_pps {
+                    if let Some(pps) = cached_pps.as_deref() {
+                        prefix.push(Bytes::copy_from_slice(pps));
+                    }
                 }
             }
-            if !nal_summary.has_pps {
-                if let Some(pps) = cached_pps.as_deref() {
-                    prefix.push(Bytes::copy_from_slice(pps));
+
+            let total_nals_to_send = prefix.len() + nalus.len();
+            let mut nal_cursor = 0usize;
+
+            for bytes in prefix {
+                nal_cursor += 1;
+                total_payload_bytes = total_payload_bytes.saturating_add(bytes.len());
+                let payloads = match payloader.payload(1200, &bytes) {
+                    Ok(chunks) => chunks,
+                    Err(err) => {
+                        eprintln!("H264 payload split failed: {err}");
+                        continue;
+                    }
+                };
+                total_fragments = total_fragments.saturating_add(payloads.len());
+                let last_nal = nal_cursor == total_nals_to_send;
+                for (index, fragment) in payloads.iter().enumerate() {
+                    let marker = last_nal && (index + 1 == payloads.len());
+                    let packet = Packet {
+                        header: rtp::header::Header {
+                            version: 2,
+                            padding: false,
+                            extension: false,
+                            marker,
+                            payload_type,
+                            sequence_number: seq,
+                            timestamp: frame_ts,
+                            ssrc: stream_ssrc,
+                            csrc: vec![],
+                            extension_profile: 0,
+                            extensions: vec![],
+                            extensions_padding: 0,
+                        },
+                        payload: fragment.clone(),
+                    };
+                    if track.write_rtp(&packet).await.is_err() {
+                        send_error = true;
+                        break;
+                    }
+                    frame_sent = true;
+                    seq = seq.wrapping_add(1);
                 }
             }
-        }
 
-        // Send optional prefix first (SPS/PPS), then the ordered NALs.
-        let total_nals_to_send = prefix.len() + nalus.len();
-        let mut nal_cursor = 0usize;
-
-        for bytes in prefix {
-            nal_cursor += 1;
-            let payloads = match payloader.payload(1200, &bytes) {
-                Ok(chunks) => chunks,
-                Err(err) => {
-                    eprintln!("H264 payload split failed: {err}");
+            for nal in nalus.iter() {
+                if nal.is_empty() {
                     continue;
                 }
-            };
-            total_fragments = total_fragments.saturating_add(payloads.len());
-            let last_nal = nal_cursor == total_nals_to_send;
-            for (index, fragment) in payloads.iter().enumerate() {
-                if track.any_binding_paused().await {
-                    break;
-                }
-                let marker = last_nal && (index + 1 == payloads.len());
-                let packet = Packet {
-                    header: rtp::header::Header {
-                        version: 2,
-                        padding: false,
-                        extension: false,
-                        marker,
-                        payload_type,
-                        sequence_number: seq,
-                        timestamp: frame_ts,
-                        ssrc: stream_ssrc,
-                        csrc: vec![],
-                        extension_profile: 0,
-                        extensions: vec![],
-                        extensions_padding: 0,
-                    },
-                    payload: fragment.clone(),
+
+                total_payload_bytes = total_payload_bytes.saturating_add(nal.len());
+                let nal_bytes = Bytes::copy_from_slice(nal);
+                let payloads = match payloader.payload(1200, &nal_bytes) {
+                    Ok(chunks) => chunks,
+                    Err(err) => {
+                        eprintln!("H264 payload split failed: {err}");
+                        continue;
+                    }
                 };
-                if track.write_rtp(&packet).await.is_err() {
-                    break;
+                total_fragments = total_fragments.saturating_add(payloads.len());
+
+                nal_cursor += 1;
+                let last_nal = nal_cursor == total_nals_to_send;
+                for (index, fragment) in payloads.iter().enumerate() {
+                    let marker = last_nal && (index + 1 == payloads.len());
+                    let packet = Packet {
+                        header: rtp::header::Header {
+                            version: 2,
+                            padding: false,
+                            extension: false,
+                            marker,
+                            payload_type,
+                            sequence_number: seq,
+                            timestamp: frame_ts,
+                            ssrc: stream_ssrc,
+                            csrc: vec![],
+                            extension_profile: 0,
+                            extensions: vec![],
+                            extensions_padding: 0,
+                        },
+                        payload: fragment.clone(),
+                    };
+
+                    if track.write_rtp(&packet).await.is_err() {
+                        send_error = true;
+                        break;
+                    }
+
+                    frame_sent = true;
+                    seq = seq.wrapping_add(1);
                 }
-                frame_sent = true;
-                seq = seq.wrapping_add(1);
+            }
+
+            let send_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+            if frame_sent {
+                stats.record_frame(total_payload_bytes.max(1));
+                if frame.frame_counter % preset.target_fps.max(1) as u64 == 0 {
+                    println!(
+                        "Sent software H264 frame {} ({} bytes payload)",
+                        frame.frame_counter, total_payload_bytes
+                    );
+                    vlog!(
+                        "sw pipeline: {}x{} reuse_last={} capture={:.2}ms encode={:.2}ms payload={:.2}ms send={:.2}ms total={:.2}ms nalus={} sps={} pps={} idr={} frags={} bytes={} drop_cap={} drop_enc={}",
+                        frame.width,
+                        frame.height,
+                        frame.reused_last_frame,
+                        frame.capture_ms,
+                        frame.encode_ms,
+                        payload_ms,
+                        send_ms,
+                        frame_start.elapsed().as_secs_f64() * 1000.0,
+                        nal_summary.nalus,
+                        nal_summary.has_sps,
+                        nal_summary.has_pps,
+                        nal_summary.has_idr,
+                        total_fragments,
+                        total_payload_bytes,
+                        frame.dropped_before_encode,
+                        dropped_before_send,
+                    );
+                }
             }
         }
 
-        for nal in nalus.iter() {
-            if nal.is_empty() {
-                continue;
-            }
-
-            let nal_bytes = Bytes::copy_from_slice(nal);
-            let payloads = match payloader.payload(1200, &nal_bytes) {
-                Ok(chunks) => chunks,
-                Err(err) => {
-                    eprintln!("H264 payload split failed: {err}");
-                    continue;
-                }
-            };
-            total_fragments = total_fragments.saturating_add(payloads.len());
-
-            nal_cursor += 1;
-            let last_nal = nal_cursor == total_nals_to_send;
-            for (index, fragment) in payloads.iter().enumerate() {
-                if track.any_binding_paused().await {
-                    break;
-                }
-
-                let marker = last_nal && (index + 1 == payloads.len());
-                let packet = Packet {
-                    header: rtp::header::Header {
-                        version: 2,
-                        padding: false,
-                        extension: false,
-                        marker,
-                        payload_type,
-                        sequence_number: seq,
-                        timestamp: frame_ts,
-                        ssrc: stream_ssrc,
-                        csrc: vec![],
-                        extension_profile: 0,
-                        extensions: vec![],
-                        extensions_padding: 0,
-                    },
-                    payload: fragment.clone(),
-                };
-
-                if track.write_rtp(&packet).await.is_err() {
-                    break;
-                }
-
-                frame_sent = true;
-                seq = seq.wrapping_add(1);
-            }
+        let rtcp_delta = collect_rtcp_delta(&rtcp_feedback, &mut last_rtcp_snapshot);
+        if let Some(next) = controller.on_feedback(AdaptiveFeedback {
+            dropped_before_encode: frame.dropped_before_encode,
+            dropped_before_send,
+            send_error,
+            rtcp_nack_delta: rtcp_delta.nack,
+            rtcp_pli_delta: rtcp_delta.pli,
+            rtcp_fir_delta: rtcp_delta.fir,
+            rtcp_feedback_stale: rtcp_delta.total > 0 && rtcp_delta.feedback_stale,
+        }) {
+            let _ = adaptive_tx.send(next);
+            println!(
+                "OpenH264 adaptive target: {} FPS, {:.2} Mbps",
+                next.target_fps,
+                next.bitrate_bps as f64 / 1_000_000.0
+            );
         }
-        let send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
 
-        if frame_sent {
-            stats.record_frame(encoded.len());
-            if frame_index % preset.target_fps.max(1) as u64 == 0 {
-                println!(
-                    "Sent software H264 frame {} ({} bytes payload)",
-                    frame_index,
-                    encoded.len()
-                );
-                vlog!(
-                    "sw pipeline: {}x{} reuse_last={} capture={:.2}ms encode={:.2}ms payload={:.2}ms send={:.2}ms total={:.2}ms nalus={} sps={} pps={} idr={} frags={} bytes={}",
-                    width,
-                    height,
-                    reused_last_frame,
-                    capture_ms,
-                    encode_ms,
-                    payload_ms,
-                    send_ms,
-                    frame_start.elapsed().as_secs_f64() * 1000.0,
-                    nal_summary.nalus,
-                    nal_summary.has_sps,
-                    nal_summary.has_pps,
-                    nal_summary.has_idr,
-                    total_fragments,
-                    encoded.len(),
-                );
-            }
+        if rtcp_delta.pli > 0 || rtcp_delta.fir > 0 {
+            // Recover quickly from decoder corruption after packet loss by forcing
+            // an IDR on the next encoded frame.
+            force_idr_hint.store(true, Ordering::Relaxed);
         }
+
         stats.flush_if_due(signaling).await;
-
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_interval {
-            tokio::time::sleep(frame_interval - elapsed).await;
-        }
     }
+
+    capture_task.abort();
+    encode_task.abort();
 
     Ok(())
 }
@@ -1240,8 +1818,12 @@ async fn run_media_foundation_screen_sender(
     peer: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticRTP>,
     preset: VideoEncoderPreset,
+    rtcp_feedback: Arc<RtcpFeedbackState>,
+    mut stream_profile_rx: watch::Receiver<StreamQualityProfile>,
 ) -> Result<(), String> {
-    let frame_period = frame_interval_for(preset);
+    let initial_profile = *stream_profile_rx.borrow();
+    let initial_config = profile_target_for_preset(initial_profile, preset);
+    let (adaptive_tx, adaptive_rx) = watch::channel(initial_config);
     let mut payloader = H264Payloader::default();
     let mut stream_ssrc: u32 = 0;
     let mut negotiated_ssrc: Option<u32> = None;
@@ -1251,28 +1833,242 @@ async fn run_media_foundation_screen_sender(
     let mut seq: u16 = 1;
     let stream_clock_start = Instant::now();
     let mut last_rtp_ts: u32 = 0;
-    let mut frame_counter: u64 = 0;
     let mut stats = StreamStatsWindow::new();
-    let mut capturer = DxgiDesktopDuplicator::new()?;
-    let scale_target = resolve_scale_request();
-    let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
-    let mut last_dimensions: Option<(usize, usize)> = None;
-    let mut worker = MediaFoundationEncoderWorker::new(
-        0,
-        0,
-        preset.target_fps.max(1),
-        preset.bitrate_bps,
-    )?;
 
+    let (capture_tx, mut capture_rx) = broadcast::channel::<CapturedScreenFrame>(2);
+    let (encoded_tx, mut encoded_rx) = broadcast::channel::<EncodedScreenFrame>(2);
+
+    let capture_peer = Arc::clone(peer);
+    let capture_track = Arc::clone(track);
+    let capture_cfg_rx = adaptive_rx.clone();
+    let capture_task = tokio::spawn(async move {
+        #[cfg(windows)]
+        let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
+
+        let mut capturer = match DxgiDesktopDuplicator::new() {
+            Ok(capturer) => capturer,
+            Err(err) => {
+                eprintln!("DXGI capturer init failed: {err}");
+                return;
+            }
+        };
+
+        let scale_target = resolve_scale_request();
+        let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
+        let mut frame_counter: u64 = 0;
+        let mut next_capture_deadline = Instant::now() + frame_interval_for_target_fps(initial_config.target_fps);
+
+        loop {
+            let capture_config = *capture_cfg_rx.borrow();
+            match capture_peer.connection_state() {
+                RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+                _ => {}
+            }
+
+            if !stream_is_ready(&capture_peer, &capture_track).await {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                continue;
+            }
+
+            let capture_start = Instant::now();
+            let mut reused_last_frame = false;
+
+            let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
+                &mut capturer,
+                scale_target,
+            ) {
+                Ok(Some((w, h, frame))) => {
+                    let arc = Arc::new(frame);
+                    last_capture = Some((w, h, Arc::clone(&arc)));
+                    (w, h, arc)
+                }
+                Ok(None) => {
+                    if let Some((w, h, ref arc)) = last_capture {
+                        reused_last_frame = true;
+                        (w, h, Arc::clone(arc))
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Screen capture failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            frame_counter = frame_counter.saturating_add(1);
+            let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
+
+            let frame = CapturedScreenFrame {
+                width,
+                height,
+                bgra_frame,
+                reused_last_frame,
+                capture_ms,
+                frame_counter,
+            };
+
+            let _ = capture_tx.send(frame);
+
+            pace_capture_loop(&mut next_capture_deadline, capture_config.target_fps).await;
+        }
+    });
+
+    let mut encode_cfg_rx = adaptive_rx.clone();
+    let encode_task = tokio::spawn(async move {
+        let mut active_config = *encode_cfg_rx.borrow();
+        let mut worker = match MediaFoundationEncoderWorker::new(
+            0,
+            0,
+            active_config.target_fps.max(1),
+            active_config.bitrate_bps,
+        ) {
+            Ok(worker) => worker,
+            Err(err) => {
+                eprintln!("Media Foundation worker init failed: {err}");
+                return;
+            }
+        };
+
+        let mut last_dimensions: Option<(usize, usize)> = None;
+        let mut dropped_capture_frames: u64 = 0;
+
+        loop {
+            let Some(frame) = recv_latest_broadcast(&mut capture_rx, &mut dropped_capture_frames).await else {
+                break;
+            };
+
+            let dropped_before_encode = std::mem::take(&mut dropped_capture_frames);
+
+            let latest_config = *encode_cfg_rx.borrow_and_update();
+            if latest_config != active_config {
+                // R4: Only recreate the encoder on significant bitrate changes (>30%).
+                // Small adaptive adjustments skip the expensive MFT teardown/rebuild
+                // which causes visible 50-200ms hiccups.
+                let bitrate_ratio = latest_config.bitrate_bps as f64
+                    / active_config.bitrate_bps.max(1) as f64;
+                let fps_delta = latest_config
+                    .target_fps
+                    .abs_diff(active_config.target_fps);
+                let significant_change = bitrate_ratio < 0.7
+                    || bitrate_ratio > 1.43
+                    || fps_delta >= 8;
+
+                if significant_change {
+                    match MediaFoundationEncoderWorker::new(
+                        0,
+                        0,
+                        latest_config.target_fps.max(1),
+                        latest_config.bitrate_bps,
+                    ) {
+                        Ok(new_worker) => {
+                            worker = new_worker;
+                            println!(
+                                "Media Foundation adaptive reconfigure: {} FPS, {:.2} Mbps",
+                                latest_config.target_fps,
+                                latest_config.bitrate_bps as f64 / 1_000_000.0
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("Media Foundation reconfigure failed: {err}");
+                        }
+                    }
+                }
+                active_config = latest_config;
+            }
+
+            if last_dimensions != Some((frame.width, frame.height)) {
+                last_dimensions = Some((frame.width, frame.height));
+                println!(
+                    "Media Foundation H264 encoder configured at {}x{}",
+                    frame.width, frame.height
+                );
+            }
+
+            // Some Intel Media Foundation stacks can stall after repeated drain/restart
+            // keyframe forcing. Keep forced keyframe only at stream startup.
+            let force_keyframe = frame.frame_counter == 1;
+
+            let width = frame.width;
+            let height = frame.height;
+            let bgra_frame = Arc::clone(&frame.bgra_frame);
+            let encode_start = Instant::now();
+
+            let join_result = tokio::task::spawn_blocking(move || {
+                let result = worker.encode_bgra(width, height, bgra_frame, force_keyframe);
+                (result, worker)
+            })
+            .await;
+
+            let (encoded_units_result, active_worker) = match join_result {
+                Ok(value) => value,
+                Err(e) => {
+                    eprintln!("spawn_blocking failed: {e}");
+                    break;
+                }
+            };
+            worker = active_worker;
+
+            let encoded_units = match encoded_units_result {
+                Ok(units) => units,
+                Err(err) => {
+                    eprintln!("Media Foundation encode failed: {err}");
+                    continue;
+                }
+            };
+
+            if encoded_units.is_empty() || encoded_units.iter().all(|u| u.data.is_empty()) {
+                continue;
+            }
+
+            let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+            let packet = EncodedScreenFrame {
+                width: frame.width,
+                height: frame.height,
+                reused_last_frame: frame.reused_last_frame,
+                capture_ms: frame.capture_ms,
+                encode_ms,
+                frame_counter: frame.frame_counter,
+                dropped_before_encode,
+                encoded_units: encoded_units
+                    .into_iter()
+                    .filter_map(|unit| if unit.data.is_empty() { None } else { Some(unit.data) })
+                    .collect(),
+            };
+
+            let _ = encoded_tx.send(packet);
+        }
+    });
+
+    let mut dropped_encoded_frames: u64 = 0;
+    let mut controller = AdaptiveRateController::new(initial_config);
+    let mut last_rtcp_snapshot = rtcp_feedback.snapshot();
     loop {
-        let loop_start = Instant::now();
+        let profile_limit = profile_target_for_preset(*stream_profile_rx.borrow_and_update(), preset);
+        if let Some(updated) = controller.apply_profile_limit(profile_limit) {
+            let _ = adaptive_tx.send(updated);
+            println!(
+                "Media Foundation profile target: {} FPS, {:.2} Mbps",
+                updated.target_fps,
+                updated.bitrate_bps as f64 / 1_000_000.0
+            );
+        }
+
         match peer.connection_state() {
             RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
             _ => {}
         }
 
+        let Some(frame) = recv_latest_broadcast(&mut encoded_rx, &mut dropped_encoded_frames).await else {
+            break;
+        };
+
+        let dropped_before_send = std::mem::take(&mut dropped_encoded_frames);
+
         if !stream_is_ready(peer, track).await {
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
             continue;
         }
 
@@ -1295,72 +2091,23 @@ async fn run_media_foundation_screen_sender(
             println!("Using video SSRC: {stream_ssrc}");
         }
 
-        let capture_start = Instant::now();
-        let mut reused_last_frame = false;
-        let (width, height, bgra_frame) =
-            match capture_primary_screen_even_bgra(&mut capturer, scale_target)? {
-                Some((w, h, frame)) => {
-                    let arc = Arc::new(frame);
-                    last_capture = Some((w, h, Arc::clone(&arc)));
-                    (w, h, arc)
-                }
-                None => {
-                    if let Some((w, h, ref arc)) = last_capture {
-                        reused_last_frame = true;
-                        (w, h, Arc::clone(arc))
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                        continue;
-                    }
-                }
-            };
-        let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
-        frame_counter += 1;
-
-        if last_dimensions != Some((width, height)) {
-            last_dimensions = Some((width, height));
-            println!(
-                "Media Foundation H264 encoder configured at {}x{}",
-                width, height
-            );
-        }
-
-        let encode_start = Instant::now();
-        let (encoded_units_result, returned_worker) = tokio::task::spawn_blocking(move || {
-            let nv12 = super::desktop_duplication::bgra_to_nv12(width, height, width * 4, &bgra_frame);
-            let result = worker.encode_nv12(width, height, nv12.as_bytes());
-            (result, worker)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed: {e}"))?;
-        worker = returned_worker;
-
-        let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
-
-        let encoded_units = encoded_units_result?;
-        if encoded_units.is_empty() || encoded_units.iter().all(|u| u.data.is_empty()) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            continue;
-        }
-
+        let loop_start = Instant::now();
         let mut frame_ts = rtp_timestamp_90khz_from_instant(&stream_clock_start);
         if frame_ts <= last_rtp_ts {
             frame_ts = last_rtp_ts.wrapping_add(1);
         }
         last_rtp_ts = frame_ts;
         let mut frame_sent = false;
+        let mut send_error = false;
         let mut total_payload_bytes = 0usize;
         let mut total_fragments = 0usize;
         let mut nal_summary = NalSummary::default();
 
-        let units_len = encoded_units.len();
-        for (unit_index, unit) in encoded_units.into_iter().enumerate() {
-            if unit.data.is_empty() {
-                continue;
-            }
-
-            let raw_nalus = split_annexb_nalus(&unit.data);
-            let (nalus, has_idr) = reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
+        let units_len = frame.encoded_units.len();
+        for (unit_index, unit_data) in frame.encoded_units.into_iter().enumerate() {
+            let raw_nalus = split_annexb_nalus(&unit_data);
+            let (nalus, has_idr) =
+                reorder_and_cache_sps_pps(raw_nalus, &mut cached_sps, &mut cached_pps);
             let unit_summary = summarize_nalus(&nalus);
             nal_summary.nalus = nal_summary.nalus.saturating_add(unit_summary.nalus);
             nal_summary.has_sps |= unit_summary.has_sps;
@@ -1398,9 +2145,6 @@ async fn run_media_foundation_screen_sender(
                 total_fragments = total_fragments.saturating_add(payloads.len());
                 let last_nal = last_unit && (nal_cursor == total_nals_to_send);
                 for (index, fragment) in payloads.iter().enumerate() {
-                    if track.any_binding_paused().await {
-                        break;
-                    }
                     let marker = last_nal && (index + 1 == payloads.len());
                     let packet = Packet {
                         header: rtp::header::Header {
@@ -1420,6 +2164,7 @@ async fn run_media_foundation_screen_sender(
                         payload: fragment.clone(),
                     };
                     if track.write_rtp(&packet).await.is_err() {
+                        send_error = true;
                         break;
                     }
                     frame_sent = true;
@@ -1446,10 +2191,6 @@ async fn run_media_foundation_screen_sender(
                 nal_cursor += 1;
                 let last_nal = last_unit && (nal_cursor == total_nals_to_send);
                 for (index, fragment) in payloads.iter().enumerate() {
-                    if track.any_binding_paused().await {
-                        break;
-                    }
-
                     let marker = last_nal && (index + 1 == payloads.len());
                     let packet = Packet {
                         header: rtp::header::Header {
@@ -1470,6 +2211,7 @@ async fn run_media_foundation_screen_sender(
                     };
 
                     if track.write_rtp(&packet).await.is_err() {
+                        send_error = true;
                         break;
                     }
 
@@ -1481,18 +2223,18 @@ async fn run_media_foundation_screen_sender(
 
         if frame_sent {
             stats.record_frame(total_payload_bytes.max(1));
-            if frame_counter % preset.target_fps.max(1) as u64 == 0 {
+            if frame.frame_counter % preset.target_fps.max(1) as u64 == 0 {
                 println!(
                     "Sent native MF H264 frame {} ({} bytes payload)",
-                    frame_counter, total_payload_bytes
+                    frame.frame_counter, total_payload_bytes
                 );
                 vlog!(
-                    "mf pipeline: {}x{} reuse_last={} capture={:.2}ms encode={:.2}ms total={:.2}ms nalus={} sps={} pps={} idr={} frags={} bytes={}",
-                    width,
-                    height,
-                    reused_last_frame,
-                    capture_ms,
-                    encode_ms,
+                    "mf pipeline: {}x{} reuse_last={} capture={:.2}ms encode={:.2}ms total={:.2}ms nalus={} sps={} pps={} idr={} frags={} bytes={} drop_cap={} drop_enc={}",
+                    frame.width,
+                    frame.height,
+                    frame.reused_last_frame,
+                    frame.capture_ms,
+                    frame.encode_ms,
                     loop_start.elapsed().as_secs_f64() * 1000.0,
                     nal_summary.nalus,
                     nal_summary.has_sps,
@@ -1500,16 +2242,35 @@ async fn run_media_foundation_screen_sender(
                     nal_summary.has_idr,
                     total_fragments,
                     total_payload_bytes,
+                    frame.dropped_before_encode,
+                    dropped_before_send,
                 );
             }
         }
-        stats.flush_if_due(signaling).await;
 
-        let elapsed = loop_start.elapsed();
-        if elapsed < frame_period {
-            tokio::time::sleep(frame_period - elapsed).await;
+        let rtcp_delta = collect_rtcp_delta(&rtcp_feedback, &mut last_rtcp_snapshot);
+        if let Some(next) = controller.on_feedback(AdaptiveFeedback {
+            dropped_before_encode: frame.dropped_before_encode,
+            dropped_before_send,
+            send_error,
+            rtcp_nack_delta: rtcp_delta.nack,
+            rtcp_pli_delta: rtcp_delta.pli,
+            rtcp_fir_delta: rtcp_delta.fir,
+            rtcp_feedback_stale: rtcp_delta.total > 0 && rtcp_delta.feedback_stale,
+        }) {
+            let _ = adaptive_tx.send(next);
+            println!(
+                "Media Foundation adaptive target: {} FPS, {:.2} Mbps",
+                next.target_fps,
+                next.bitrate_bps as f64 / 1_000_000.0
+            );
         }
+
+        stats.flush_if_due(signaling).await;
     }
+
+    capture_task.abort();
+    encode_task.abort();
 
     Ok(())
 }
@@ -1531,6 +2292,9 @@ async fn run_ffmpeg_rtp_screen_sender(
     preset: VideoEncoderPreset,
 ) -> Result<(), String> {
     let frame_interval = frame_interval_for(preset);
+    #[cfg(windows)]
+    let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
+
     let mut bridge: Option<FfmpegRtpBridge> = None;
     let mut active_dimensions: Option<(usize, usize)> = None;
     let mut stats = StreamStatsWindow::new();
@@ -1539,6 +2303,7 @@ async fn run_ffmpeg_rtp_screen_sender(
     let scale_target = resolve_scale_request();
     let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
     let mut frame_counter: u64 = 0;
+    let mut next_capture_deadline = Instant::now() + frame_interval;
 
     loop {
         match peer.connection_state() {
@@ -1628,7 +2393,7 @@ async fn run_ffmpeg_rtp_screen_sender(
             drain_start.elapsed().as_secs_f64() * 1000.0
         );
         stats.flush_if_due(signaling).await;
-        tokio::time::sleep(frame_interval).await;
+        pace_capture_loop(&mut next_capture_deadline, preset.target_fps.max(1)).await;
     }
 
     if let Some(existing) = bridge.as_mut() {
@@ -1674,8 +2439,10 @@ async fn drain_ffmpeg_packets(
 }
 
 async fn stream_is_ready(peer: &Arc<RTCPeerConnection>, track: &Arc<TrackLocalStaticRTP>) -> bool {
-    !track.all_binding_paused().await
-        && peer.connection_state() == RTCPeerConnectionState::Connected
+    let _ = track;
+    // Some systems report binding paused for too long even after negotiation succeeds,
+    // which can stall the sender loop and leave only the startup preview visible.
+    peer.connection_state() == RTCPeerConnectionState::Connected
 }
 
 fn frame_interval_for(preset: VideoEncoderPreset) -> Duration {
@@ -1706,6 +2473,22 @@ fn normalize_frame_for_stream(
             requested_height,
         );
         frame.resize_bgra_nearest(target_width, target_height)
+    } else if should_auto_downscale() && (frame.width > 1920 || frame.height > 1080) {
+        // Auto-downscale high-resolution captures (4K, ultrawide, etc.) to 1080p
+        // to guarantee good FPS on all hardware. Preserves aspect ratio.
+        let aspect = frame.width as f64 / frame.height.max(1) as f64;
+        let (tw, th) = if aspect >= 1.0 {
+            // Landscape: cap width at 1920
+            let w = 1920usize;
+            let h = ((w as f64 / aspect).round() as usize).max(2);
+            (w, h)
+        } else {
+            // Portrait: cap height at 1080
+            let h = 1080usize;
+            let w = ((h as f64 * aspect).round() as usize).max(2);
+            (w, h)
+        };
+        frame.resize_bgra_nearest(tw & !1, th & !1)
     } else {
         frame
     };
@@ -1716,6 +2499,11 @@ fn normalize_frame_for_stream(
     }
 
     Ok((width, height, bgra))
+}
+
+fn should_auto_downscale() -> bool {
+    // Disable auto-downscale with LUMIERE_STREAM_NOSCALE=1
+    !env_flag_true("LUMIERE_STREAM_NOSCALE")
 }
 
 fn resolve_scale_request() -> Option<(usize, usize)> {

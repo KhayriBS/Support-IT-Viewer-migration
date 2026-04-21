@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{interval, Duration};
 
@@ -22,7 +23,7 @@ use super::input_handler::InputHandler;
 use super::metrics::MetricsCollector;
 use super::screen_capture::capture_primary_jpeg_base64;
 use super::signaling::{SignalEvent, SignalType, SignalingClient};
-use super::webrtc::AgentWebRtc;
+use super::webrtc::{AgentWebRtc, StreamQualityProfile};
 
 // ─── Agent state (shared across Tauri commands) ───────────────────────────────
 
@@ -58,6 +59,7 @@ pub struct SharedState {
     pub status: Mutex<AgentStatus>,
     pub jwt_token: Mutex<Option<String>>,
     pub signaling: Mutex<Option<Arc<SignalingClient>>>,
+    pub viewer_activity_epoch: AtomicU64,
     pub stop_notify: Notify,
     /// Channel to push inbound chat messages to the frontend via Tauri events
     pub chat_tx: Mutex<Option<mpsc::UnboundedSender<(String, String)>>>,
@@ -69,6 +71,7 @@ impl SharedState {
             status: Mutex::new(AgentStatus::default()),
             jwt_token: Mutex::new(None),
             signaling: Mutex::new(None),
+            viewer_activity_epoch: AtomicU64::new(0),
             stop_notify: Notify::new(),
             chat_tx: Mutex::new(None),
         })
@@ -257,19 +260,8 @@ pub async fn join_session(
             
             match client.connect(&token_clone, event_tx).await {
                 Ok(_) => {
-                    if let Err(err) = client
-                        .send(super::signaling::SignalMessage::new(
-                            SignalType::Join,
-                            "viewer",
-                            Some(serde_json::json!({ "role": "agent" })),
-                        ))
-                        .await
-                    {
-                        eprintln!("⚠️ Envoi JOIN agent échoué: {err}");
-                    }
-
                     println!("⏳ En attente de l'OFFER du viewer…");
-                    reconnect_delay = Duration::from_secs(1); // reset backoff on successful connect
+                    let connected_at = std::time::Instant::now();
                     
                     // Run the signal dispatch loop
                     dispatch_signals(
@@ -280,6 +272,11 @@ pub async fn join_session(
                         Arc::clone(&input_handler),
                         &file_service,
                     ).await;
+
+                    if connected_at.elapsed() >= Duration::from_secs(8) {
+                        // Reset backoff only for reasonably stable connections.
+                        reconnect_delay = Duration::from_secs(1);
+                    }
                     
                     // Connection closed — check if we should reconnect
                     {
@@ -336,7 +333,9 @@ async fn dispatch_signals(
     let mut webrtc: Option<AgentWebRtc> = None;
     let mut h264_sender_started = false;
     let mut startup_preview_started = false;
+    let mut startup_preview_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut last_offer_fingerprint: Option<u64> = None;
+    let mut requested_stream_profile = StreamQualityProfile::Responsive;
 
     while let Some(msg) = event_rx.recv().await {
         let sig_client = {
@@ -346,11 +345,13 @@ async fn dispatch_signals(
 
         match msg.signal_type {
             SignalType::Join => {
+                state.viewer_activity_epoch.fetch_add(1, Ordering::Relaxed);
                 println!("👋 Viewer rejoint la session — attente de l'OFFER SDP");
             }
 
             // ── SDP Offer → create Answer ──────────────────────────────
             SignalType::Offer => {
+                state.viewer_activity_epoch.fetch_add(1, Ordering::Relaxed);
                 println!("📥 Offer SDP reçu du viewer");
 
                 let current_offer_fingerprint = msg
@@ -391,6 +392,7 @@ async fn dispatch_signals(
                 if let (Some(pc), Some(payload)) = (webrtc.as_ref(), msg.payload.as_ref()) {
                     match pc.handle_offer(payload).await {
                         Ok(answer_payload) => {
+                            pc.set_stream_profile(requested_stream_profile);
                             last_offer_fingerprint = current_offer_fingerprint;
                             if let Err(e) = sig.send_answer(answer_payload).await {
                                 eprintln!("❌ Envoi ANSWER échoué: {e}");
@@ -399,10 +401,18 @@ async fn dispatch_signals(
 
                                 if !startup_preview_started {
                                     let preview_sig = Arc::clone(&sig);
-                                    tokio::spawn(async move {
+                                    let preview_task = tokio::spawn(async move {
                                         for _ in 0..6 {
+                                            if !preview_sig.is_connected().await {
+                                                break;
+                                            }
+
                                             match capture_primary_jpeg_base64(55) {
                                                 Ok(frame) => {
+                                                    if !preview_sig.is_connected().await {
+                                                        break;
+                                                    }
+
                                                     let payload = serde_json::json!({
                                                         "kind": "screen-frame",
                                                         "mime": "image/jpeg",
@@ -411,6 +421,9 @@ async fn dispatch_signals(
                                                     });
 
                                                     if let Err(err) = preview_sig.send_screen_frame(payload).await {
+                                                        if err.to_ascii_lowercase().contains("non connecté") {
+                                                            break;
+                                                        }
                                                         eprintln!("⚠️ Envoi preview écran échoué: {err}");
                                                     }
                                                 }
@@ -422,6 +435,7 @@ async fn dispatch_signals(
                                             tokio::time::sleep(Duration::from_millis(900)).await;
                                         }
                                     });
+                                    startup_preview_task = Some(preview_task);
                                     startup_preview_started = true;
                                 }
 
@@ -465,16 +479,93 @@ async fn dispatch_signals(
                 }
             }
 
+            SignalType::StreamProfile => {
+                let profile = msg
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("profile"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| StreamQualityProfile::from_payload(raw))
+                    .unwrap_or(StreamQualityProfile::Quality);
+
+                requested_stream_profile = profile;
+                if let Some(pc) = webrtc.as_ref() {
+                    pc.set_stream_profile(profile);
+                }
+                println!("🎛️ Stream profile reçu: {:?}", profile);
+            }
+
             // ── LEAVE ─────────────────────────────────────────────────
             SignalType::Leave => {
                 println!("🚪 Signal LEAVE reçu — fermeture de la session");
-                leave_session(Arc::clone(&state)).await;
+
+                let state_for_grace = Arc::clone(&state);
+                let leave_epoch = state.viewer_activity_epoch.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+
+                    let in_session = state_for_grace.status.lock().await.in_session;
+                    let current_epoch = state_for_grace.viewer_activity_epoch.load(Ordering::Relaxed);
+                    if in_session && current_epoch == leave_epoch {
+                        println!(
+                            "⏱️ Viewer absent après délai de grâce, fermeture de la session locale"
+                        );
+                        leave_session(Arc::clone(&state_for_grace)).await;
+                    }
+                });
+
+                if let Some(task) = startup_preview_task.take() {
+                    task.abort();
+                }
+                if let Some(pc) = webrtc.as_ref() {
+                    pc.close().await;
+                }
+
+                // Do not end the local session immediately on viewer LEAVE.
+                // The signaling socket can flap (network/tab refresh); returning here lets the
+                // outer reconnect loop restore signaling while keeping the session active.
+                println!("ℹ️ Viewer déconnecté, tentative de reprise de session…");
                 break;
             }
 
             SignalType::Error => {
                 if let Some(payload) = &msg.payload {
-                    eprintln!("⚠️ Signal ERROR serveur: {payload}");
+                    let is_socket_close = payload
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|kind| kind == "socket-close")
+                        .unwrap_or(false);
+
+                    if is_socket_close {
+                        let close_code = payload
+                            .get("code")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default();
+
+                        // 1003 means the server rejects this signaling session/token combo.
+                        // Continuing reconnect attempts is futile, so close local session now.
+                        if close_code == 1003 {
+                            println!(
+                                "⛔ Signal fermé par serveur (1003), fin de session locale"
+                            );
+                            leave_session(Arc::clone(&state)).await;
+                            break;
+                        }
+                    }
+
+                    let is_peer_not_connected = payload
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|message| message.contains("Peer not connected: viewer"))
+                        .unwrap_or(false);
+
+                    if is_peer_not_connected {
+                        println!(
+                            "ℹ️ Viewer pas encore connecté (signal normal pendant l'initialisation)"
+                        );
+                    } else {
+                        eprintln!("⚠️ Signal ERROR serveur: {payload}");
+                    }
                 } else {
                     eprintln!("⚠️ Signal ERROR serveur sans payload");
                 }
@@ -574,6 +665,13 @@ async fn dispatch_signals(
             }
         }
 
+    }
+
+    if let Some(task) = startup_preview_task.take() {
+        task.abort();
+    }
+    if let Some(pc) = webrtc.as_ref() {
+        pc.close().await;
     }
 }
 

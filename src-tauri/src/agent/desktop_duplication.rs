@@ -359,12 +359,19 @@ mod imp {
                 let row_pitch = mapped.RowPitch as usize;
                 let byte_len = row_pitch.saturating_mul(height);
                 let src = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), byte_len);
-                let mut bgra = vec![0u8; width * height * 4];
-                for y in 0..height {
-                    let src_row = &src[y * row_pitch..y * row_pitch + width * 4];
-                    let dst_row = &mut bgra[y * width * 4..y * width * 4 + width * 4];
-                    dst_row.copy_from_slice(src_row);
-                }
+                let row_bytes = width * 4;
+                let total_bytes = row_bytes * height;
+                let bgra = if row_pitch == row_bytes {
+                    // Fast path: stride matches width, single contiguous copy
+                    src[..total_bytes].to_vec()
+                } else {
+                    // Stride path: row-by-row copy (GPU padding differs)
+                    let mut buf = Vec::with_capacity(total_bytes);
+                    for y in 0..height {
+                        buf.extend_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
+                    }
+                    buf
+                };
 
                 context.Unmap(staging, 0);
                 let _ = duplication.ReleaseFrame();
@@ -425,44 +432,67 @@ mod imp {
         stride: usize,
         bgra: &[u8],
     ) -> Nv12Frame {
-        let mut y_plane = vec![0u8; width * height];
-        let mut uv_plane = vec![0u8; width * (height / 2)];
-
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                let mut u_acc = 0.0f32;
-                let mut v_acc = 0.0f32;
-
-                for block_y in 0..2 {
-                    for block_x in 0..2 {
-                        let px = x + block_x;
-                        let py = y + block_y;
-                        let idx = py * stride + px * 4;
-                        let b = bgra[idx] as f32;
-                        let g = bgra[idx + 1] as f32;
-                        let r = bgra[idx + 2] as f32;
-
-                        let y_value = (0.257 * r + 0.504 * g + 0.098 * b + 16.0)
-                            .round()
-                            .clamp(0.0, 255.0) as u8;
-                        y_plane[py * width + px] = y_value;
-
-                        u_acc += (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).clamp(0.0, 255.0);
-                        v_acc += (0.439 * r - 0.368 * g - 0.071 * b + 128.0).clamp(0.0, 255.0);
-                    }
-                }
-
-                let uv_index = (y / 2) * width + x;
-                uv_plane[uv_index] = (u_acc / 4.0).round().clamp(0.0, 255.0) as u8;
-                uv_plane[uv_index + 1] = (v_acc / 4.0).round().clamp(0.0, 255.0) as u8;
-            }
-        }
+        let mut packed = Vec::new();
+        bgra_to_nv12_packed(width, height, stride, bgra, &mut packed);
+        let y_len = width * height;
+        let uv_len = width * (height / 2);
+        let mut y_plane = vec![0u8; y_len];
+        let mut uv_plane = vec![0u8; uv_len];
+        y_plane.copy_from_slice(&packed[..y_len]);
+        uv_plane.copy_from_slice(&packed[y_len..(y_len + uv_len)]);
 
         Nv12Frame {
             width,
             height,
             y_plane,
             uv_plane,
+        }
+    }
+
+    pub fn bgra_to_nv12_packed(
+        width: usize,
+        height: usize,
+        stride: usize,
+        bgra: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        let y_len = width * height;
+        let uv_len = width * (height / 2);
+        let total_len = y_len + uv_len;
+
+        if out.len() != total_len {
+            out.resize(total_len, 0);
+        }
+
+        let (y_plane, uv_plane) = out.split_at_mut(y_len);
+
+        // BT.601 integer fixed-point conversion (coefficients scaled x256).
+        for row in (0..height).step_by(2) {
+            for col in (0..width).step_by(2) {
+                let mut u_acc: i32 = 0;
+                let mut v_acc: i32 = 0;
+
+                for block_y in 0..2usize {
+                    for block_x in 0..2usize {
+                        let px = col + block_x;
+                        let py = row + block_y;
+                        let idx = py * stride + px * 4;
+                        let b = bgra[idx] as i32;
+                        let g = bgra[idx + 1] as i32;
+                        let r = bgra[idx + 2] as i32;
+
+                        let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                        y_plane[py * width + px] = y_val.clamp(0, 255) as u8;
+
+                        u_acc += -38 * r - 74 * g + 112 * b;
+                        v_acc += 112 * r - 94 * g - 18 * b;
+                    }
+                }
+
+                let uv_index = (row / 2) * width + col;
+                uv_plane[uv_index] = (((u_acc + 512) >> 10) + 128).clamp(0, 255) as u8;
+                uv_plane[uv_index + 1] = (((v_acc + 512) >> 10) + 128).clamp(0, 255) as u8;
+            }
         }
     }
 }

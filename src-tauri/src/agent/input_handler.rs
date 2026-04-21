@@ -11,6 +11,7 @@
 #[cfg(windows)]
 mod win {
     use serde_json::Value;
+    use std::sync::OnceLock;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         keybd_event, mouse_event, MapVirtualKeyW, VkKeyScanW, KEYEVENTF_KEYUP,
         MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -18,6 +19,15 @@ mod win {
         VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+
+    fn input_debug_enabled() -> bool {
+        static INPUT_DEBUG: OnceLock<bool> = OnceLock::new();
+        *INPUT_DEBUG.get_or_init(|| {
+            std::env::var("LUMIERE_INPUT_DEBUG")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        })
+    }
 
     // ─── InputHandler ─────────────────────────────────────────────────────────
 
@@ -35,7 +45,9 @@ mod win {
             };
 
             let event_type = root["type"].as_str().unwrap_or("");
-            println!("🖱️ Input reçu: {event_type}");
+            if input_debug_enabled() || !matches!(event_type, "mousemove" | "mouse-move" | "wheel") {
+                println!("🖱️ Input reçu: {event_type}");
+            }
 
             match event_type {
                 "mousemove" | "mouse-move" => self.handle_mouse_move(&root),
