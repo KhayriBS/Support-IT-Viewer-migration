@@ -1,18 +1,19 @@
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
+use sysinfo::System;
 use tokio::sync::{broadcast, watch, Mutex};
 
 #[cfg(windows)]
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod, TIMERR_NOERROR};
 
-use super::desktop_duplication::{DesktopFrame, DxgiDesktopDuplicator};
+use super::capture::{capture_primary_screen_even_bgra, create_default_capturer, resolve_scale_request};
+use super::file_transfer::FileTransferService;
 use super::media_foundation_encoder::MediaFoundationEncoderWorker;
 use super::input_handler::InputHandler;
 use super::signaling::SignalingClient;
@@ -37,6 +38,7 @@ use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -54,20 +56,35 @@ pub struct IceServerConfig {
 }
 
 fn default_ice_servers() -> Vec<IceServerConfig> {
+    // Metered "global.relay" static credentials (account: lumieretech).
+    // Used as a hard fallback when neither LUMIERE_ICE_SERVERS nor the Metered
+    // API at LUMIERE_METERED_DOMAIN are reachable. Rotated manually if Metered
+    // invalidates the static creds.
     vec![
         IceServerConfig {
-            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            urls: vec!["stun:stun.relay.metered.ca:80".to_owned()],
             username: None,
             credential: None,
         },
         IceServerConfig {
-            urls: vec![
-                "turn:openrelay.metered.ca:80".to_owned(),
-                "turn:openrelay.metered.ca:443".to_owned(),
-                "turns:openrelay.metered.ca:443".to_owned(),
-            ],
-            username: Some("openrelayproject".to_owned()),
-            credential: Some("openrelayproject".to_owned()),
+            urls: vec!["turn:global.relay.metered.ca:80".to_owned()],
+            username: Some("d156f70e60e74c734ec39dc8".to_owned()),
+            credential: Some("Z9zO5Kp3c5P/c6e0".to_owned()),
+        },
+        IceServerConfig {
+            urls: vec!["turn:global.relay.metered.ca:80?transport=tcp".to_owned()],
+            username: Some("d156f70e60e74c734ec39dc8".to_owned()),
+            credential: Some("Z9zO5Kp3c5P/c6e0".to_owned()),
+        },
+        IceServerConfig {
+            urls: vec!["turn:global.relay.metered.ca:443".to_owned()],
+            username: Some("d156f70e60e74c734ec39dc8".to_owned()),
+            credential: Some("Z9zO5Kp3c5P/c6e0".to_owned()),
+        },
+        IceServerConfig {
+            urls: vec!["turns:global.relay.metered.ca:443?transport=tcp".to_owned()],
+            username: Some("d156f70e60e74c734ec39dc8".to_owned()),
+            credential: Some("Z9zO5Kp3c5P/c6e0".to_owned()),
         },
     ]
 }
@@ -80,11 +97,34 @@ fn read_env_or_local(key: &str) -> Option<String> {
         }
     }
 
-    // Standard command (`npm run tauri dev/build`) may not inject process env vars.
-    // Fall back to reading local .env files from common working directories.
-    let candidates = [Path::new(".env.local"), Path::new("../.env.local")];
+    // Tauri runs the binary from src-tauri/target/{debug,release}/, so .env.local
+    // at the repo root is reachable via different relative depths depending on
+    // dev vs production build. Walk up from CWD as a robust fallback, and also
+    // try paths relative to the executable's directory.
+    let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
 
-    for path in candidates {
+    // Relative to current working directory (npm run tauri dev launches Vite
+    // from the repo root, but the Rust binary's cwd is src-tauri/target/{...})
+    if let Ok(mut cwd) = std::env::current_dir() {
+        for _ in 0..5 {
+            search_paths.push(cwd.join(".env.local"));
+            if !cwd.pop() {
+                break;
+            }
+        }
+    }
+
+    // Relative to the executable's location (src-tauri/target/debug/lumiere-...)
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            let Some(d) = dir.clone() else { break; };
+            search_paths.push(d.join(".env.local"));
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    for path in &search_paths {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
@@ -113,11 +153,13 @@ fn read_env_or_local(key: &str) -> Option<String> {
             }
 
             if !parsed.is_empty() {
+                println!("📂 [env] {key} loaded from {}", path.display());
                 return Some(parsed);
             }
         }
     }
 
+    println!("⚠️ [env] {key} NOT found (searched {} paths)", search_paths.len());
     None
 }
 
@@ -169,15 +211,20 @@ fn to_rtc_ice_servers(input: &[IceServerConfig]) -> Vec<RTCIceServer> {
             }
 
             let mut rtc_ice = RTCIceServer {
-                urls,
-                username,
-                credential,
+                urls: urls.clone(),
+                username: username.clone(),
+                credential: credential.clone(),
                 ..Default::default()
             };
 
             if has_turn {
                 rtc_ice.credential_type = RTCIceCredentialType::Password;
             }
+
+            println!(
+                "🧊 [ICE→RTC] Passing to webrtc-rs: urls={:?} user='{}' has_turn={} cred_type={:?}",
+                urls, username, has_turn, rtc_ice.credential_type
+            );
 
             Some(rtc_ice)
         })
@@ -275,40 +322,82 @@ fn load_ice_servers_from_env() -> Option<Vec<IceServerConfig>> {
 }
 
 async fn load_ice_servers_from_metered() -> Option<Vec<IceServerConfig>> {
-    let domain = read_env_or_local("LUMIERE_METERED_DOMAIN")?
-        .trim()
-        .to_string();
-    let api_key = read_env_or_local("LUMIERE_METERED_API_KEY")?
-        .trim()
-        .to_string();
-    if domain.is_empty() || api_key.is_empty() {
-        return None;
-    }
+    let domain = match read_env_or_local("LUMIERE_METERED_DOMAIN") {
+        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
+        _ => {
+            println!("🧊 [ICE] LUMIERE_METERED_DOMAIN absent — skip Metered API");
+            return None;
+        }
+    };
+    let api_key = match read_env_or_local("LUMIERE_METERED_API_KEY") {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => {
+            println!("🧊 [ICE] LUMIERE_METERED_API_KEY absent — skip Metered API");
+            return None;
+        }
+    };
 
     let endpoint = format!(
         "https://{domain}/api/v1/turn/credentials?apiKey={api_key}",
         domain = domain,
         api_key = api_key
     );
+    println!("🧊 [ICE] Fetching Metered TURN from {domain}...");
 
-    let response = reqwest::Client::new()
-        .get(endpoint)
+    let response = match reqwest::Client::new()
+        .get(&endpoint)
         .timeout(Duration::from_secs(8))
         .send()
         .await
-        .ok()?;
-    let body = response.text().await.ok()?;
-    parse_ice_servers_from_json(&body)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("❌ [ICE] Metered API request failed: {e}");
+            return None;
+        }
+    };
+
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("❌ [ICE] Metered API body read failed: {e}");
+            return None;
+        }
+    };
+
+    if !status.is_success() {
+        eprintln!("❌ [ICE] Metered API returned HTTP {status}: {body}");
+        return None;
+    }
+
+    match parse_ice_servers_from_json(&body) {
+        Some(servers) => {
+            println!("✅ [ICE] Metered returned {} server(s)", servers.len());
+            for s in &servers {
+                println!("   • urls={:?} user={:?}", s.urls, s.username.as_deref().unwrap_or(""));
+            }
+            Some(servers)
+        }
+        None => {
+            eprintln!("❌ [ICE] Metered API JSON parse failed. Body: {body}");
+            None
+        }
+    }
 }
 
 pub async fn resolve_ice_servers_for_frontend() -> Vec<IceServerConfig> {
     if let Some(env_servers) = load_ice_servers_from_env() {
+        println!("🧊 [ICE] Source: LUMIERE_ICE_SERVERS env override ({} servers)", env_servers.len());
         return env_servers;
     }
     if let Some(metered_servers) = load_ice_servers_from_metered().await {
+        println!("🧊 [ICE] Source: Metered API ({} servers)", metered_servers.len());
         return metered_servers;
     }
-    default_ice_servers()
+    let defaults = default_ice_servers();
+    println!("⚠️ [ICE] Source: built-in defaults ({} servers — likely openrelay, often broken)", defaults.len());
+    defaults
 }
 
 async fn resolve_ice_servers_for_peer() -> Vec<RTCIceServer> {
@@ -328,8 +417,29 @@ fn env_flag_true(key: &str) -> bool {
     )
 }
 
+fn agent_ice_gather_timeout_secs() -> u64 {
+    std::env::var("LUMIERE_AGENT_ICE_GATHER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(3, 15))
+        .unwrap_or(8)
+}
+
 fn video_debug_enabled() -> bool {
     env_flag_true("LUMIERE_VIDEO_DEBUG")
+}
+
+fn stream_structured_log_enabled() -> bool {
+    env_flag_true("LUMIERE_STREAM_STRUCTURED_LOG")
+}
+
+fn stream_log_interval() -> Duration {
+    let interval_ms = env::var("LUMIERE_STREAM_LOG_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(250, 10_000))
+        .unwrap_or(1_000);
+    Duration::from_millis(interval_ms)
 }
 
 fn derive_stream_ssrc() -> u32 {
@@ -556,13 +666,25 @@ pub struct AgentWebRtc {
     video_track: Arc<TrackLocalStaticRTP>,
     rtcp_feedback: Arc<RtcpFeedbackState>,
     stream_profile_tx: watch::Sender<StreamQualityProfile>,
+    bitrate_override_tx: watch::Sender<Option<u32>>,
+    fps_tier_override_tx: watch::Sender<Option<FpsTier>>,
+    activity_state: Arc<StreamingActivityState>,
     pending_remote_ice: Mutex<Vec<RTCIceCandidateInit>>,
 }
 
 struct StreamStatsWindow {
     started_at: Instant,
+    flush_interval: Duration,
     sent_bytes: usize,
     sent_frames: usize,
+    capture_ms_sum: f64,
+    encode_ms_sum: f64,
+    samples: u64,
+    dropped_before_encode: u64,
+    dropped_before_send: u64,
+    rtcp_nack: u64,
+    rtcp_pli: u64,
+    rtcp_fir: u64,
 }
 
 #[derive(Clone)]
@@ -591,6 +713,32 @@ struct EncodedScreenFrame {
 struct AdaptiveVideoConfig {
     target_fps: u32,
     bitrate_bps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpsTier {
+    Idle,
+    Normal,
+    Active,
+}
+
+impl FpsTier {
+    pub fn from_payload(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "idle" | "eco" => Some(Self::Idle),
+            "normal" | "balanced" | "equilibre" => Some(Self::Normal),
+            "active" | "performance" | "reactive" => Some(Self::Active),
+            _ => None,
+        }
+    }
+
+    fn target_fps(self) -> u32 {
+        match self {
+            Self::Idle => 15,
+            Self::Normal => 30,
+            Self::Active => 60,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,6 +783,78 @@ struct AdaptiveRateController {
     min_bitrate_bps: u32,
     last_adjust_at: Instant,
     stress_ema: f64,
+}
+
+#[derive(Default)]
+struct StreamingActivityState {
+    last_input_unix_ms: AtomicU64,
+}
+
+impl StreamingActivityState {
+    fn mark_input_activity(&self) {
+        self.last_input_unix_ms
+            .store(unix_time_millis(), Ordering::Relaxed);
+    }
+
+    fn is_active_recent(&self, window_ms: u64) -> bool {
+        let last = self.last_input_unix_ms.load(Ordering::Relaxed);
+        last > 0 && unix_time_millis().saturating_sub(last) <= window_ms
+    }
+}
+
+struct CpuUsageSampler {
+    system: System,
+    last_sample_at: Instant,
+    last_cpu_usage: f64,
+}
+
+impl CpuUsageSampler {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_cpu_usage();
+        Self {
+            system,
+            last_sample_at: Instant::now(),
+            last_cpu_usage: 0.0,
+        }
+    }
+
+    fn sample(&mut self) -> f64 {
+        if self.last_sample_at.elapsed() >= Duration::from_secs(1) {
+            self.system.refresh_cpu_usage();
+            let cpus = self.system.cpus();
+            if !cpus.is_empty() {
+                let total: f32 = cpus.iter().map(|cpu| cpu.cpu_usage()).sum();
+                self.last_cpu_usage = (total / cpus.len() as f32) as f64;
+            }
+            self.last_sample_at = Instant::now();
+        }
+        self.last_cpu_usage
+    }
+}
+
+fn choose_auto_fps_tier(cpu_usage: f64, user_active: bool, network_constrained: bool) -> FpsTier {
+    if network_constrained || cpu_usage >= 85.0 {
+        return FpsTier::Idle;
+    }
+
+    if user_active && cpu_usage < 70.0 {
+        return FpsTier::Active;
+    }
+
+    FpsTier::Normal
+}
+
+fn apply_external_limits(
+    mut profile_limit: AdaptiveVideoConfig,
+    fps_tier: FpsTier,
+    bitrate_override: Option<u32>,
+) -> AdaptiveVideoConfig {
+    profile_limit.target_fps = profile_limit.target_fps.min(fps_tier.target_fps());
+    if let Some(override_bitrate) = bitrate_override {
+        profile_limit.bitrate_bps = profile_limit.bitrate_bps.min(override_bitrate.max(100_000));
+    }
+    profile_limit
 }
 
 #[derive(Clone, Copy, Default)]
@@ -963,8 +1183,17 @@ impl StreamStatsWindow {
     fn new() -> Self {
         Self {
             started_at: Instant::now(),
+            flush_interval: stream_log_interval(),
             sent_bytes: 0,
             sent_frames: 0,
+            capture_ms_sum: 0.0,
+            encode_ms_sum: 0.0,
+            samples: 0,
+            dropped_before_encode: 0,
+            dropped_before_send: 0,
+            rtcp_nack: 0,
+            rtcp_pli: 0,
+            rtcp_fir: 0,
         }
     }
 
@@ -980,9 +1209,31 @@ impl StreamStatsWindow {
         }
     }
 
+    fn record_pipeline_sample(
+        &mut self,
+        capture_ms: f64,
+        encode_ms: f64,
+        dropped_before_encode: u64,
+        dropped_before_send: u64,
+        rtcp_delta: RtcpDelta,
+    ) {
+        self.capture_ms_sum += capture_ms;
+        self.encode_ms_sum += encode_ms;
+        self.samples = self.samples.saturating_add(1);
+        self.dropped_before_encode = self
+            .dropped_before_encode
+            .saturating_add(dropped_before_encode);
+        self.dropped_before_send = self
+            .dropped_before_send
+            .saturating_add(dropped_before_send);
+        self.rtcp_nack = self.rtcp_nack.saturating_add(rtcp_delta.nack);
+        self.rtcp_pli = self.rtcp_pli.saturating_add(rtcp_delta.pli);
+        self.rtcp_fir = self.rtcp_fir.saturating_add(rtcp_delta.fir);
+    }
+
     async fn flush_if_due(&mut self, signaling: &Arc<SignalingClient>) {
         let elapsed = self.started_at.elapsed();
-        if elapsed < Duration::from_secs(1) {
+        if elapsed < self.flush_interval {
             return;
         }
 
@@ -990,6 +1241,16 @@ impl StreamStatsWindow {
         let mbps = (self.sent_bytes as f64 * 8.0) / (elapsed_sec * 1_000_000.0);
         let fps = self.sent_frames as f64 / elapsed_sec;
         let bytes_per_second = (self.sent_bytes as f64 / elapsed_sec).round() as i64;
+        let avg_capture_ms = if self.samples > 0 {
+            self.capture_ms_sum / self.samples as f64
+        } else {
+            0.0
+        };
+        let avg_encode_ms = if self.samples > 0 {
+            self.encode_ms_sum / self.samples as f64
+        } else {
+            0.0
+        };
 
         if let Err(err) = signaling
             .send_stream_stats(mbps, fps, bytes_per_second)
@@ -998,17 +1259,55 @@ impl StreamStatsWindow {
             eprintln!("Failed to send stream stats: {err}");
         }
 
+        if stream_structured_log_enabled() {
+            let event = serde_json::json!({
+                "event": "stream_stats",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "mbps": mbps,
+                "fps": fps,
+                "bytesPerSecond": bytes_per_second,
+                "captureMsAvg": avg_capture_ms,
+                "encodeMsAvg": avg_encode_ms,
+                "droppedBeforeEncode": self.dropped_before_encode,
+                "droppedBeforeSend": self.dropped_before_send,
+                "rtcpNack": self.rtcp_nack,
+                "rtcpPli": self.rtcp_pli,
+                "rtcpFir": self.rtcp_fir,
+                "logIntervalMs": self.flush_interval.as_millis(),
+            });
+            println!("{}", event);
+        }
+
         self.started_at = Instant::now();
         self.sent_bytes = 0;
         self.sent_frames = 0;
+        self.capture_ms_sum = 0.0;
+        self.encode_ms_sum = 0.0;
+        self.samples = 0;
+        self.dropped_before_encode = 0;
+        self.dropped_before_send = 0;
+        self.rtcp_nack = 0;
+        self.rtcp_pli = 0;
+        self.rtcp_fir = 0;
     }
 }
+
+// ─── File DataChannel upload state ────────────────────────────────────────────
+
+struct FileChannelUploadState {
+    transfer_id: String,
+    dest_path: String,
+    received_chunks: usize,
+}
+
+// ─── AgentWebRtc impl ─────────────────────────────────────────────────────────
 
 impl AgentWebRtc {
     pub async fn new(
         signaling: Arc<SignalingClient>,
         input_handler: Arc<InputHandler>,
         allow_remote_input: bool,
+        allow_file_transfer: bool,
     ) -> Result<Self, String> {
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -1024,8 +1323,22 @@ impl AgentWebRtc {
             .with_interceptor_registry(registry)
             .build();
 
+        let ice_servers = resolve_ice_servers_for_peer().await;
+        // Default = All (host + srflx + relay). Setting LUMIERE_FORCE_RELAY=1
+        // forces relay-only on the agent. webrtc-rs 0.11 has known issues with
+        // TURN allocation on some setups, so default is safe.
+        let policy = if std::env::var("LUMIERE_FORCE_RELAY")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+        {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::All
+        };
+        println!("🧊 [ICE] Agent ICE transport policy: {:?}", policy);
         let config = RTCConfiguration {
-            ice_servers: resolve_ice_servers_for_peer().await,
+            ice_servers,
+            ice_transport_policy: policy,
             ..Default::default()
         };
 
@@ -1063,8 +1376,11 @@ impl AgentWebRtc {
             })
         }));
 
+        let activity_state = Arc::new(StreamingActivityState::default());
+        let activity_for_channel = Arc::clone(&activity_state);
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_handler = Arc::clone(&input_handler);
+            let activity_for_channel = Arc::clone(&activity_for_channel);
             Box::pin(async move {
                 let label = channel.label().to_string();
                 println!("DataChannel recu: {label}");
@@ -1084,32 +1400,35 @@ impl AgentWebRtc {
                     })
                 }));
 
-                if label != "input" {
-                    return;
+                if label == "input" {
+                    let message_label = label.clone();
+                    channel.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let input_handler = Arc::clone(&input_handler);
+                        let message_label = message_label.clone();
+                        let activity_for_channel = Arc::clone(&activity_for_channel);
+                        Box::pin(async move {
+                            if !msg.is_string {
+                                return;
+                            }
+
+                            activity_for_channel.mark_input_activity();
+
+                            let Ok(message) = String::from_utf8(msg.data.to_vec()) else {
+                                eprintln!("Message DataChannel invalide sur {message_label}");
+                                return;
+                            };
+
+                            if !allow_remote_input {
+                                println!("Input distant ignore (lecture seule)");
+                                return;
+                            }
+
+                            input_handler.handle_input(&message);
+                        })
+                    }));
+                } else if label == "file" {
+                    setup_file_channel(channel, allow_file_transfer).await;
                 }
-
-                let message_label = label.clone();
-                channel.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let input_handler = Arc::clone(&input_handler);
-                    let message_label = message_label.clone();
-                    Box::pin(async move {
-                        if !msg.is_string {
-                            return;
-                        }
-
-                        let Ok(message) = String::from_utf8(msg.data.to_vec()) else {
-                            eprintln!("Message DataChannel invalide sur {message_label}");
-                            return;
-                        };
-
-                        if !allow_remote_input {
-                            println!("Input distant ignore (lecture seule)");
-                            return;
-                        }
-
-                        input_handler.handle_input(&message);
-                    })
-                }));
             })
         }));
 
@@ -1137,6 +1456,8 @@ impl AgentWebRtc {
 
         let rtcp_feedback = Arc::new(RtcpFeedbackState::default());
         let (stream_profile_tx, _) = watch::channel(StreamQualityProfile::Quality);
+    let (bitrate_override_tx, _) = watch::channel(None::<u32>);
+    let (fps_tier_override_tx, _) = watch::channel(None::<FpsTier>);
 
         println!("WebRTC video track created: screen/H264");
 
@@ -1173,6 +1494,9 @@ impl AgentWebRtc {
             video_track,
             rtcp_feedback,
             stream_profile_tx,
+            bitrate_override_tx,
+            fps_tier_override_tx,
+            activity_state,
             pending_remote_ice: Mutex::new(Vec::new()),
         })
     }
@@ -1181,10 +1505,34 @@ impl AgentWebRtc {
         let _ = self.stream_profile_tx.send(profile);
     }
 
+    pub fn adjust_bitrate(&self, bitrate: u32) {
+        let _ = self.bitrate_override_tx.send(Some(bitrate.max(800_000)));
+    }
+
+    pub fn clear_bitrate_override(&self) {
+        let _ = self.bitrate_override_tx.send(None);
+    }
+
+    pub fn set_fps_tier(&self, tier: FpsTier) {
+        let _ = self.fps_tier_override_tx.send(Some(tier));
+    }
+
+    pub fn clear_fps_tier_override(&self) {
+        let _ = self.fps_tier_override_tx.send(None);
+    }
+
     pub async fn close(&self) {
         if let Err(err) = self.peer.close().await {
             eprintln!("Failed to close WebRTC peer: {err}");
         }
+    }
+
+    /// True when the underlying peer connection is in `Connected` state.
+    /// Used by the session layer to ignore signaling-socket failures while
+    /// the actual WebRTC pipe is healthy (signaling is only required for
+    /// negotiation; once `Connected`, video/data flow peer-to-peer).
+    pub fn is_peer_connected(&self) -> bool {
+        self.peer.connection_state() == RTCPeerConnectionState::Connected
     }
 
     pub async fn handle_offer(&self, payload: &Value) -> Result<Value, String> {
@@ -1233,11 +1581,54 @@ impl AgentWebRtc {
             .await
             .map_err(|e| format!("set_local_description failed: {e}"))?;
 
+        // Half-trickle ICE is OPT-IN. By default we return the ANSWER
+        // immediately and rely on `on_ice_candidate` to trickle each
+        // candidate as a small ICE signaling message. Embedding all
+        // candidates (host+srflx+relay) in the SDP makes the ANSWER frame
+        // 8–30 KB which the Render free-tier WebSocket gateway rejects
+        // with close code 1003 ("message too big" → "unsupported data"),
+        // tearing the signaling socket down within seconds.
+        //
+        // Set LUMIERE_HALF_TRICKLE_ICE=1 to re-enable embedding (only safe
+        // on signaling servers that accept large text frames).
+        if env_flag_true("LUMIERE_HALF_TRICKLE_ICE") {
+            let gather_timeout_secs = agent_ice_gather_timeout_secs();
+            println!(
+                "⏳ [ICE] Half-trickle ON — waiting for ICE gathering (max {}s)...",
+                gather_timeout_secs
+            );
+            let mut gather_complete = self.peer.gathering_complete_promise().await;
+            let gather_timeout = tokio::time::timeout(
+                Duration::from_secs(gather_timeout_secs),
+                gather_complete.recv(),
+            )
+            .await;
+
+            match gather_timeout {
+                Ok(_) => println!("✅ [ICE] Local ICE gathering complete"),
+                Err(_) => println!("⚠️ [ICE] Gathering timeout — sending ANSWER with partial candidates"),
+            }
+        } else {
+            println!("📤 [ICE] Trickle mode — sending ANSWER immediately, candidates will trickle separately");
+        }
+
         let local = self
             .peer
             .local_description()
             .await
             .ok_or("local_description unavailable")?;
+
+        // Count candidates embedded for visibility.
+        let cand_lines: Vec<&str> = local.sdp.lines()
+            .filter(|l| l.starts_with("a=candidate"))
+            .collect();
+        let relay_count = cand_lines.iter().filter(|l| l.contains(" typ relay")).count();
+        let srflx_count = cand_lines.iter().filter(|l| l.contains(" typ srflx")).count();
+        let host_count = cand_lines.iter().filter(|l| l.contains(" typ host")).count();
+        println!(
+            "📤 [ICE] ANSWER embedding {} candidates (host={}, srflx={}, relay={})",
+            cand_lines.len(), host_count, srflx_count, relay_count
+        );
 
         Ok(serde_json::json!({
             "type": "answer",
@@ -1251,6 +1642,9 @@ impl AgentWebRtc {
         let track = Arc::clone(&self.video_track);
         let rtcp_feedback = Arc::clone(&self.rtcp_feedback);
         let stream_profile_rx = self.stream_profile_tx.subscribe();
+        let bitrate_override_rx = self.bitrate_override_tx.subscribe();
+        let fps_tier_override_rx = self.fps_tier_override_tx.subscribe();
+        let activity_state = Arc::clone(&self.activity_state);
 
         tokio::spawn(async move {
             let selection = VideoEncoderSelection::resolve();
@@ -1270,6 +1664,9 @@ impl AgentWebRtc {
                         selection.preset,
                         Arc::clone(&rtcp_feedback),
                         stream_profile_rx.clone(),
+                        bitrate_override_rx.clone(),
+                        fps_tier_override_rx.clone(),
+                        Arc::clone(&activity_state),
                     )
                     .await
                 }
@@ -1281,6 +1678,9 @@ impl AgentWebRtc {
                         selection.preset,
                         Arc::clone(&rtcp_feedback),
                         stream_profile_rx.clone(),
+                        bitrate_override_rx.clone(),
+                        fps_tier_override_rx.clone(),
+                        Arc::clone(&activity_state),
                     )
                     .await
                     {
@@ -1296,6 +1696,9 @@ impl AgentWebRtc {
                                 selection.preset,
                                 Arc::clone(&rtcp_feedback),
                                 stream_profile_rx.clone(),
+                                bitrate_override_rx.clone(),
+                                fps_tier_override_rx.clone(),
+                                Arc::clone(&activity_state),
                             )
                             .await
                         }
@@ -1324,6 +1727,9 @@ impl AgentWebRtc {
                                 selection.preset,
                                 Arc::clone(&rtcp_feedback),
                                 stream_profile_rx.clone(),
+                                bitrate_override_rx.clone(),
+                                fps_tier_override_rx.clone(),
+                                Arc::clone(&activity_state),
                             )
                             .await
                         }
@@ -1372,6 +1778,217 @@ impl AgentWebRtc {
     }
 }
 
+// ─── File DataChannel helpers ─────────────────────────────────────────────────
+
+/// Configure the "file" DataChannel received from the viewer.
+/// Handles JSON control messages and binary upload chunks.
+async fn setup_file_channel(channel: Arc<RTCDataChannel>, allow_file_transfer: bool) {
+    let upload_state: Arc<Mutex<Option<FileChannelUploadState>>> =
+        Arc::new(Mutex::new(None));
+    let channel_for_msg = Arc::clone(&channel);
+
+    channel.on_message(Box::new(move |msg: DataChannelMessage| {
+        let channel = Arc::clone(&channel_for_msg);
+        let upload_state = Arc::clone(&upload_state);
+        Box::pin(async move {
+            if msg.is_string {
+                let Ok(text) = String::from_utf8(msg.data.to_vec()) else { return; };
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { return; };
+
+                if !allow_file_transfer {
+                    let tid = json["transferId"].as_str().unwrap_or("").to_string();
+                    let _ = channel.send_text(serde_json::json!({
+                        "type": "FILE_ERROR",
+                        "transferId": tid,
+                        "message": "File transfer not permitted"
+                    }).to_string()).await;
+                    return;
+                }
+
+                match json["type"].as_str() {
+                    Some("FILE_LIST_REQUEST") => {
+                        let path = json["path"].as_str().unwrap_or("").to_string();
+                        println!("📂 [file-ch] Listing: {path}");
+                        let listing = FileTransferService::new().get_directory_listing(&path);
+                        let resp = serde_json::json!({
+                            "type": "FILE_LIST_RESPONSE",
+                            "path": listing.path,
+                            "files": listing.files,
+                            "error": listing.error,
+                        });
+                        let _ = channel.send_text(resp.to_string()).await;
+                    }
+                    Some("FILE_DOWNLOAD_REQUEST") => {
+                        let path = json["path"].as_str().unwrap_or("").to_string();
+                        let tid = json["transferId"].as_str().unwrap_or("").to_string();
+                        println!("📥 [file-ch] Download: {path}");
+                        tokio::spawn(handle_file_download(Arc::clone(&channel), path, tid));
+                    }
+                    Some("FILE_UPLOAD_START") => {
+                        let tid = json["transferId"].as_str().unwrap_or("").to_string();
+                        let file_name = json["fileName"].as_str().unwrap_or("upload").to_string();
+
+                        let safe_name = std::path::Path::new(&file_name)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "upload".to_string());
+
+                        let dest = FileTransferService::get_downloads_path()
+                            .join(&safe_name)
+                            .to_string_lossy()
+                            .to_string();
+
+                        // Remove stale file so we always start fresh
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        println!("📤 [file-ch] Upload start: {safe_name} → {dest}");
+
+                        *upload_state.lock().await = Some(FileChannelUploadState {
+                            transfer_id: tid,
+                            dest_path: dest,
+                            received_chunks: 0,
+                        });
+                    }
+                    Some("FILE_COMPLETE") => {
+                        let tid = json["transferId"].as_str().unwrap_or("").to_string();
+                        let mut state = upload_state.lock().await;
+                        let matches = state.as_ref()
+                            .map(|s| s.transfer_id == tid)
+                            .unwrap_or(false);
+                        if matches {
+                            let dest = state.as_ref()
+                                .map(|s| s.dest_path.clone())
+                                .unwrap_or_default();
+                            *state = None;
+                            drop(state);
+                            println!("✅ [file-ch] Upload complet: {dest}");
+                            let _ = channel.send_text(serde_json::json!({
+                                "type": "FILE_UPLOAD_ACK",
+                                "transferId": tid,
+                            }).to_string()).await;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Binary chunk → upload
+                if !allow_file_transfer {
+                    return;
+                }
+                let (dest, append) = {
+                    let mut state = upload_state.lock().await;
+                    if let Some(ref mut s) = *state {
+                        let dest = s.dest_path.clone();
+                        let append = s.received_chunks > 0;
+                        s.received_chunks += 1;
+                        (dest, append)
+                    } else {
+                        return;
+                    }
+                };
+                let data: Vec<u8> = msg.data.to_vec();
+                if let Err(e) =
+                    FileTransferService::new().save_file_bytes(&dest, &data, append).await
+                {
+                    eprintln!("❌ [file-ch] Upload write error: {e}");
+                }
+            }
+        })
+    }));
+}
+
+/// Send a file from the agent filesystem to the viewer over the DataChannel.
+/// Called in a spawned task — blocks until the transfer is done or the channel
+/// closes.
+async fn handle_file_download(
+    channel: Arc<RTCDataChannel>,
+    path: String,
+    transfer_id: String,
+) {
+    use tokio::io::AsyncReadExt;
+    const CHUNK_SIZE: usize = 64 * 1024;       // 64 KB per chunk
+    const MAX_BUFFERED: u64 = 4 * 1024 * 1024; // pause when > 4 MB buffered
+
+    // Stat first so we can send totalSize / totalChunks up-front.
+    let total_size = match tokio::fs::metadata(&path).await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            let _ = channel.send_text(serde_json::json!({
+                "type": "FILE_ERROR",
+                "transferId": transfer_id,
+                "message": format!("Cannot access file: {e}"),
+            }).to_string()).await;
+            return;
+        }
+    };
+
+    let total_chunks =
+        ((total_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64).max(1) as usize;
+
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+
+    // Send header
+    let _ = channel.send_text(serde_json::json!({
+        "type": "FILE_DOWNLOAD_RESPONSE",
+        "transferId": transfer_id,
+        "fileName": file_name,
+        "totalSize": total_size,
+        "totalChunks": total_chunks,
+    }).to_string()).await;
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = channel.send_text(serde_json::json!({
+                "type": "FILE_ERROR",
+                "transferId": transfer_id,
+                "message": format!("Cannot open file: {e}"),
+            }).to_string()).await;
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        // Backpressure: yield until the send buffer drains below threshold.
+        while (channel.buffered_amount().await as u64) > MAX_BUFFERED {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let n = match file.read(&mut buf).await {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) => {
+                let _ = channel.send_text(serde_json::json!({
+                    "type": "FILE_ERROR",
+                    "transferId": transfer_id,
+                    "message": format!("Read error: {e}"),
+                }).to_string()).await;
+                return;
+            }
+        };
+
+        if channel
+            .send(&bytes::Bytes::copy_from_slice(&buf[..n]))
+            .await
+            .is_err()
+        {
+            return; // channel closed mid-transfer
+        }
+    }
+
+    let _ = channel.send_text(serde_json::json!({
+        "type": "FILE_COMPLETE",
+        "transferId": transfer_id,
+    }).to_string()).await;
+
+    println!("✅ [file-ch] Download envoyé: {path}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 async fn run_openh264_screen_sender(
     signaling: &Arc<SignalingClient>,
     peer: &Arc<RTCPeerConnection>,
@@ -1379,6 +1996,9 @@ async fn run_openh264_screen_sender(
     preset: VideoEncoderPreset,
     rtcp_feedback: Arc<RtcpFeedbackState>,
     mut stream_profile_rx: watch::Receiver<StreamQualityProfile>,
+    mut bitrate_override_rx: watch::Receiver<Option<u32>>,
+    mut fps_tier_override_rx: watch::Receiver<Option<FpsTier>>,
+    activity_state: Arc<StreamingActivityState>,
 ) -> Result<(), String> {
     let initial_profile = *stream_profile_rx.borrow();
     let initial_config = profile_target_for_preset(initial_profile, preset);
@@ -1405,7 +2025,7 @@ async fn run_openh264_screen_sender(
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
 
-        let mut capturer = match DxgiDesktopDuplicator::new() {
+        let mut capturer = match create_default_capturer() {
             Ok(capturer) => capturer,
             Err(err) => {
                 eprintln!("DXGI capturer init failed: {err}");
@@ -1433,7 +2053,7 @@ async fn run_openh264_screen_sender(
             let capture_start = Instant::now();
             let mut reused_last_frame = false;
             let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
-                &mut capturer,
+                &mut *capturer,
                 scale_target,
             ) {
                 Ok(Some((w, h, frame))) => {
@@ -1519,7 +2139,8 @@ async fn run_openh264_screen_sender(
                 );
             }
 
-            let keyframe_interval = (active_config.target_fps.max(1) as u64).saturating_mul(5);
+            // Production low-latency target: force an IDR approximately every 2 seconds.
+            let keyframe_interval = (active_config.target_fps.max(1) as u64).saturating_mul(2);
             let force_keyframe = frame.frame_counter == 1
                 || (keyframe_interval > 0 && frame.frame_counter % keyframe_interval == 0)
                 || force_idr_hint_for_encode.swap(false, Ordering::Relaxed);
@@ -1579,9 +2200,34 @@ async fn run_openh264_screen_sender(
     let mut dropped_encoded_frames: u64 = 0;
     let mut controller = AdaptiveRateController::new(initial_config);
     let mut last_rtcp_snapshot = rtcp_feedback.snapshot();
+    let mut cpu_sampler = CpuUsageSampler::new();
+    let mut network_pressure_until = Instant::now();
+    let mut current_fps_tier = FpsTier::Normal;
     loop {
+        let cpu_usage = cpu_sampler.sample();
+        let user_active = activity_state.is_active_recent(1500);
+        let network_constrained = Instant::now() <= network_pressure_until;
+        let auto_fps_tier = choose_auto_fps_tier(cpu_usage, user_active, network_constrained);
+        let requested_fps_tier = fps_tier_override_rx
+            .borrow_and_update()
+            .as_ref()
+            .copied()
+            .unwrap_or(auto_fps_tier);
+        if requested_fps_tier != current_fps_tier {
+            println!(
+                "OpenH264 FPS tier -> {:?} (cpu={:.1}%, user_active={}, network_constrained={})",
+                requested_fps_tier,
+                cpu_usage,
+                user_active,
+                network_constrained
+            );
+            current_fps_tier = requested_fps_tier;
+        }
+
         let profile_limit = profile_target_for_preset(*stream_profile_rx.borrow_and_update(), preset);
-        if let Some(updated) = controller.apply_profile_limit(profile_limit) {
+        let bitrate_override = *bitrate_override_rx.borrow_and_update();
+        let effective_limit = apply_external_limits(profile_limit, current_fps_tier, bitrate_override);
+        if let Some(updated) = controller.apply_profile_limit(effective_limit) {
             let _ = adaptive_tx.send(updated);
             println!(
                 "OpenH264 profile target: {} FPS, {:.2} Mbps",
@@ -1781,6 +2427,21 @@ async fn run_openh264_screen_sender(
         }
 
         let rtcp_delta = collect_rtcp_delta(&rtcp_feedback, &mut last_rtcp_snapshot);
+        stats.record_pipeline_sample(
+            frame.capture_ms,
+            frame.encode_ms,
+            frame.dropped_before_encode,
+            dropped_before_send,
+            rtcp_delta,
+        );
+        if send_error
+            || dropped_before_send > 0
+            || rtcp_delta.nack >= 3
+            || rtcp_delta.pli > 0
+            || rtcp_delta.fir > 0
+        {
+            network_pressure_until = Instant::now() + Duration::from_secs(2);
+        }
         if let Some(next) = controller.on_feedback(AdaptiveFeedback {
             dropped_before_encode: frame.dropped_before_encode,
             dropped_before_send,
@@ -1820,6 +2481,9 @@ async fn run_media_foundation_screen_sender(
     preset: VideoEncoderPreset,
     rtcp_feedback: Arc<RtcpFeedbackState>,
     mut stream_profile_rx: watch::Receiver<StreamQualityProfile>,
+    mut bitrate_override_rx: watch::Receiver<Option<u32>>,
+    mut fps_tier_override_rx: watch::Receiver<Option<FpsTier>>,
+    activity_state: Arc<StreamingActivityState>,
 ) -> Result<(), String> {
     let initial_profile = *stream_profile_rx.borrow();
     let initial_config = profile_target_for_preset(initial_profile, preset);
@@ -1834,6 +2498,7 @@ async fn run_media_foundation_screen_sender(
     let stream_clock_start = Instant::now();
     let mut last_rtp_ts: u32 = 0;
     let mut stats = StreamStatsWindow::new();
+    let force_idr_hint = Arc::new(AtomicBool::new(false));
 
     let (capture_tx, mut capture_rx) = broadcast::channel::<CapturedScreenFrame>(2);
     let (encoded_tx, mut encoded_rx) = broadcast::channel::<EncodedScreenFrame>(2);
@@ -1845,7 +2510,7 @@ async fn run_media_foundation_screen_sender(
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
 
-        let mut capturer = match DxgiDesktopDuplicator::new() {
+        let mut capturer = match create_default_capturer() {
             Ok(capturer) => capturer,
             Err(err) => {
                 eprintln!("DXGI capturer init failed: {err}");
@@ -1874,7 +2539,7 @@ async fn run_media_foundation_screen_sender(
             let mut reused_last_frame = false;
 
             let (width, height, bgra_frame) = match capture_primary_screen_even_bgra(
-                &mut capturer,
+                &mut *capturer,
                 scale_target,
             ) {
                 Ok(Some((w, h, frame))) => {
@@ -1917,6 +2582,7 @@ async fn run_media_foundation_screen_sender(
     });
 
     let mut encode_cfg_rx = adaptive_rx.clone();
+    let force_idr_hint_for_encode = Arc::clone(&force_idr_hint);
     let encode_task = tokio::spawn(async move {
         let mut active_config = *encode_cfg_rx.borrow();
         let mut worker = match MediaFoundationEncoderWorker::new(
@@ -1987,9 +2653,12 @@ async fn run_media_foundation_screen_sender(
                 );
             }
 
-            // Some Intel Media Foundation stacks can stall after repeated drain/restart
-            // keyframe forcing. Keep forced keyframe only at stream startup.
-            let force_keyframe = frame.frame_counter == 1;
+            // Keep decoder recovery fast: IDR at startup, every ~2 seconds,
+            // and immediately when RTCP PLI/FIR asks for a refresh.
+            let keyframe_interval = (active_config.target_fps.max(1) as u64).saturating_mul(2);
+            let force_keyframe = frame.frame_counter == 1
+                || (keyframe_interval > 0 && frame.frame_counter % keyframe_interval == 0)
+                || force_idr_hint_for_encode.swap(false, Ordering::Relaxed);
 
             let width = frame.width;
             let height = frame.height;
@@ -2045,9 +2714,37 @@ async fn run_media_foundation_screen_sender(
     let mut dropped_encoded_frames: u64 = 0;
     let mut controller = AdaptiveRateController::new(initial_config);
     let mut last_rtcp_snapshot = rtcp_feedback.snapshot();
+    let mut cpu_sampler = CpuUsageSampler::new();
+    let mut network_pressure_until = Instant::now();
+    let mut current_fps_tier = FpsTier::Normal;
+    let mut no_output_since: Option<Instant> = None;
+    let first_frame_deadline = Instant::now() + Duration::from_secs(2);
+    let mut has_sent_video_frame = false;
     loop {
+        let cpu_usage = cpu_sampler.sample();
+        let user_active = activity_state.is_active_recent(1500);
+        let network_constrained = Instant::now() <= network_pressure_until;
+        let auto_fps_tier = choose_auto_fps_tier(cpu_usage, user_active, network_constrained);
+        let requested_fps_tier = fps_tier_override_rx
+            .borrow_and_update()
+            .as_ref()
+            .copied()
+            .unwrap_or(auto_fps_tier);
+        if requested_fps_tier != current_fps_tier {
+            println!(
+                "Media Foundation FPS tier -> {:?} (cpu={:.1}%, user_active={}, network_constrained={})",
+                requested_fps_tier,
+                cpu_usage,
+                user_active,
+                network_constrained
+            );
+            current_fps_tier = requested_fps_tier;
+        }
+
         let profile_limit = profile_target_for_preset(*stream_profile_rx.borrow_and_update(), preset);
-        if let Some(updated) = controller.apply_profile_limit(profile_limit) {
+        let bitrate_override = *bitrate_override_rx.borrow_and_update();
+        let effective_limit = apply_external_limits(profile_limit, current_fps_tier, bitrate_override);
+        if let Some(updated) = controller.apply_profile_limit(effective_limit) {
             let _ = adaptive_tx.send(updated);
             println!(
                 "Media Foundation profile target: {} FPS, {:.2} Mbps",
@@ -2061,8 +2758,25 @@ async fn run_media_foundation_screen_sender(
             _ => {}
         }
 
-        let Some(frame) = recv_latest_broadcast(&mut encoded_rx, &mut dropped_encoded_frames).await else {
-            break;
+        let frame = match tokio::time::timeout(
+            Duration::from_millis(500),
+            recv_latest_broadcast(&mut encoded_rx, &mut dropped_encoded_frames),
+        )
+        .await
+        {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                if !has_sent_video_frame && Instant::now() >= first_frame_deadline {
+                    capture_task.abort();
+                    encode_task.abort();
+                    return Err(
+                        "Media Foundation timed out waiting for first encoded frame; triggering software fallback"
+                            .to_string(),
+                    );
+                }
+                continue;
+            }
         };
 
         let dropped_before_send = std::mem::take(&mut dropped_encoded_frames);
@@ -2222,6 +2936,8 @@ async fn run_media_foundation_screen_sender(
         }
 
         if frame_sent {
+            has_sent_video_frame = true;
+            no_output_since = None;
             stats.record_frame(total_payload_bytes.max(1));
             if frame.frame_counter % preset.target_fps.max(1) as u64 == 0 {
                 println!(
@@ -2246,9 +2962,35 @@ async fn run_media_foundation_screen_sender(
                     dropped_before_send,
                 );
             }
+        } else {
+            let now = Instant::now();
+            let started = no_output_since.get_or_insert(now);
+            if now.duration_since(*started) >= Duration::from_secs(3) {
+                capture_task.abort();
+                encode_task.abort();
+                return Err(
+                    "Media Foundation produced no RTP output for >3s; triggering software fallback"
+                        .to_string(),
+                );
+            }
         }
 
         let rtcp_delta = collect_rtcp_delta(&rtcp_feedback, &mut last_rtcp_snapshot);
+        stats.record_pipeline_sample(
+            frame.capture_ms,
+            frame.encode_ms,
+            frame.dropped_before_encode,
+            dropped_before_send,
+            rtcp_delta,
+        );
+        if send_error
+            || dropped_before_send > 0
+            || rtcp_delta.nack >= 3
+            || rtcp_delta.pli > 0
+            || rtcp_delta.fir > 0
+        {
+            network_pressure_until = Instant::now() + Duration::from_secs(2);
+        }
         if let Some(next) = controller.on_feedback(AdaptiveFeedback {
             dropped_before_encode: frame.dropped_before_encode,
             dropped_before_send,
@@ -2264,6 +3006,11 @@ async fn run_media_foundation_screen_sender(
                 next.target_fps,
                 next.bitrate_bps as f64 / 1_000_000.0
             );
+        }
+
+        if rtcp_delta.pli > 0 || rtcp_delta.fir > 0 {
+            // Viewer requested a decoder refresh; force an IDR on next encode.
+            force_idr_hint.store(true, Ordering::Relaxed);
         }
 
         stats.flush_if_due(signaling).await;
@@ -2299,7 +3046,7 @@ async fn run_ffmpeg_rtp_screen_sender(
     let mut active_dimensions: Option<(usize, usize)> = None;
     let mut stats = StreamStatsWindow::new();
     let mut negotiated_payload_type: Option<u8> = None;
-    let mut capturer = DxgiDesktopDuplicator::new()?;
+    let mut capturer = create_default_capturer()?;
     let scale_target = resolve_scale_request();
     let mut last_capture: Option<(usize, usize, Arc<Vec<u8>>)> = None;
     let mut frame_counter: u64 = 0;
@@ -2328,7 +3075,7 @@ async fn run_ffmpeg_rtp_screen_sender(
         let capture_start = Instant::now();
         let mut reused_last_frame = false;
         let (width, height, bgra_frame) =
-            match capture_primary_screen_even_bgra(&mut capturer, scale_target)? {
+            match capture_primary_screen_even_bgra(&mut *capturer, scale_target)? {
                 Some((w, h, frame)) => {
                     let arc = Arc::new(frame);
                     last_capture = Some((w, h, Arc::clone(&arc)));
@@ -2447,103 +3194,4 @@ async fn stream_is_ready(peer: &Arc<RTCPeerConnection>, track: &Arc<TrackLocalSt
 
 fn frame_interval_for(preset: VideoEncoderPreset) -> Duration {
     Duration::from_secs_f64(1.0 / preset.target_fps.max(1) as f64)
-}
-
-fn capture_primary_screen_even_bgra(
-    capturer: &mut DxgiDesktopDuplicator,
-    scale_target: Option<(usize, usize)>,
-) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
-    let Some(frame) = capturer.capture_next_frame(16)? else {
-        return Ok(None);
-    };
-
-    let prepared = normalize_frame_for_stream(frame, scale_target)?;
-    Ok(Some(prepared))
-}
-
-fn normalize_frame_for_stream(
-    frame: DesktopFrame,
-    scale_target: Option<(usize, usize)>,
-) -> Result<(usize, usize, Vec<u8>), String> {
-    let frame = if let Some((requested_width, requested_height)) = scale_target {
-        let (target_width, target_height) = resolve_scaled_dimensions(
-            frame.width,
-            frame.height,
-            requested_width,
-            requested_height,
-        );
-        frame.resize_bgra_nearest(target_width, target_height)
-    } else if should_auto_downscale() && (frame.width > 1920 || frame.height > 1080) {
-        // Auto-downscale high-resolution captures (4K, ultrawide, etc.) to 1080p
-        // to guarantee good FPS on all hardware. Preserves aspect ratio.
-        let aspect = frame.width as f64 / frame.height.max(1) as f64;
-        let (tw, th) = if aspect >= 1.0 {
-            // Landscape: cap width at 1920
-            let w = 1920usize;
-            let h = ((w as f64 / aspect).round() as usize).max(2);
-            (w, h)
-        } else {
-            // Portrait: cap height at 1080
-            let h = 1080usize;
-            let w = ((h as f64 * aspect).round() as usize).max(2);
-            (w, h)
-        };
-        frame.resize_bgra_nearest(tw & !1, th & !1)
-    } else {
-        frame
-    };
-
-    let (width, height, bgra) = frame.into_even_bgra();
-    if width < 2 || height < 2 {
-        return Err("Captured frame is too small".to_string());
-    }
-
-    Ok((width, height, bgra))
-}
-
-fn should_auto_downscale() -> bool {
-    // Disable auto-downscale with LUMIERE_STREAM_NOSCALE=1
-    !env_flag_true("LUMIERE_STREAM_NOSCALE")
-}
-
-fn resolve_scale_request() -> Option<(usize, usize)> {
-    let requested_width = env::var("LUMIERE_STREAM_WIDTH")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 320);
-    let requested_height = env::var("LUMIERE_STREAM_HEIGHT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 180);
-
-    match (requested_width, requested_height) {
-        (Some(width), Some(height)) => Some((width & !1, height & !1)),
-        (Some(width), None) => Some((width & !1, 0)),
-        (None, Some(height)) => Some((0, height & !1)),
-        (None, None) => None,
-    }
-}
-
-fn resolve_scaled_dimensions(
-    source_width: usize,
-    source_height: usize,
-    requested_width: usize,
-    requested_height: usize,
-) -> (usize, usize) {
-    let aspect = source_width as f64 / source_height.max(1) as f64;
-
-    let (target_width, target_height) = match (requested_width, requested_height) {
-        (width, height) if width > 0 && height > 0 => (width, height),
-        (width, 0) if width > 0 => {
-            let height = ((width as f64 / aspect).round() as usize).max(2);
-            (width, height)
-        }
-        (0, height) if height > 0 => {
-            let width = ((height as f64 * aspect).round() as usize).max(2);
-            (width, height)
-        }
-        _ => (source_width, source_height),
-    };
-
-    ((target_width.max(2)) & !1, (target_height.max(2)) & !1)
 }

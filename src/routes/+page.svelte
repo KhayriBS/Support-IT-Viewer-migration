@@ -1,8 +1,9 @@
-<script lang="ts">
+﻿<script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, onMount } from "svelte";
   import { ChatRealtimeClient, SignalingClient, technicianApi } from "$lib/api";
   import type { Agent, ChatMessage, ControlSession, SignalMessage, TypingNotification } from "$lib/api";
+  import type { FileEntry, FileTransfer } from "$lib/api/types";
 
   interface AgentMetrics {
     cpuUsage: number;
@@ -45,6 +46,271 @@
   const signalingClient = new SignalingClient();
   const chatClient = new ChatRealtimeClient();
 
+  // â”€â”€ Diagnostic logger (always on â€” strip these once issue is fixed) â”€â”€â”€â”€â”€â”€â”€â”€
+  // Goal: see in DevTools console exactly which event/branch fires when the
+  // session dies. Prefix every log with [DIAG] for easy grep.
+  // Note: we deep-clone payload via JSON to break Svelte 5 $state proxies
+  // (which would otherwise trigger the `console_log_state` warning).
+  function diag(tag: string, payload?: unknown) {
+    if (payload === undefined) {
+      console.log(`[DIAG] ${tag}`);
+      return;
+    }
+    let safe: unknown = payload;
+    try {
+      safe = JSON.parse(JSON.stringify(payload));
+    } catch {
+      // payload contains non-serializable values (Map, RTCPeerConnection, â€¦) â€”
+      // log as-is, the proxy warning is harmless.
+    }
+    console.log(`[DIAG] ${tag}`, safe);
+  }
+
+  // Inbound video stats poller â€” confirms whether bytes/frames actually arrive.
+  // If bytesReceived stays at 0 â†’ media path is broken (codec/SRTP/FEC/etc.).
+  // If bytesReceived grows but framesDecoded == 0 â†’ decoder rejecting frames.
+  let inboundStatsTimer: ReturnType<typeof setInterval> | null = null;
+  function startInboundStatsLogger(pc: RTCPeerConnection) {
+    stopInboundStatsLogger();
+    let lastBytes = 0;
+    let lastFrames = 0;
+    inboundStatsTimer = setInterval(async () => {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach((s) => {
+          if (s.type === "inbound-rtp" && (s as RTCInboundRtpStreamStats).kind === "video") {
+            const r = s as RTCInboundRtpStreamStats & {
+              bytesReceived?: number;
+              framesReceived?: number;
+              framesDecoded?: number;
+              framesDropped?: number;
+              packetsLost?: number;
+              jitter?: number;
+            };
+            const bytes = r.bytesReceived ?? 0;
+            const frames = r.framesReceived ?? 0;
+            diag("inbound-rtp video", {
+              bytesReceived: bytes,
+              deltaBytes: bytes - lastBytes,
+              framesReceived: frames,
+              deltaFrames: frames - lastFrames,
+              framesDecoded: r.framesDecoded ?? 0,
+              framesDropped: r.framesDropped ?? 0,
+              packetsLost: r.packetsLost ?? 0,
+              jitter: r.jitter ?? 0
+            });
+            lastBytes = bytes;
+            lastFrames = frames;
+          }
+        });
+      } catch (err) {
+        diag("getStats failed", String(err));
+      }
+    }, 2000);
+  }
+  function stopInboundStatsLogger() {
+    if (inboundStatsTimer) {
+      clearInterval(inboundStatsTimer);
+      inboundStatsTimer = null;
+    }
+  }
+
+  // Watchdog: after the signaling socket dies mid-ICE, give the peer N seconds
+  // to reach `connected` on its own (most ICE candidates were already exchanged
+  // before the close). If not, declare failure and clean up.
+  let iceWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  const ICE_CONVERGENCE_WINDOW_MS = 15000; // bumped â€” ICE relay can take time
+  async function dumpIceCandidatePairs(pc: RTCPeerConnection) {
+    try {
+      const stats = await pc.getStats();
+      const candidates = new Map<string, RTCStats>();
+      const pairs: Array<{
+        state: string;
+        nominated: boolean;
+        local?: { type?: string; protocol?: string; address?: string };
+        remote?: { type?: string; protocol?: string; address?: string };
+        bytesSent?: number;
+        bytesReceived?: number;
+      }> = [];
+      stats.forEach((s) => {
+        if (s.type === "local-candidate" || s.type === "remote-candidate") {
+          candidates.set(s.id, s as RTCStats);
+        }
+      });
+      stats.forEach((s) => {
+        if (s.type === "candidate-pair") {
+          const p = s as RTCIceCandidatePairStats & { localCandidateId?: string; remoteCandidateId?: string };
+          const local = p.localCandidateId ? candidates.get(p.localCandidateId) : undefined;
+          const remote = p.remoteCandidateId ? candidates.get(p.remoteCandidateId) : undefined;
+          pairs.push({
+            state: p.state ?? "?",
+            nominated: !!p.nominated,
+            local: local && {
+              type: (local as { candidateType?: string }).candidateType,
+              protocol: (local as { protocol?: string }).protocol,
+              address: (local as { address?: string }).address
+            },
+            remote: remote && {
+              type: (remote as { candidateType?: string }).candidateType,
+              protocol: (remote as { protocol?: string }).protocol,
+              address: (remote as { address?: string }).address
+            },
+            bytesSent: (p as { bytesSent?: number }).bytesSent,
+            bytesReceived: (p as { bytesReceived?: number }).bytesReceived
+          });
+        }
+      });
+      diag("ICE candidate pairs", pairs);
+    } catch (err) {
+      diag("dumpIceCandidatePairs failed", String(err));
+    }
+  }
+
+  function startIceConvergenceWatchdog() {
+    stopIceConvergenceWatchdog();
+    iceWatchdogTimer = setTimeout(() => {
+      iceWatchdogTimer = null;
+      const pc = viewerPeerConnection;
+      const state = pc?.connectionState;
+      if (state === "connected") {
+        diag("ICE watchdog: peer is connected, all good");
+        signalingError = null;
+        return;
+      }
+      diag("ICE watchdog EXPIRED â€” peer never reached connected", { state });
+      // Last-resort dump: shows which candidate pairs ICE actually tried.
+      // Look for state="succeeded" or "failed", and presence of "relay" type.
+      if (pc) void dumpIceCandidatePairs(pc);
+      signalingError =
+        "Connexion vidÃ©o impossible aprÃ¨s perte du signaling. Recharge la session.";
+      resetViewerPeerConnection();
+      if (backendSessionSynced) {
+        void leaveBackendSession();
+      }
+    }, ICE_CONVERGENCE_WINDOW_MS);
+  }
+  function stopIceConvergenceWatchdog() {
+    if (iceWatchdogTimer) {
+      clearTimeout(iceWatchdogTimer);
+      iceWatchdogTimer = null;
+    }
+  }
+
+  // ICE recovery: when the media path drops after initial success, prefer
+  // ICE restart over hard peer reset.
+  let iceRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  let iceRestartInFlight = false;
+  const ICE_RESTART_ON_DISCONNECTED_DELAY_MS = 5000;
+  const ICE_RESTART_ON_FAILED_DELAY_MS = 1200;
+
+  function stopIceRestartTimer() {
+    if (iceRestartTimer) {
+      clearTimeout(iceRestartTimer);
+      iceRestartTimer = null;
+    }
+  }
+
+  function scheduleIceRestart(reason: string, delayMs: number) {
+    if (signalingManualDisconnect || signalingRemoteEnded) {
+      return;
+    }
+    if (!viewerPeerConnection || viewerPeerConnection.connectionState === "closed") {
+      return;
+    }
+    if (iceRestartInFlight || iceRestartTimer) {
+      return;
+    }
+
+    diag("ICE restart scheduled", {
+      reason,
+      delayMs,
+      signalingConnected,
+      peerState: viewerPeerConnection.connectionState,
+      iceState: viewerPeerConnection.iceConnectionState
+    });
+
+    iceRestartTimer = setTimeout(() => {
+      iceRestartTimer = null;
+      void attemptIceRestart(reason);
+    }, delayMs);
+  }
+
+  async function attemptIceRestart(reason: string) {
+    if (iceRestartInFlight) {
+      return;
+    }
+
+    const session = queriedSession ?? activeSession;
+    if (!session || session.status !== "ACTIVE") {
+      diag("ICE restart aborted â€” no active session", { reason });
+      return;
+    }
+
+    const pc = viewerPeerConnection;
+    if (!pc || pc.connectionState === "closed") {
+      diag("ICE restart aborted â€” peer unavailable", { reason });
+      return;
+    }
+
+    iceRestartInFlight = true;
+    try {
+      if (!signalingConnected) {
+        diag("ICE restart: signaling down, reconnect requested", { reason });
+        await connectSignaling({ force: true, reason: "ice_restart" });
+      }
+      if (!signalingConnected) {
+        diag("ICE restart aborted â€” signaling still unavailable");
+        scheduleIceRestart("signaling_unavailable", 2500);
+        return;
+      }
+
+      const livePc = viewerPeerConnection;
+      if (!livePc || livePc !== pc || livePc.signalingState === "closed") {
+        diag("ICE restart aborted â€” peer changed/closed", { reason });
+        return;
+      }
+
+      if (livePc.signalingState !== "stable") {
+        diag("ICE restart deferred â€” signalingState not stable", {
+          signalingState: livePc.signalingState
+        });
+        scheduleIceRestart("deferred_non_stable", 1200);
+        return;
+      }
+
+      diag("ICE restart starting", {
+        reason,
+        peerState: livePc.connectionState,
+        iceState: livePc.iceConnectionState
+      });
+
+      livePc.restartIce();
+      const offer = await livePc.createOffer({
+        iceRestart: true,
+        offerToReceiveVideo: true
+      });
+      await livePc.setLocalDescription(offer);
+      await waitForIceGathering(livePc, 3000);
+
+      const finalSdp = livePc.localDescription?.sdp ?? offer.sdp ?? "";
+      const finalType = livePc.localDescription?.type ?? offer.type;
+      const restartOffer = { type: finalType, sdp: finalSdp };
+
+      sendViewerOfferPayload(String(session.id), restartOffer);
+      startViewerOfferRetry(String(session.id), restartOffer);
+      screenFrameError = "Reconnexion reseau en cours (ICE restart)...";
+      diag("ICE restart offer sent", {
+        sessionId: session.id,
+        candidateCount: finalSdp.split("\n").filter((l) => l.startsWith("a=candidate")).length
+      });
+    } catch (error) {
+      diag("ICE restart failed", String(error));
+      scheduleIceRestart("retry_after_error", 2500);
+    } finally {
+      iceRestartInFlight = false;
+    }
+  }
+
   const uiDebugEnabled =
     import.meta.env.DEV &&
     String((import.meta as unknown as { env?: Record<string, unknown> }).env?.VITE_UI_DEBUG ?? "") === "1";
@@ -53,13 +319,23 @@
   let backendSessionSynced = $state(false);
   let backendSyncError = $state<string | null>(null);
   let signalLogs = $state<SignalLogEntry[]>([]);
-  let outgoingChat = $state("Hello from lumiere-tech-it");
   let detachMessageListener: (() => void) | null = null;
   let detachCloseListener: (() => void) | null = null;
   let detachErrorListener: (() => void) | null = null;
   let signalingManualDisconnect = false;
+  let signalingRemoteEnded = false;
   let signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let signalingReconnectAttempts = 0;
+  let viewerHadConnectedOnce = false;
+  // True while a connectSignaling() call is still opening its WebSocket.
+  // Prevents two parallel connects on the same token (HMR re-mount, double
+  // chooseFeature, etc.) which the server rejects with 1003.
+  let connectSignalingInFlight = false;
+  // Buffer for local ICE candidates generated AFTER the signaling socket dies.
+  // The flaky server closes the WS before all candidates (especially `relay`
+  // ones via TURN, which take time to allocate) are emitted by the browser.
+  // We keep them around so we can flush them if signaling ever comes back.
+  let bufferedLocalIceCandidates: SignalMessage[] = [];
   let viewerPeerConnection: RTCPeerConnection | null = null;
   let viewerControlChannel: RTCDataChannel | null = null;
   let viewerSignalProcessing: Promise<void> = Promise.resolve();
@@ -87,32 +363,46 @@
   let viewerFullscreenActive = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
+  // Metered "global.relay" static credentials (account: lumieretech).
+  // Hard fallback used when VITE_ICE_SERVERS is unset and the Tauri
+  // get_ice_servers_cmd returns nothing usable. Rotate if Metered invalidates.
   const defaultViewerIceServers: RTCIceServer[] = [
-    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.relay.metered.ca:80" },
     {
-      urls: [
-        "turn:openrelay.metered.ca:80",
-        "turn:openrelay.metered.ca:443",
-        "turns:openrelay.metered.ca:443"
-      ],
-      username: "openrelayproject",
-      credential: "openrelayproject"
+      urls: "turn:global.relay.metered.ca:80",
+      username: "d156f70e60e74c734ec39dc8",
+      credential: "Z9zO5Kp3c5P/c6e0"
+    },
+    {
+      urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: "d156f70e60e74c734ec39dc8",
+      credential: "Z9zO5Kp3c5P/c6e0"
+    },
+    {
+      urls: "turn:global.relay.metered.ca:443",
+      username: "d156f70e60e74c734ec39dc8",
+      credential: "Z9zO5Kp3c5P/c6e0"
+    },
+    {
+      urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: "d156f70e60e74c734ec39dc8",
+      credential: "Z9zO5Kp3c5P/c6e0"
     }
   ];
   let viewerIceServers = $state<RTCIceServer[]>(defaultViewerIceServers);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
   let viewerPlaybackProfile = $state<"responsive" | "quality">("responsive");
+  let viewerFpsTier = $state<"auto" | "idle" | "normal" | "active">("auto");
+  let viewerBitrateTier = $state<"auto" | "poor" | "medium" | "good">("auto");
+  let viewerPreset = $state<"custom" | "low-latency" | "balanced" | "quality">("balanced");
   let viewerProfileManualOverride = false;
   let viewerProfileAutoUpgradeTimer: ReturnType<typeof setTimeout> | null = null;
   const viewerAutoUpgradeDelayMs = 7000;
   const viewerAutoUpgradeMinMbps = 1.8;
   const viewerAutoUpgradeMinFps = 28;
   const streamProfileSignalEnabled =
-    String((import.meta.env.VITE_ENABLE_STREAM_PROFILE_SIGNAL ?? "")).trim().toLowerCase() === "true";
-  let screenFrameUrl = $state<string>("");
-  let screenFrameAt = $state<string>("");
-  let screenFrameCount = $state<number>(0);
+    String((import.meta.env.VITE_ENABLE_STREAM_PROFILE_SIGNAL ?? "true")).trim().toLowerCase() !== "false";
   let screenFrameError = $state<string | null>(null);
 
   interface RemoteInputEvent {
@@ -132,6 +422,19 @@
     };
   }
 
+  // â”€â”€ File transfer via WebRTC DataChannel "file" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  let fileChannel: RTCDataChannel | null = null;
+  let fileChannelOpen = $state(false);
+  let fileListLoading = $state(false);
+  let fileListError = $state<string | null>(null);
+  let fileCurrentPath = $state("");
+  let fileListing = $state<FileEntry[]>([]);
+  let fileTransfers = $state<Record<string, FileTransfer>>({});
+  /** transferId of the download currently receiving binary chunks */
+  let activeDownloadId: string | null = null;
+  const FILE_CHANNEL_UPLOAD_BACKPRESSURE = 16 * 1024 * 1024; // 16 MB
+  const FILE_CHUNK_SIZE = 64 * 1024;                          // 64 KB
+
   let metricsTimer: ReturnType<typeof setInterval>;
   let agentsTimer: ReturnType<typeof setInterval>;
   let chatPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -142,6 +445,7 @@
   let chatMessages = $state<ChatMessage[]>([]);
   let chatError = $state<string | null>(null);
   let typingInfo = $state<TypingNotification | null>(null);
+  let typingClearTimer: ReturnType<typeof setTimeout> | null = null;
   let detachChatMessageListener: (() => void) | null = null;
   let detachChatTypingListener: (() => void) | null = null;
   let detachChatConnectionListener: (() => void) | null = null;
@@ -376,7 +680,8 @@
     actionError = null;
     try {
       stopSessionActivationWatch();
-      await disconnectSignaling();
+      await disconnectSignaling({ sendLeave: true });
+      disconnectChat(); // tear down STOMP/poll when session ends
       await technicianApi.stopSessionByToken(token);
       activeSession = null;
       queriedSession = null;
@@ -427,14 +732,66 @@
     return String((queriedSession ?? activeSession)?.id ?? "").trim();
   }
 
-  async function refreshChatMessages() {
-    const roomId = chatRoomId || resolveRoomId();
-    if (!roomId) {
-      return;
+  // â”€â”€ Dedup helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  /** Stable identity key. Prefers server id; falls back to content fingerprint. */
+  function msgKey(msg: ChatMessage): string {
+    if (msg.id !== undefined && msg.id !== null) {
+      return `id:${msg.id}`;
     }
+    return `${msg.senderName}:${msg.timestamp}:${msg.content.slice(0, 64)}`;
+  }
+
+  /** Merge two message arrays without duplicates, keeping chronological order. */
+  function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+    if (incoming.length === 0) return existing;
+    const seen = new Set(existing.map(msgKey));
+    const merged = [...existing];
+    for (const msg of incoming) {
+      const k = msgKey(msg);
+      if (!seen.has(k)) {
+        merged.push(msg);
+        seen.add(k);
+      }
+    }
+    // Sort by timestamp (ISO strings sort lexicographically)
+    merged.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    return merged.slice(-200);
+  }
+
+  // â”€â”€ Poll timer helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  function startChatPoll() {
+    if (chatPollTimer) return; // already running
+    chatPollTimer = setInterval(() => {
+      void refreshChatMessages();
+    }, 5000);
+  }
+
+  function stopChatPoll() {
+    if (chatPollTimer) {
+      clearInterval(chatPollTimer);
+      chatPollTimer = null;
+    }
+  }
+
+  // â”€â”€ Core chat functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  async function refreshChatMessages(roomOverride?: string, replace = false) {
+    const roomId = roomOverride || chatRoomId || resolveRoomId();
+    if (!roomId) return;
 
     try {
-      chatMessages = await technicianApi.getMessages(roomId);
+      const fetched = await technicianApi.getMessages(roomId);
+
+      // Ignore stale responses when the user has switched to another session/room.
+      if (chatRoomId && chatRoomId !== roomId) {
+        return;
+      }
+
+      chatMessages = replace
+        ? mergeMessages([], fetched)
+        : mergeMessages(chatMessages, fetched);
       chatError = null;
     } catch (error) {
       chatError = String(error);
@@ -448,28 +805,45 @@
       return;
     }
 
+    // Guard: same room and already connected â€” nothing to do
+    if (chatRoomId === roomId && chatConnected) {
+      return;
+    }
+
     disconnectChat();
+    chatMessages = [];
+    typingInfo = null;
     chatRoomId = roomId;
     chatError = null;
 
+    // STOMP message handler with inline dedup
     detachChatMessageListener = chatClient.onMessage((msg) => {
-      chatMessages = [...chatMessages, msg].slice(-100);
+      const k = msgKey(msg);
+      if (chatMessages.some((m) => msgKey(m) === k)) return;
+      chatMessages = [...chatMessages, msg].slice(-200);
     });
 
+    // Typing indicator with auto-clear
     detachChatTypingListener = chatClient.onTyping((msg) => {
-      typingInfo = msg;
-      setTimeout(() => {
-        if (typingInfo === msg) {
-          typingInfo = null;
-        }
-      }, 1200);
+      typingInfo = msg.isTyping ? msg : null;
+      if (typingClearTimer) clearTimeout(typingClearTimer);
+      if (msg.isTyping) {
+        typingClearTimer = setTimeout(() => { typingInfo = null; }, 3000);
+      }
     });
 
+    // Connection state handler: drive poll timer based on STOMP availability
     detachChatConnectionListener = chatClient.onConnection((connected) => {
       chatConnected = connected;
+      if (connected) {
+        stopChatPoll(); // STOMP up â†’ no REST polling needed
+      } else if (chatRoomId) {
+        startChatPoll(); // STOMP dropped â†’ REST fallback kicks in
+      }
     });
 
-    await refreshChatMessages();
+    // Initial message load (room-scoped replace to avoid cross-session bleed)
+    await refreshChatMessages(roomId, true);
 
     try {
       await chatClient.connect(roomId);
@@ -477,29 +851,30 @@
       chatError = String(error);
     }
 
-    if (chatPollTimer) {
-      clearInterval(chatPollTimer);
-    }
-    // Fallback refresh even if STOMP drops.
-    chatPollTimer = setInterval(() => {
-      void refreshChatMessages();
-    }, 5000);
+    // Start poll as baseline fallback; stopped automatically when STOMP connects
+    startChatPoll();
   }
 
   function disconnectChat() {
+    // Clear room FIRST so the onConnection(false) handler does not restart the poll
+    chatRoomId = "";
     chatClient.disconnect();
     chatConnected = false;
-    if (chatPollTimer) {
-      clearInterval(chatPollTimer);
-      chatPollTimer = null;
-    }
+    stopChatPoll();
+    if (typingClearTimer) { clearTimeout(typingClearTimer); typingClearTimer = null; }
+    typingInfo = null;
     clearChatListeners();
   }
 
   async function sendChatMessage() {
     const roomId = chatRoomId || resolveRoomId();
     const content = chatInput.trim();
-    if (!roomId || !content) {
+    if (!roomId || !content) return;
+
+    // Guard: no active session
+    const session = queriedSession ?? activeSession;
+    if (!session || session.status !== "ACTIVE") {
+      chatError = "Aucune session active.";
       return;
     }
 
@@ -513,6 +888,7 @@
     );
 
     if (!sentViaStomp) {
+      // REST fallback: send then merge-refresh (server assigns timestamp/id)
       try {
         await technicianApi.sendMessageRest(roomId, "viewer", "viewer", "agent", "agent", content);
         await refreshChatMessages();
@@ -525,6 +901,253 @@
     chatInput = "";
     chatError = null;
   }
+
+  // â”€â”€ File DataChannel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  function configureFileDataChannel(channel: RTCDataChannel) {
+    // Ensure binary data arrives as ArrayBuffer (not Blob)
+    channel.binaryType = "arraybuffer";
+    fileChannel = channel;
+    fileChannelOpen = channel.readyState === "open";
+
+    channel.onopen = () => {
+      fileChannelOpen = true;
+    };
+    channel.onclose = () => {
+      if (fileChannel === channel) {
+        fileChannelOpen = false;
+        activeDownloadId = null;
+      }
+    };
+    channel.onerror = () => {
+      if (fileChannel === channel) {
+        fileChannelOpen = false;
+      }
+    };
+    channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+      if (typeof event.data === "string") {
+        try {
+          handleFileChannelJson(JSON.parse(event.data) as Record<string, unknown>);
+        } catch {
+          // ignore malformed JSON
+        }
+      } else if (event.data instanceof ArrayBuffer) {
+        handleFileChannelBinary(event.data);
+      }
+    };
+  }
+
+  function handleFileChannelJson(msg: Record<string, unknown>) {
+    const type = msg.type as string | undefined;
+    const tid = (msg.transferId as string | undefined) ?? "";
+
+    if (type === "FILE_LIST_RESPONSE") {
+      fileCurrentPath = (msg.path as string) ?? "";
+      fileListing = (msg.files as FileEntry[]) ?? [];
+      fileListError = (msg.error as string | null) ?? null;
+      fileListLoading = false;
+      return;
+    }
+
+    if (type === "FILE_DOWNLOAD_RESPONSE") {
+      activeDownloadId = tid;
+      fileTransfers = {
+        ...fileTransfers,
+        [tid]: {
+          transferId: tid,
+          type: "download",
+          fileName: (msg.fileName as string) ?? "file",
+          totalSize: (msg.totalSize as number) ?? 0,
+          totalChunks: (msg.totalChunks as number) ?? 1,
+          doneChunks: 0,
+          doneBytes: 0,
+          startedAt: Date.now(),
+          state: "active",
+          buffers: []
+        } satisfies FileTransfer
+      };
+      return;
+    }
+
+    if (type === "FILE_COMPLETE") {
+      const transfer = fileTransfers[tid];
+      if (transfer?.type === "download" && transfer.state === "active") {
+        // Trigger browser download
+        const blob = new Blob(transfer.buffers ?? []);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = transfer.fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...transfer, state: "complete", buffers: undefined }
+        };
+        if (activeDownloadId === tid) {
+          activeDownloadId = null;
+        }
+      } else if (transfer?.type === "upload") {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...transfer, state: "complete" }
+        };
+      }
+      return;
+    }
+
+    if (type === "FILE_UPLOAD_ACK") {
+      const transfer = fileTransfers[tid];
+      if (transfer) {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...transfer, state: "complete" }
+        };
+      }
+      return;
+    }
+
+    if (type === "FILE_ERROR") {
+      const transfer = fileTransfers[tid];
+      if (transfer) {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...transfer, state: "error", error: (msg.message as string) ?? "unknown error" }
+        };
+      } else {
+        console.error("[file-ch] remote error:", msg.message);
+      }
+      if (activeDownloadId === tid) {
+        activeDownloadId = null;
+      }
+    }
+  }
+
+  function handleFileChannelBinary(data: ArrayBuffer) {
+    const tid = activeDownloadId;
+    if (!tid) return;
+    const transfer = fileTransfers[tid];
+    if (!transfer || transfer.type !== "download" || transfer.state !== "active") return;
+
+    const updated: FileTransfer = {
+      ...transfer,
+      doneChunks: transfer.doneChunks + 1,
+      doneBytes: transfer.doneBytes + data.byteLength,
+      buffers: [...(transfer.buffers ?? []), data]
+    };
+    fileTransfers = { ...fileTransfers, [tid]: updated };
+  }
+
+  function requestFileList(path: string) {
+    if (!fileChannel || fileChannel.readyState !== "open") {
+      fileListError = "Canal fichier non disponible.";
+      return;
+    }
+    fileListLoading = true;
+    fileListError = null;
+    fileChannel.send(JSON.stringify({ type: "FILE_LIST_REQUEST", path }));
+  }
+
+  function downloadRemoteFile(filePath: string, fileName: string) {
+    if (!fileChannel || fileChannel.readyState !== "open") return;
+    const tid = crypto.randomUUID();
+    fileChannel.send(JSON.stringify({ type: "FILE_DOWNLOAD_REQUEST", transferId: tid, path: filePath }));
+    // Transfer state is created when FILE_DOWNLOAD_RESPONSE arrives
+    console.info("[file-ch] download requested:", fileName, tid);
+  }
+
+  async function uploadLocalFile(file: File) {
+    if (!fileChannel || fileChannel.readyState !== "open") return;
+
+    const tid = crypto.randomUUID();
+    const totalChunks = Math.max(1, Math.ceil(file.size / FILE_CHUNK_SIZE));
+
+    const transfer: FileTransfer = {
+      transferId: tid,
+      type: "upload",
+      fileName: file.name,
+      totalSize: file.size,
+      totalChunks,
+      doneChunks: 0,
+      doneBytes: 0,
+      startedAt: Date.now(),
+      state: "active"
+    };
+    fileTransfers = { ...fileTransfers, [tid]: transfer };
+
+    fileChannel.send(JSON.stringify({
+      type: "FILE_UPLOAD_START",
+      transferId: tid,
+      fileName: file.name,
+      totalSize: file.size,
+      totalChunks
+    }));
+
+    for (let i = 0; i < totalChunks; i++) {
+      if (!fileChannel || fileChannel.readyState !== "open") {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...fileTransfers[tid], state: "error", error: "Canal fermÃ© pendant l'envoi" }
+        };
+        return;
+      }
+      // Backpressure
+      while (fileChannel.bufferedAmount > FILE_CHANNEL_UPLOAD_BACKPRESSURE) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+
+      const start = i * FILE_CHUNK_SIZE;
+      const chunk = await file.slice(start, start + FILE_CHUNK_SIZE).arrayBuffer();
+      fileChannel.send(chunk);
+
+      const prev = fileTransfers[tid];
+      fileTransfers = {
+        ...fileTransfers,
+        [tid]: {
+          ...prev,
+          doneChunks: i + 1,
+          doneBytes: Math.min(prev.doneBytes + chunk.byteLength, file.size)
+        }
+      };
+    }
+
+    fileChannel.send(JSON.stringify({ type: "FILE_COMPLETE", transferId: tid }));
+  }
+
+  function resetFileChannel() {
+    try { fileChannel?.close(); } catch { /* ignore */ }
+    fileChannel = null;
+    fileChannelOpen = false;
+    fileListLoading = false;
+    fileListError = null;
+    fileListing = [];
+    fileTransfers = {};
+    activeDownloadId = null;
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  function transferProgress(t: FileTransfer): number {
+    if (t.totalSize === 0) return 100;
+    return Math.round((t.doneBytes / t.totalSize) * 100);
+  }
+
+  function transferSpeed(t: FileTransfer): string {
+    const elapsed = (Date.now() - t.startedAt) / 1000;
+    if (elapsed < 0.1) return "";
+    const bps = t.doneBytes / elapsed;
+    return `${formatFileSize(Math.round(bps))}/s`;
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   function statusClass(status: string | undefined) {
     switch ((status ?? "").toUpperCase()) {
@@ -695,7 +1318,7 @@
       const record = payload as Record<string, unknown>;
       const sdp = typeof record?.sdp === "string" ? record.sdp : "";
       const label = typeof record?.type === "string" ? record.type : type.toLowerCase();
-      return `SDP ${label} • ${sdp.length} chars`;
+      return `SDP ${label} â€¢ ${sdp.length} chars`;
     }
 
     if (type === "ICE") {
@@ -708,7 +1331,7 @@
       const record = payload as Record<string, unknown>;
       const mbps = Number(record?.mbps ?? 0);
       const fps = Number(record?.fps ?? 0);
-      return `${mbps.toFixed(2)} Mbps • ${fps.toFixed(1)} FPS`;
+      return `${mbps.toFixed(2)} Mbps â€¢ ${fps.toFixed(1)} FPS`;
     }
 
     if (type === "FILE_DATA") {
@@ -716,7 +1339,7 @@
       if (typeof record?.chunkIndex === "number") {
         return `File chunk ${record.chunkIndex}`;
       }
-      return "Screen frame";
+      return "File data";
     }
 
     const payloadText = JSON.stringify(payload);
@@ -773,6 +1396,13 @@
       signalingReconnectTimer = null;
       void connectSignaling();
     }, delayMs);
+  }
+
+  function isRetryableSignalingCloseCode(code: number) {
+    // Retry only for transient network/server conditions.
+    // 1006: abnormal closure (network loss)
+    // 1011/1012/1013: server/internal temporary conditions
+    return code === 1006 || code === 1011 || code === 1012 || code === 1013;
   }
 
   function stopViewerOfferRetry() {
@@ -916,12 +1546,23 @@
       return;
     }
 
+    const bitrateBpsByTier: Record<"poor" | "medium" | "good", number> = {
+      poor: 1_500_000,
+      medium: 4_000_000,
+      good: 8_000_000
+    };
+
+    const bitrateBps = viewerBitrateTier === "auto" ? undefined : bitrateBpsByTier[viewerBitrateTier];
+    const fpsTier = viewerFpsTier === "auto" ? undefined : viewerFpsTier;
+
     const profileMessage: SignalMessage = {
       type: "STREAM_PROFILE",
       to: "agent",
       sessionId: String(current.id),
       payload: {
-        profile
+        profile,
+        bitrateBps,
+        fpsTier
       }
     };
 
@@ -973,7 +1614,35 @@
   function toggleViewerPlaybackProfile() {
     stopViewerAutoUpgradeTimer();
     const nextProfile = viewerPlaybackProfile === "quality" ? "responsive" : "quality";
+    viewerPreset = "custom";
     sendViewerPlaybackProfile(nextProfile, { manualOverride: true });
+  }
+
+  function applyViewerStreamTuning() {
+    stopViewerAutoUpgradeTimer();
+    viewerPreset = "custom";
+    sendViewerPlaybackProfile(viewerPlaybackProfile, { manualOverride: true });
+  }
+
+  function applyViewerPreset(preset: "low-latency" | "balanced" | "quality") {
+    viewerPreset = preset;
+
+    if (preset === "low-latency") {
+      viewerPlaybackProfile = "responsive";
+      viewerFpsTier = "active";
+      viewerBitrateTier = "medium";
+    } else if (preset === "balanced") {
+      viewerPlaybackProfile = "responsive";
+      viewerFpsTier = "normal";
+      viewerBitrateTier = "medium";
+    } else {
+      viewerPlaybackProfile = "quality";
+      viewerFpsTier = "active";
+      viewerBitrateTier = "good";
+    }
+
+    stopViewerAutoUpgradeTimer();
+    sendViewerPlaybackProfile(viewerPlaybackProfile, { manualOverride: true });
   }
 
   function handleViewerVideoFocus() {
@@ -1168,9 +1837,17 @@
   }
 
   function resetViewerPeerConnection() {
+    diag("resetViewerPeerConnection CALLED");
+    console.trace("[DIAG] resetViewerPeerConnection stack");
+    bufferedLocalIceCandidates = [];
+    stopInboundStatsLogger();
+    stopIceConvergenceWatchdog();
+    stopIceRestartTimer();
+    iceRestartInFlight = false;
     stopViewerOfferRetry();
     stopViewerControlsAutoHide();
     viewerAnswerReceived = false;
+    viewerHadConnectedOnce = false;
     viewerSignalProcessing = Promise.resolve();
     pendingViewerIceCandidates = [];
     viewerOfferRetryCount = 0;
@@ -1185,6 +1862,9 @@
     viewerRemoteHeight = 1080;
     viewerStreamMbps = null;
     viewerStreamFps = null;
+    viewerFpsTier = "auto";
+    viewerBitrateTier = "auto";
+    viewerPreset = "balanced";
     stopViewerAutoUpgradeTimer();
     viewerProfileManualOverride = false;
     viewerPlaybackProfile = "responsive";
@@ -1196,6 +1876,8 @@
     } finally {
       viewerControlChannel = null;
     }
+
+    resetFileChannel();
 
     try {
       viewerPeerConnection?.close();
@@ -1220,9 +1902,6 @@
     }
     viewerRemoteStream = null;
 
-    screenFrameUrl = "";
-    screenFrameAt = "";
-    screenFrameCount = 0;
     screenFrameError = null;
   }
 
@@ -1235,11 +1914,25 @@
     }
 
     const handleLoadedMetadata = () => {
+      diag("video.loadedmetadata", { width: videoEl.videoWidth, height: videoEl.videoHeight });
       syncViewerVideoMetadata(videoEl);
     };
     videoEl.addEventListener("loadedmetadata", handleLoadedMetadata);
 
+    // Extra video lifecycle diagnostics
+    const onPlay = () => diag("video.onplay");
+    const onPause = () => diag("video.onpause");
+    const onWaiting = () => diag("video.onwaiting (no data)");
+    const onStalled = () => diag("video.onstalled");
+    const onError = () => diag("video.onerror", videoEl.error?.message);
+    videoEl.addEventListener("play", onPlay);
+    videoEl.addEventListener("pause", onPause);
+    videoEl.addEventListener("waiting", onWaiting);
+    videoEl.addEventListener("stalled", onStalled);
+    videoEl.addEventListener("error", onError);
+
     if (videoEl.srcObject !== (stream ?? null)) {
+      diag("video.srcObject assigned", { hasStream: !!stream, streamId: stream?.id });
       videoEl.srcObject = stream;
     }
 
@@ -1252,6 +1945,11 @@
 
     return () => {
       videoEl.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      videoEl.removeEventListener("play", onPlay);
+      videoEl.removeEventListener("pause", onPause);
+      videoEl.removeEventListener("waiting", onWaiting);
+      videoEl.removeEventListener("stalled", onStalled);
+      videoEl.removeEventListener("error", onError);
     };
   });
 
@@ -1260,49 +1958,106 @@
       return viewerPeerConnection;
     }
 
+    diag("creating new RTCPeerConnection with iceServers", viewerIceServers);
+    // Use "all" so the viewer publishes host + srflx + relay candidates.
+    // The relay candidates are critical (they survive NAT rebind) and are
+    // already embedded in the OFFER via half-trickle ICE.
     const pc = new RTCPeerConnection({
-      iceServers: viewerIceServers
+      iceServers: viewerIceServers,
+      iceTransportPolicy: "all"
     });
 
     // Needed to produce an SDP offer even before media integration is complete.
     const inputChannel = pc.createDataChannel("input", { ordered: true });
     configureViewerDataChannel(inputChannel);
+
+    const fileChannelInstance = pc.createDataChannel("file", { ordered: true });
+    configureFileDataChannel(fileChannelInstance);
+
     pc.addTransceiver("video", { direction: "recvonly" });
 
     viewerConnectionState = pc.connectionState;
 
     pc.ontrack = (event) => {
       const stream = event.streams?.[0] ?? new MediaStream([event.track]);
-      if (uiDebugEnabled) {
-        console.info("[viewer] remote track received", {
-          kind: event.track.kind,
-          id: event.track.id,
-          streamId: stream.id
-        });
-      }
+      diag("pc.ontrack FIRED", {
+        kind: event.track.kind,
+        id: event.track.id,
+        streamId: stream.id,
+        readyState: event.track.readyState,
+        muted: event.track.muted,
+        enabled: event.track.enabled
+      });
       viewerRemoteStream = stream;
       screenFrameError = null;
       applyViewerJitterBufferProfile(pc);
+
+      // Watch the track for "muted" or "ended" events that indicate the
+      // browser dropped the stream (codec mismatch, no keyframe, etc.)
+      event.track.onmute = () => diag("track.onmute (no media flowing)", { id: event.track.id });
+      event.track.onunmute = () => diag("track.onunmute (media resumed)", { id: event.track.id });
+      event.track.onended = () => diag("track.onended (track terminated)", { id: event.track.id });
     };
 
     pc.onconnectionstatechange = () => {
       viewerConnectionState = pc.connectionState;
+      diag("pc.connectionState =", pc.connectionState);
       if (pc.connectionState === "connected") {
+        viewerHadConnectedOnce = true;
         revealViewerControls();
         screenFrameError = null;
+        signalingError = null;
+        stopSignalingReconnect();
+        stopIceConvergenceWatchdog(); // ICE made it on its own â€” cancel watchdog
         applyViewerJitterBufferProfile(pc);
         maybeAutoUpgradeViewerProfile();
+        startInboundStatsLogger(pc);
+        stopIceRestartTimer();
       } else if (pc.connectionState === "failed") {
         screenFrameError = "La connexion WebRTC a echoue.";
+        stopInboundStatsLogger();
+        stopIceConvergenceWatchdog();
+        scheduleIceRestart("pc_connection_failed", ICE_RESTART_ON_FAILED_DELAY_MS);
+      } else if (pc.connectionState === "closed" || pc.connectionState === "disconnected") {
+        stopInboundStatsLogger();
+        stopIceConvergenceWatchdog();
+        if (pc.connectionState === "disconnected") {
+          scheduleIceRestart("pc_connection_disconnected", ICE_RESTART_ON_DISCONNECTED_DELAY_MS);
+        }
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      diag("pc.iceConnectionState =", pc.iceConnectionState);
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        stopIceRestartTimer();
+        return;
+      }
+      if (pc.iceConnectionState === "failed") {
+        scheduleIceRestart("ice_failed", ICE_RESTART_ON_FAILED_DELAY_MS);
+        return;
+      }
+      if (pc.iceConnectionState === "disconnected") {
+        scheduleIceRestart("ice_disconnected", ICE_RESTART_ON_DISCONNECTED_DELAY_MS);
+      }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      diag("pc.iceGatheringState =", pc.iceGatheringState);
+    };
+
+    pc.onsignalingstatechange = () => {
+      diag("pc.signalingState =", pc.signalingState);
+    };
+
     pc.ondatachannel = (event) => {
+      diag("pc.ondatachannel (remote-created)", { label: event.channel.label });
       configureViewerDataChannel(event.channel);
     };
 
     pc.onicecandidate = (event) => {
-      if (!event.candidate || !signalingConnected) {
+      if (!event.candidate) {
+        diag("ICE viewer: gathering complete (null candidate)");
         return;
       }
 
@@ -1317,11 +2072,31 @@
         }
       };
 
+      // If signaling is closed, buffer the candidate for later flush.
+      // CRITICAL: TURN `relay` candidates often arrive AFTER the flaky
+      // signaling server has closed with 1011. Without this buffer they are
+      // lost, ICE only has host/srflx pairs, and the connection dies in 5-8s.
+      if (!signalingConnected) {
+        bufferedLocalIceCandidates.push(iceMessage);
+        diag("ICE viewer: BUFFERED (signaling closed)", {
+          type: event.candidate.type,
+          candidate: event.candidate.candidate.slice(0, 80),
+          bufferSize: bufferedLocalIceCandidates.length
+        });
+        return;
+      }
+
+      diag("ICE viewer â†’ agent", {
+        type: event.candidate.type,
+        candidate: event.candidate.candidate.slice(0, 80)
+      });
+
       try {
         signalingClient.send(iceMessage, "viewer");
         logSignal("out", { ...iceMessage, from: "viewer" });
-      } catch {
-        // ignore transient send issues
+      } catch (err) {
+        diag("ICE send to agent FAILED â€” buffering", String(err));
+        bufferedLocalIceCandidates.push(iceMessage);
       }
     };
 
@@ -1382,18 +2157,96 @@
     }, 1000);
   }
 
+  /**
+   * Wait until the RTCPeerConnection has finished gathering ICE candidates,
+   * or until `timeoutMs` elapses (whichever comes first). Used to switch from
+   * trickle ICE to half-trickle: by the time we send the OFFER, all local
+   * candidates (including TURN `relay` ones) are embedded in the SDP, so we
+   * don't depend on the signaling socket staying alive long enough to trickle
+   * them individually.
+   */
+  function waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+    if (pc.iceGatheringState === "complete") {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        pc.removeEventListener("icegatheringstatechange", onChange);
+        diag("waitForIceGathering: TIMEOUT", { gatheringState: pc.iceGatheringState });
+        resolve();
+      }, timeoutMs);
+      const onChange = () => {
+        if (pc.iceGatheringState === "complete") {
+          clearTimeout(timer);
+          pc.removeEventListener("icegatheringstatechange", onChange);
+          diag("waitForIceGathering: COMPLETE");
+          resolve();
+        }
+      };
+      pc.addEventListener("icegatheringstatechange", onChange);
+    });
+  }
+
   async function sendViewerOffer(sessionId: string) {
     const pc = ensureViewerPeerConnection(sessionId);
     const offer = await pc.createOffer({ offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
+
+    // CRITICAL â€” half-trickle ICE: wait for all local candidates (including
+    // TURN relay) to be gathered before sending the OFFER. The flaky signaling
+    // server tends to close with 1011 mid-trickle, dropping our `relay`
+    // candidates. Embedding them directly in the OFFER SDP avoids that.
+    // Cap at 4s so we don't block forever if a STUN/TURN server hangs.
+    await waitForIceGathering(pc, 4000);
+
+    // Use the FINAL local description (now with all candidates embedded).
+    const finalSdp = pc.localDescription?.sdp ?? offer.sdp ?? "";
+    const finalType = pc.localDescription?.type ?? offer.type;
+    const finalOffer = { type: finalType, sdp: finalSdp };
+
+    // Log codec + candidate counts for visibility.
+    const offerH264 = finalSdp.split("\n").filter((l) => /H264|h264/i.test(l));
+    const candidateLines = finalSdp.split("\n").filter((l) => l.startsWith("a=candidate"));
+    const relayCount = candidateLines.filter((l) => / typ relay/.test(l)).length;
+    diag("OFFER created â€” H264 lines", offerH264);
+    diag("OFFER candidates embedded", {
+      total: candidateLines.length,
+      relay: relayCount,
+      gatheringState: pc.iceGatheringState
+    });
+    diag("OFFER recvonly transceivers", pc.getTransceivers().map((t) => ({
+      direction: t.direction,
+      currentDirection: t.currentDirection,
+      kind: t.receiver?.track?.kind
+    })));
     viewerAnswerReceived = false;
     screenFrameError = null;
 
-    sendViewerOfferPayload(sessionId, offer);
-    startViewerOfferRetry(sessionId, offer);
+    sendViewerOfferPayload(sessionId, finalOffer);
+    startViewerOfferRetry(sessionId, finalOffer);
   }
 
   async function handleIncomingSignal(message: SignalMessage) {
+    if (message.type === "LEAVE") {
+      signalingRemoteEnded = true;
+      signalingManualDisconnect = true;
+      stopSignalingReconnect();
+      stopViewerOfferRetry();
+      signalingError = "Session terminee par le poste distant.";
+      screenFrameError = "Le poste distant a ferme la session.";
+      signalingClient.disconnect();
+      clearSignalingListeners();
+      resetViewerPeerConnection();
+      disconnectChat(); // session ended remotely â€” tear down STOMP too
+      signalingConnected = false;
+      if (backendSessionSynced) {
+        await leaveBackendSession();
+      } else {
+        backendSyncError = null;
+      }
+      return;
+    }
+
     if (message.type === "ERROR") {
       const payload = message.payload as Record<string, unknown> | null;
       const reason =
@@ -1412,67 +2265,16 @@
       return;
     }
 
-    if (message.type === "FILE_DATA") {
-      const payload = message.payload as unknown;
-
-      const extractFrame = (): { mime: string; data: string; timestamp?: string } | null => {
-        if (typeof payload === "string") {
-          return payload.length > 100 ? { mime: "image/jpeg", data: payload } : null;
-        }
-
-        if (!payload || typeof payload !== "object") {
-          return null;
-        }
-
-        const record = payload as Record<string, unknown>;
-
-        // Ignore actual file-transfer chunks.
-        if (
-          typeof record.chunkIndex === "number" ||
-          typeof record.totalChunks === "number" ||
-          typeof record.fileName === "string"
-        ) {
-          return null;
-        }
-
-        const kind = typeof record.kind === "string" ? record.kind : "";
-        const data = record.data ?? record.base64 ?? record.image ?? record.frame;
-        const mime = (record.mime ?? record.contentType ?? "image/jpeg") as string;
-        const timestamp = typeof record.timestamp === "string" ? record.timestamp : undefined;
-
-        const isScreenFrame = kind === "screen-frame";
-        const isImageMime = typeof mime === "string" && mime.startsWith("image/");
-        const looksLikeFrame = "frame" in record || "image" in record;
-
-        if (!isScreenFrame && !isImageMime && !looksLikeFrame) {
-          return null;
-        }
-
-        if (typeof data === "string" && data.length > 100) {
-          return { mime, data, timestamp };
-        }
-
-        return null;
-      };
-
-      const frame = extractFrame();
-      if (frame) {
-        screenFrameUrl = `data:${frame.mime};base64,${frame.data}`;
-        screenFrameAt = frame.timestamp || new Date().toISOString();
-        screenFrameCount += 1;
-        screenFrameError = null;
-      }
-      return;
-    }
-
     if (message.type === "ANSWER") {
       const payload = message.payload as { type?: string; sdp?: string } | null;
       if (!payload?.sdp || !payload?.type) {
+        diag("ANSWER ignored â€” empty payload", payload);
         return;
       }
 
       const pc = viewerPeerConnection;
       if (!pc) {
+        diag("ANSWER ignored â€” no viewerPeerConnection");
         return;
       }
 
@@ -1480,23 +2282,36 @@
       stopViewerOfferRetry();
       screenFrameError = null;
 
-      await pc.setRemoteDescription({
-        type: payload.type as RTCSdpType,
-        sdp: payload.sdp
-      });
+      // Inspect codec lines so we can compare with what the agent negotiated.
+      const h264Lines = payload.sdp.split("\n").filter((l) => /H264|h264/i.test(l));
+      diag("ANSWER received â€” H264 lines in SDP", h264Lines);
+
+      try {
+        await pc.setRemoteDescription({
+          type: payload.type as RTCSdpType,
+          sdp: payload.sdp
+        });
+        diag("setRemoteDescription OK", { signalingState: pc.signalingState });
+        stopIceRestartTimer();
+        iceRestartInFlight = false;
+      } catch (err) {
+        diag("setRemoteDescription FAILED", String(err));
+        screenFrameError = `setRemoteDescription failed: ${String(err)}`;
+        return;
+      }
+
       sendViewerPlaybackProfile(viewerPlaybackProfile);
       maybeAutoUpgradeViewerProfile();
 
       if (pendingViewerIceCandidates.length > 0) {
         const queued = pendingViewerIceCandidates;
         pendingViewerIceCandidates = [];
+        diag("draining queued ICE candidates", { count: queued.length });
         for (const candidate of queued) {
           try {
             await pc.addIceCandidate(candidate);
           } catch (error) {
-            if (uiDebugEnabled) {
-              console.error("Failed to apply queued remote ICE candidate", error);
-            }
+            diag("queued addIceCandidate FAILED", String(error));
           }
         }
       }
@@ -1520,18 +2335,25 @@
         sdpMLineIndex: payload.sdpMLineIndex ?? null
       };
 
+      // Parse the candidate type so we can see if we're getting host / srflx /
+      // relay candidates from the agent. If only host/srflx (no relay), TURN
+      // is missing on the agent side and ICE will fail across NAT.
+      const candStr = candidateInit.candidate ?? "";
+      const typMatch = candStr.match(/typ (\w+)/);
+      const candType = typMatch ? typMatch[1] : "?";
+      diag("ICE from agent", { type: candType, candidate: candStr.slice(0, 80) });
+
       const pc = viewerPeerConnection;
       if (!pc.remoteDescription) {
         pendingViewerIceCandidates.push(candidateInit);
+        diag("ICE queued (no remoteDescription yet)", { queueLen: pendingViewerIceCandidates.length });
         return;
       }
 
       try {
         await pc.addIceCandidate(candidateInit);
       } catch (error) {
-        if (uiDebugEnabled) {
-          console.error("Failed to add remote ICE candidate", error);
-        }
+        diag("addIceCandidate FAILED", String(error));
       }
     }
   }
@@ -1591,16 +2413,51 @@
     revealViewerControls();
   }
 
-  async function connectSignaling() {
+  async function connectSignaling(options?: { force?: boolean; reason?: string }) {
+    const forceConnect = options?.force === true;
+    const forceReason = options?.reason ?? null;
+    diag("connectSignaling CALLED", {
+      alreadyConnected: signalingConnected,
+      inFlight: connectSignalingInFlight,
+      force: forceConnect,
+      reason: forceReason
+    });
+    console.trace("[DIAG] connectSignaling stack");
+
     if (signalingConnected) {
+      diag("connectSignaling SKIPPED â€” already connected");
       return;
     }
+    if (connectSignalingInFlight) {
+      // Race guard: another connect attempt is already opening a WebSocket.
+      // Without this, two parallel connects with the same token cause the
+      // server to reject one of them with 1003.
+      diag("connectSignaling SKIPPED â€” already in flight (race guard)");
+      return;
+    }
+    connectSignalingInFlight = true;
 
     const current = queriedSession ?? activeSession;
     if (!current) {
       signalingError = "Demarrez ou chargez une session avant la connexion signaling.";
+      connectSignalingInFlight = false;
       return;
     }
+
+    // Do not churn signaling sockets while media is already healthy.
+    // Reconnect is only needed on-demand (e.g. ICE restart when media drops).
+    const peerState = viewerPeerConnection?.connectionState;
+    if (!forceConnect && peerState === "connected") {
+      diag("connectSignaling SKIPPED â€” peer already connected (background reconnect disabled)");
+      connectSignalingInFlight = false;
+      return;
+    }
+
+    diag("connectSignaling using session", {
+      id: current.id,
+      status: current.status,
+      tokenSuffix: current.signalingToken?.slice(-8)
+    });
 
     signalingError = null;
     signalLogs = [];
@@ -1612,6 +2469,7 @@
     viewerPlaybackProfile = "responsive";
     revealViewerControls();
     signalingManualDisconnect = false;
+    signalingRemoteEnded = false;
 
     try {
       await signalingClient.connect(current.signalingToken, "viewer", String(current.id));
@@ -1640,24 +2498,69 @@
           });
       });
 
-      detachCloseListener = signalingClient.onClose(() => {
+      detachCloseListener = signalingClient.onClose((event) => {
+        const closeCode = event.code ?? 0;
+        const peerState = viewerPeerConnection?.connectionState;
+        const iceState = viewerPeerConnection?.iceConnectionState;
+        diag("signaling SOCKET CLOSED", {
+          code: closeCode,
+          reason: event.reason,
+          wasClean: event.wasClean,
+          manualDisconnect: signalingManualDisconnect,
+          remoteEnded: signalingRemoteEnded,
+          peerState,
+          iceState
+        });
         signalingConnected = false;
-        resetViewerPeerConnection();
 
-        if (signalingManualDisconnect) {
+        const isManualEnd = signalingManualDisconnect || signalingRemoteEnded;
+        const peerTerminal =
+          peerState === "failed" || peerState === "closed";
+        const peerAlreadyConnected = peerState === "connected";
+
+        // Signaling can flap while media is still alive. Keep the peer when
+        // possible and reconnect signaling in background so ICE restart remains
+        // available if connectivity degrades later.
+
+        if (isManualEnd || peerTerminal) {
+          diag("signaling close â†’ RESETTING peer", { isManualEnd, peerTerminal });
           stopSignalingReconnect();
+          resetViewerPeerConnection();
+          if (closeCode === 1003) {
+            signalingError = "Signal ferme (1003): session/token invalide ou expire. Recharge la session.";
+          } else if (closeCode === 1000) {
+            signalingError = "Signal ferme normalement (1000).";
+          } else {
+            signalingError = `Signal ferme (code ${closeCode}).`;
+          }
           if (backendSessionSynced) {
             void leaveBackendSession();
           }
           return;
+        }        if (peerAlreadyConnected) {
+          diag("signaling close â†’ peer CONNECTED, keep media and reconnect signaling in background");
+          signalingError = null;
+          // Keep media alive AND keep signaling reconnecting in the background:
+          // we still need it for ICE restart, future OFFERs, chat and stats.
+          // Reset the attempt counter so the backoff starts fresh each time
+          // the peer is healthy (otherwise it drifts to the 10s ceiling).
+          signalingReconnectAttempts = 0;
+          scheduleSignalingReconnect();
+          return;
         }
 
-        // Unexpected socket close: keep backend session alive and reconnect signaling.
-        signalingError = "Signal perdu, tentative de reconnexion...";
-        if (backendSessionSynced) {
-          backendSyncError = null;
-        }
+        // Peer still negotiating (`new` / `connecting` / `checking`). Give it
+        // a grace window to converge using the ICE candidates already on the
+        // wire. If ICE doesn't reach `connected` in time, declare failure.
+        diag("signaling close â†’ giving ICE a grace window to converge", {
+          peerState,
+          iceState
+        });        signalingError = "Signal perdu — tentative de reprise signaling et ICE...";
+        // Always keep retrying — previous logic stopped after the first
+        // signaling drop once the peer had ever been connected, leaving
+        // the viewer stranded with no way to reach the agent again.
         scheduleSignalingReconnect();
+        startIceConvergenceWatchdog();
       });
 
       detachErrorListener = signalingClient.onError(() => {
@@ -1665,6 +2568,22 @@
       });
 
       signalingConnected = true;
+
+      // Flush any ICE candidates that were generated while signaling was down
+      // (often the critical TURN `relay` candidates that arrive late).
+      if (bufferedLocalIceCandidates.length > 0) {
+        diag("flushing buffered ICE candidates", { count: bufferedLocalIceCandidates.length });
+        const toFlush = bufferedLocalIceCandidates;
+        bufferedLocalIceCandidates = [];
+        for (const ice of toFlush) {
+          try {
+            signalingClient.send(ice, "viewer");
+          } catch (err) {
+            diag("flush ICE FAILED â€” re-buffering", String(err));
+            bufferedLocalIceCandidates.push(ice);
+          }
+        }
+      }
 
       const joinMessage: SignalMessage = {
         type: "JOIN",
@@ -1676,11 +2595,38 @@
       };
       signalingClient.send(joinMessage, "viewer");
       logSignal("out", { ...joinMessage, from: "viewer" });
-      await sendViewerOffer(String(current.id));
+
+      // CRITICAL: only send a fresh OFFER if we don't already have a working
+      // peer. After a transient signaling close (1006/1011/1012/1013) the peer
+      // is still alive and re-OFFERing would consume the token a second time
+      // â†’ the server replies with 1003.
+      const existingPeerState = viewerPeerConnection?.connectionState;
+      const peerAlreadyAlive =
+        !!viewerPeerConnection &&
+        existingPeerState !== "closed" &&
+        existingPeerState !== "failed";
+
+      if (peerAlreadyAlive) {
+        diag("connectSignaling: peer already alive â€” skipping re-OFFER", {
+          peerState: existingPeerState
+        });
+      } else {
+        await sendViewerOffer(String(current.id));
+      }
     } catch (error) {
+      diag("connectSignaling THREW", String(error));
       signalingClient.disconnect();
-      resetViewerPeerConnection();
       signalingConnected = false;
+      const peerState = viewerPeerConnection?.connectionState;
+      const peerAlive =
+        peerState === "connected" ||
+        peerState === "connecting" ||
+        peerState === "disconnected";
+      if (!peerAlive || signalingManualDisconnect) {
+        resetViewerPeerConnection();
+      } else {
+        diag("connectSignaling failed but peer is still alive — keeping peer", { peerState });
+      }
       if (signalingManualDisconnect) {
         backendSessionSynced = false;
         backendSyncError = null;
@@ -1688,14 +2634,47 @@
       signalingError = String(error);
 
       if (!signalingManualDisconnect) {
+        // Always keep retrying so the signaling channel comes back even
+        // after the peer has been healthy at some point — needed for
+        // ICE restart / chat / stats if connectivity later degrades.
         scheduleSignalingReconnect();
       }
+    } finally {
+      // Always release the in-flight lock so the next legitimate connect attempt
+      // (e.g. scheduled reconnect) can proceed.
+      connectSignalingInFlight = false;
     }
   }
 
-  async function disconnectSignaling() {
+  async function disconnectSignaling(options?: { sendLeave?: boolean }) {
+    diag("disconnectSignaling CALLED", { sendLeave: options?.sendLeave === true });
+    // Stack trace so we see exactly which caller fired this â€” Svelte effect,
+    // onDestroy, button click, error handler, etc.
+    console.trace("[DIAG] disconnectSignaling stack");
+
     signalingManualDisconnect = true;
     stopSignalingReconnect();
+
+    const shouldSendLeave = options?.sendLeave === true;
+    const current = queriedSession ?? activeSession;
+    if (shouldSendLeave && signalingClient.isConnected() && current?.id) {
+      try {
+        const leaveMessage: SignalMessage = {
+          type: "LEAVE",
+          to: "agent",
+          sessionId: String(current.id),
+          payload: {
+            role: "viewer",
+            reason: "manual_disconnect"
+          }
+        };
+        diag("SENDING LEAVE", leaveMessage);
+        signalingClient.send(leaveMessage, "viewer");
+      } catch (err) {
+        diag("LEAVE send failed", String(err));
+      }
+    }
+
     signalingClient.disconnect();
     resetViewerPeerConnection();
     clearSignalingListeners();
@@ -1705,31 +2684,6 @@
       await leaveBackendSession();
     } else {
       backendSyncError = null;
-    }
-  }
-
-  function sendChatSignal() {
-    const text = outgoingChat.trim();
-    if (!text) {
-      return;
-    }
-
-    const msg: SignalMessage = {
-      type: "CHAT",
-      to: "agent",
-      payload: {
-        content: text,
-        senderName: "viewer",
-        timestamp: new Date().toISOString()
-      }
-    };
-
-    try {
-      signalingClient.send(msg, "viewer");
-      logSignal("out", { ...msg, from: "viewer" });
-      signalingError = null;
-    } catch (error) {
-      signalingError = String(error);
     }
   }
 
@@ -1829,7 +2783,27 @@
     approvalTimer = setInterval(checkPendingApproval, 3000);
   });
 
+  // Track real app shutdown (window close, page unload). Set ONLY when the
+  // browser/Tauri actually fires beforeunload / pagehide. Any other onDestroy
+  // (Svelte rerender, HMR, route swap) must NOT tear down the session.
+  let realUnloadInProgress = false;
+  if (typeof window !== "undefined") {
+    const markRealUnload = () => {
+      realUnloadInProgress = true;
+      diag("real unload event fired (window closing)");
+    };
+    window.addEventListener("beforeunload", markRealUnload);
+    window.addEventListener("pagehide", markRealUnload);
+  }
+
   onDestroy(() => {
+    diag("onDestroy fired", {
+      realUnload: realUnloadInProgress,
+      visibility: typeof document !== "undefined" ? document.visibilityState : "n/a",
+      hmrAvailable: typeof (import.meta as unknown as { hot?: unknown }).hot !== "undefined"
+    });
+
+    // Visual timers + DOM listeners can always be cleaned (no network impact).
     detachViewerInputListeners?.();
     detachViewerInputListeners = null;
     detachViewerFullscreenListener?.();
@@ -1837,6 +2811,18 @@
     clearInterval(metricsTimer);
     clearInterval(agentsTimer);
     if (approvalTimer) clearInterval(approvalTimer);
+    if (typingClearTimer) clearTimeout(typingClearTimer);
+
+    // CRITICAL: only tear down the network sessions if the user is REALLY
+    // leaving the app (window/tab close). Otherwise, a Svelte rerender,
+    // route change, HMR, or component unmount would kill the active video
+    // session â€” which is what was happening to you.
+    if (!realUnloadInProgress) {
+      diag("onDestroy SKIPPED network teardown â€” not a real unload");
+      return;
+    }
+
+    diag("onDestroy: real teardown (window closing)");
     stopSessionActivationWatch();
     void disconnectSignaling();
     disconnectChat();
@@ -2066,11 +3052,11 @@
         <button onclick={toggleViewerExpanded}>
           {viewerExpanded ? "Taille normale" : "Agrandir"}
         </button>
-        <button onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream && !screenFrameUrl}>
+        <button onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream}>
           {viewerFullscreenActive ? "Quitter plein ecran" : "Plein ecran"}
         </button>
-        <button onclick={connectSignaling} disabled={actionLoading || signalingConnected}>Reconnecter</button>
-        <button class="danger-ghost" onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>Deconnecter</button>
+        <button onclick={() => void connectSignaling()} disabled={actionLoading || signalingConnected}>Reconnecter</button>
+        <button class="danger-ghost" onclick={() => void disconnectSignaling({ sendLeave: true })} disabled={!signalingConnected}>Deconnecter</button>
       </div>
     </div>
 
@@ -2088,8 +3074,8 @@
           <span class="session-kv-label">Etat</span>
           <div class="viewer-status-stack">
             <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
-            <span class={`pill ${viewerRemoteStream || screenFrameUrl ? "ok" : "muted"}`}>
-              {viewerRemoteStream ? "flux live" : screenFrameUrl ? "apercu" : "en attente"}
+            <span class={`pill ${viewerRemoteStream ? "ok" : "muted"}`}>
+              {viewerRemoteStream ? "flux live" : "en attente"}
             </span>
           </div>
         </div>
@@ -2109,6 +3095,7 @@
           <span class="session-kv-label">Qualite</span>
           <div class="viewer-status-stack">
             <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
+            <span class="pill muted">preset: {viewerPreset}</span>
             {#if viewerStreamMbps !== null}
               <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
             {/if}
@@ -2120,7 +3107,7 @@
         <div class="viewer-summary-tile">
           <span class="session-kv-label">Affichage</span>
           <div class="viewer-status-stack">
-            {#if viewerRemoteStream || screenFrameUrl}
+            {#if viewerRemoteStream}
               <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
             {/if}
             <span class="pill muted">{viewerFullscreenActive ? "plein ecran" : viewerExpanded ? "agrandi" : "standard"}</span>
@@ -2157,21 +3144,54 @@
               <span class="telemetry-label">Mbps</span>
               <strong>{viewerStreamMbps !== null ? viewerStreamMbps.toFixed(2) : "--"}</strong>
             </span>
-            {#if viewerRemoteStream || screenFrameUrl}
+            {#if viewerRemoteStream}
               <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
             {/if}
           </div>
           <div class="viewer-toolbar-group viewer-toolbar-actions">
+            <select class="toolbar-btn" bind:value={viewerFpsTier} onchange={applyViewerStreamTuning}>
+              <option value="auto">FPS auto</option>
+              <option value="idle">FPS 15 (idle)</option>
+              <option value="normal">FPS 30 (normal)</option>
+              <option value="active">FPS 60 (active)</option>
+            </select>
+            <select class="toolbar-btn" bind:value={viewerBitrateTier} onchange={applyViewerStreamTuning}>
+              <option value="auto">Bitrate auto</option>
+              <option value="poor">1.5 Mbps</option>
+              <option value="medium">4 Mbps</option>
+              <option value="good">8 Mbps</option>
+            </select>
+            <button
+              class="toolbar-btn"
+              class:selected={viewerPreset === "low-latency"}
+              onclick={() => applyViewerPreset("low-latency")}
+            >
+              Low latency
+            </button>
+            <button
+              class="toolbar-btn"
+              class:selected={viewerPreset === "balanced"}
+              onclick={() => applyViewerPreset("balanced")}
+            >
+              Balanced
+            </button>
+            <button
+              class="toolbar-btn"
+              class:selected={viewerPreset === "quality"}
+              onclick={() => applyViewerPreset("quality")}
+            >
+              Quality
+            </button>
             <button class="toolbar-btn" onclick={toggleViewerPlaybackProfile}>
               {viewerPlaybackProfile === "quality" ? "Mode qualite" : "Mode reactif"}
             </button>
             <button class="toolbar-btn" onclick={toggleViewerExpanded}>
               {viewerExpanded ? "Normal" : "Agrandir"}
             </button>
-            <button class="toolbar-btn" onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream && !screenFrameUrl}>
+            <button class="toolbar-btn" onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream}>
               {viewerFullscreenActive ? "Quitter" : "Plein ecran"}
             </button>
-            <button class="toolbar-btn danger-ghost" onclick={() => void disconnectSignaling()} disabled={!signalingConnected}>
+            <button class="toolbar-btn danger-ghost" onclick={() => void disconnectSignaling({ sendLeave: true })} disabled={!signalingConnected}>
               Deconnecter
             </button>
           </div>
@@ -2194,19 +3214,13 @@
             onwheel={handleViewerWheel}
             oncontextmenu={(event) => event.preventDefault()}
           ></video>
-        {:else if screenFrameUrl}
-          <img class="screen-preview" src={screenFrameUrl} alt="Remote screen preview" />
         {:else}
           <div class="video-placeholder">
-            <p>Aucune image reçue pour le moment.</p>
-            <p class="hint">Lance la session puis attends les frames envoyees par l'agent.</p>
+            <p>Aucune image reÃ§ue pour le moment.</p>
+            <p class="hint">Lance la session puis attends la premiere frame WebRTC de l'agent.</p>
           </div>
         {/if}
       </div>
-
-      {#if !viewerRemoteStream && screenFrameUrl}
-        <p class="hint mono">Frame #{screenFrameCount} - {screenFrameAt}</p>
-      {/if}
 
       {#if screenFrameError}
         <p class="error top-gap">{screenFrameError}</p>
@@ -2239,57 +3253,240 @@
   {#if queriedSession?.status === "ACTIVE" && selectedFeature === "chat"}
   <section class="card">
     <div class="row between">
-      <h2>Chat live (STOMP)</h2>
+      <div>
+        <h2>Chat</h2>
+        <p class="hint top-gap">Messagerie temps rÃ©el de la session.</p>
+      </div>
       <div class="row">
-        <button onclick={connectChat} disabled={chatConnected}>Connect chat</button>
-        <button onclick={disconnectChat} disabled={!chatConnected}>Disconnect chat</button>
+        <span class={`pill ${chatConnected ? "ok" : "warn"}`}>
+          {chatConnected ? "connectÃ©" : "hors ligne"}
+        </span>
+        {#if !chatConnected}
+          <button onclick={() => void connectChat()}>Reconnecter</button>
+        {/if}
       </div>
     </div>
-
-    <div class="row top-gap">
-      <input bind:value={chatInput} placeholder="Message" oninput={() => chatClient.sendTyping(chatRoomId || resolveRoomId(), "viewer", "viewer", true)} />
-      <button onclick={sendChatMessage}>Send</button>
-    </div>
-
-    {#if typingInfo}
-      <p class="hint top-gap">{typingInfo.senderName} is typing...</p>
-    {/if}
 
     {#if chatError}
       <p class="error top-gap">{chatError}</p>
     {/if}
 
     {#if chatMessages.length === 0}
-      <p class="hint top-gap">Aucun message.</p>
+      <p class="hint top-gap">Aucun message pour l'instant.</p>
     {:else}
-      <div class="list top-gap">
-        {#each chatMessages as msg, i (`${msg.id ?? "x"}-${msg.timestamp}-${i}`)}
-          <div class="item">
-            <p><strong>{msg.senderName}</strong>: {msg.content}</p>
-            <p class="hint mono">{msg.timestamp}</p>
+      <div class="list top-gap chat-list">
+        {#each chatMessages as msg (msgKey(msg))}
+          <div class="item chat-item" class:chat-self={msg.senderName === "viewer"}>
+            <p class="chat-bubble"><strong>{msg.senderName}</strong>: {msg.content}</p>
+            <p class="hint mono chat-ts">{new Date(msg.timestamp).toLocaleTimeString()}</p>
           </div>
         {/each}
       </div>
     {/if}
+
+    {#if typingInfo}
+      <p class="hint top-gap chat-typing">{typingInfo.senderName} est en train d'Ã©crireâ€¦</p>
+    {/if}
+
+    <div class="row top-gap">
+      <input
+        bind:value={chatInput}
+        placeholder="Votre messageâ€¦"
+        class="chat-input"
+        onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
+        oninput={() => {
+          const roomId = chatRoomId || resolveRoomId();
+          if (roomId) chatClient.sendTyping(roomId, "viewer", "viewer", true);
+        }}
+      />
+      <button onclick={() => void sendChatMessage()} disabled={!chatInput.trim()}>Envoyer</button>
+    </div>
   </section>
   {/if}
 
   {#if queriedSession?.status === "ACTIVE" && selectedFeature === "files"}
     <section class="card">
-      <h2>Transfert de fichiers</h2>
-      <p class="hint top-gap">
-        Canal pret. La vue de navigation/transfert fichier sera branchee ici.
-      </p>
+      <div class="row between">
+        <div>
+          <h2>Transfert de fichiers</h2>
+          <p class="hint top-gap">Navigation et transfert P2P via DataChannel WebRTC.</p>
+        </div>
+        <span class={`pill ${fileChannelOpen ? "ok" : "warn"}`}>
+          {fileChannelOpen ? "canal pret" : "canal en attente"}
+        </span>
+      </div>
+
+      {#if queriedSession.allowFileTransfer === false}
+        <p class="error top-gap">Transfert de fichiers non autorise pour cette session.</p>
+      {:else}
+        <!-- Upload locale â†’ agent -->
+        <div class="top-gap">
+          <h3>Envoyer un fichier vers l'agent</h3>
+          <div class="row top-gap">
+            <input
+              type="file"
+              disabled={!fileChannelOpen}
+              onchange={async (e) => {
+                const input = e.currentTarget as HTMLInputElement;
+                const file = input.files?.[0];
+                if (file) {
+                  input.value = "";
+                  await uploadLocalFile(file);
+                }
+              }}
+              class="file-input"
+            />
+          </div>
+        </div>
+
+        <!-- Explorateur distant -->
+        <div class="top-gap">
+          <div class="row between">
+            <h3>Explorateur distant</h3>
+            <div class="row">
+              <button
+                disabled={!fileChannelOpen || fileListLoading}
+                onclick={() => requestFileList(fileCurrentPath)}
+              >
+                {fileListLoading ? "Chargement..." : "Actualiser"}
+              </button>
+              {#if fileCurrentPath}
+                <button
+                  disabled={!fileChannelOpen}
+                  onclick={() => {
+                    const parent = fileCurrentPath.replace(/[/\\][^/\\]*$/, "") || "";
+                    requestFileList(parent);
+                  }}
+                >
+                  Dossier parent
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          {#if !fileChannelOpen}
+            <p class="hint top-gap">En attente du canal fichier WebRTC...</p>
+          {:else if fileListing.length === 0 && !fileListLoading && !fileListError && !fileCurrentPath}
+            <div class="top-gap">
+              <button onclick={() => requestFileList("")}>
+                Parcourir les fichiers distants
+              </button>
+            </div>
+          {:else}
+            {#if fileListError}
+              <p class="error top-gap">{fileListError}</p>
+            {/if}
+
+            {#if fileCurrentPath}
+              <p class="hint top-gap mono">{fileCurrentPath}</p>
+            {/if}
+
+            <div class="list top-gap">
+              {#each fileListing as entry (entry.path)}
+                <div class="item file-item">
+                  <div class="file-meta">
+                    <span class="file-icon">{entry.isDirectory ? "ðŸ“" : "ðŸ“„"}</span>
+                    <span class="file-name">{entry.name}</span>
+                    {#if !entry.isDirectory && entry.size > 0}
+                      <span class="hint">{formatFileSize(entry.size)}</span>
+                    {/if}
+                  </div>
+                  <div class="row">
+                    {#if entry.isDirectory}
+                      <button
+                        class="btn-sm"
+                        onclick={() => requestFileList(entry.path)}
+                      >
+                        Ouvrir
+                      </button>
+                    {:else}
+                      <button
+                        class="btn-sm"
+                        disabled={!fileChannelOpen}
+                        onclick={() => downloadRemoteFile(entry.path, entry.name)}
+                      >
+                        TÃ©lÃ©charger
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <!-- Transferts en cours -->
+        {#if Object.keys(fileTransfers).length > 0}
+          <div class="top-gap">
+            <div class="row between">
+              <h3>Transferts</h3>
+              <button
+                class="btn-sm"
+                onclick={() => {
+                  const cleaned: Record<string, FileTransfer> = {};
+                  for (const [k, v] of Object.entries(fileTransfers)) {
+                    if (v.state === "active") cleaned[k] = v;
+                  }
+                  fileTransfers = cleaned;
+                }}
+              >
+                Effacer terminÃ©s
+              </button>
+            </div>
+            <div class="list top-gap">
+              {#each Object.values(fileTransfers).slice().reverse() as t (t.transferId)}
+                <div class="item transfer-item">
+                  <div class="transfer-meta">
+                    <span class="transfer-direction">
+                      {t.type === "upload" ? "â¬† Upload" : "â¬‡ Download"}
+                    </span>
+                    <span class="file-name">{t.fileName}</span>
+                    <span class={`pill ${t.state === "complete" ? "ok" : t.state === "error" ? "error" : "warn"}`}>
+                      {t.state === "active"
+                        ? `${transferProgress(t)}%`
+                        : t.state === "complete"
+                          ? "terminÃ©"
+                          : "erreur"}
+                    </span>
+                  </div>
+                  {#if t.state === "active"}
+                    <div class="progress-bar-wrap">
+                      <div
+                        class="progress-bar-fill"
+                        style="width: {transferProgress(t)}%"
+                      ></div>
+                    </div>
+                    <p class="hint">
+                      {formatFileSize(t.doneBytes)} / {formatFileSize(t.totalSize)}
+                      {#if transferSpeed(t)}Â· {transferSpeed(t)}{/if}
+                    </p>
+                  {:else if t.state === "error"}
+                    <p class="error">{t.error ?? "Erreur inconnue"}</p>
+                  {:else}
+                    <p class="hint">{formatFileSize(t.totalSize)} â€” terminÃ©</p>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      {/if}
     </section>
   {/if}
 
   <!-- Approval Modal -->
   {#if showApprovalModal && pendingApprovalSession}
-    <div class="approval-overlay" role="dialog" tabindex="-1" onkeydown={(e) => e.key === "Escape" && !approvalLoading && (showApprovalModal = false)} onclick={() => !approvalLoading && (showApprovalModal = false)}>
-      <div class="approval-modal" onclick={(e) => e.stopPropagation()}>
-        <h2>Demande d'accès distant</h2>
+    <div
+      class="approval-overlay"
+      role="dialog"
+      tabindex="-1"
+      onkeydown={(e) => e.key === "Escape" && !approvalLoading && (showApprovalModal = false)}
+      onmousedown={(e) => !approvalLoading && e.target === e.currentTarget && (showApprovalModal = false)}
+    >
+      <div class="approval-modal">
+        <h2>Demande d'accÃ¨s distant</h2>
         <p class="approval-desc">
-          <strong>{pendingApprovalSession.technicianUsername || "Technicien"}</strong> demande l'accès à ce PC.
+          <strong>{pendingApprovalSession.technicianUsername || "Technicien"}</strong> demande l'accÃ¨s Ã  ce PC.
         </p>
 
         {#if approvalError}
@@ -3033,4 +4230,154 @@
       justify-content: flex-start;
     }
   }
+
+  /* â”€â”€ File transfer UI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  h3 {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #cbd5e1;
+  }
+
+  .file-input {
+    flex: 1;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(148,163,184,0.25);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+
+  .file-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .file-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .file-icon {
+    font-size: 1rem;
+    flex-shrink: 0;
+  }
+
+  .file-name {
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 340px;
+  }
+
+  .btn-sm {
+    font-size: 0.78rem;
+    padding: 4px 10px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(148,163,184,0.25);
+    border-radius: 6px;
+    color: #e2e8f0;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .btn-sm:hover {
+    background: rgba(255,255,255,0.12);
+  }
+
+  .btn-sm:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .transfer-item {
+    display: block;
+    padding: 10px 14px;
+  }
+
+  .transfer-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+
+  .transfer-direction {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #7dd3fc;
+  }
+
+  .progress-bar-wrap {
+    width: 100%;
+    height: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+
+  .progress-bar-fill {
+    height: 100%;
+    background: #38bdf8;
+    border-radius: 4px;
+    transition: width 0.2s ease;
+  }
+
+  /* â”€â”€ Chat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  .chat-list {
+    max-height: 360px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .chat-item {
+    display: block;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+
+  .chat-item.chat-self {
+    background: rgba(56, 189, 248, 0.08);
+    align-self: flex-end;
+    max-width: 80%;
+  }
+
+  .chat-bubble {
+    margin: 0;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .chat-ts {
+    margin-top: 2px;
+    font-size: 0.72rem;
+  }
+
+  .chat-typing {
+    font-style: italic;
+    color: #94a3b8;
+  }
+
+  .chat-input {
+    flex: 1;
+  }
 </style>
+
+
+
+
+

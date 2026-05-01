@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod imp {
+    use std::env;
     use std::time::Instant;
 
     use windows::core::Interface;
@@ -117,15 +118,23 @@ mod imp {
         String::from_utf16_lossy(&input[..end])
     }
 
+    fn read_monitor_index() -> Option<usize> {
+        env::var("LUMIERE_CAPTURE_MONITOR_INDEX")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    }
+
     impl DxgiDesktopDuplicator {
         pub fn new() -> Result<Self, String> {
             unsafe {
                 let factory: IDXGIFactory1 =
                     CreateDXGIFactory1().map_err(|err| format!("CreateDXGIFactory1 failed: {err}"))?;
+                let requested_monitor_index = read_monitor_index();
                 let feature_levels: [D3D_FEATURE_LEVEL; 2] =
                     [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
 
                 let mut last_error = "No DXGI output scanned".to_string();
+                let mut attached_output_ordinal = 0usize;
 
                 for adapter_index in 0..16u32 {
                     let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
@@ -200,6 +209,13 @@ mod imp {
                             continue;
                         }
 
+                        if let Some(requested) = requested_monitor_index {
+                            if attached_output_ordinal != requested {
+                                attached_output_ordinal += 1;
+                                continue;
+                            }
+                        }
+
                         let output1: IDXGIOutput1 = match output.cast() {
                             Ok(output1) => output1,
                             Err(err) => {
@@ -219,7 +235,8 @@ mod imp {
                                     - output_desc.DesktopCoordinates.top)
                                     .max(0) as u32;
                                 println!(
-                                    "DXGI selected adapter #{adapter_index} ({adapter_name}) output #{output_index}: {}x{}",
+                                    "DXGI selected adapter #{adapter_index} ({adapter_name}) output #{output_index} (monitor ordinal {}): {}x{}",
+                                    attached_output_ordinal,
                                     width,
                                     height
                                 );
@@ -241,20 +258,40 @@ mod imp {
                                 println!("{last_error}");
                             }
                         }
+
+                        attached_output_ordinal += 1;
                     }
                 }
 
                 let screens = Screen::all()
                     .map_err(|err| format!("Aucun output DXGI valide. Fallback screenshots indisponible: {err}. Dernier diagnostic DXGI: {last_error}"))?;
-                let fallback_screen = screens
+                let fallback_screen = if let Some(requested) = requested_monitor_index {
+                    screens
+                        .get(requested)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "Monitor index {requested} invalide pour fallback screenshots ({} écrans). Dernier diagnostic DXGI: {last_error}",
+                                screens.len()
+                            )
+                        })?
+                } else {
+                    screens
+                        .iter()
+                        .copied()
+                        .find(|s| s.display_info.is_primary)
+                        .or_else(|| screens.first().copied())
+                        .ok_or_else(|| format!("Aucun écran disponible pour fallback screenshots. Dernier diagnostic DXGI: {last_error}"))?
+                };
+
+                let fallback_index = screens
                     .iter()
-                    .copied()
-                    .find(|s| s.display_info.is_primary)
-                    .or_else(|| screens.first().copied())
-                    .ok_or_else(|| format!("Aucun écran disponible pour fallback screenshots. Dernier diagnostic DXGI: {last_error}"))?;
+                    .position(|candidate| candidate.display_info.id == fallback_screen.display_info.id)
+                    .unwrap_or(0);
 
                 println!(
-                    "DXGI indisponible, fallback screenshots activé sur display {} ({}x{})",
+                    "DXGI indisponible, fallback screenshots activé sur display index {} id {} ({}x{})",
+                    fallback_index,
                     fallback_screen.display_info.id,
                     fallback_screen.display_info.width,
                     fallback_screen.display_info.height
@@ -320,69 +357,70 @@ mod imp {
                         return Err(format!("AcquireNextFrame failed: {err}"));
                     }
                 }
+                let capture_result = (|| -> Result<Option<DesktopFrame>, String> {
+                    let resource = desktop_resource
+                        .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
+                    let texture: ID3D11Texture2D = resource
+                        .cast()
+                        .map_err(|err| format!("IDXGIResource->ID3D11Texture2D cast failed: {err}"))?;
 
-                let resource = desktop_resource
-                    .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
-                let texture: ID3D11Texture2D = resource
-                    .cast()
-                    .map_err(|err| format!("IDXGIResource->ID3D11Texture2D cast failed: {err}"))?;
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    texture.GetDesc(&mut desc);
+                    self.ensure_staging_texture(&desc)?;
 
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                texture.GetDesc(&mut desc);
-                self.ensure_staging_texture(&desc)?;
+                    let staging = self
+                        .staging_texture
+                        .as_ref()
+                        .ok_or_else(|| "Staging texture unavailable".to_string())?;
 
-                let staging = self
-                    .staging_texture
-                    .as_ref()
-                    .ok_or_else(|| "Staging texture unavailable".to_string())?;
+                    let source_resource: ID3D11Resource = texture
+                        .cast()
+                        .map_err(|err| format!("Texture->Resource cast failed: {err}"))?;
+                    let staging_resource: ID3D11Resource = staging
+                        .cast()
+                        .map_err(|err| format!("Staging->Resource cast failed: {err}"))?;
 
-                let source_resource: ID3D11Resource = texture
-                    .cast()
-                    .map_err(|err| format!("Texture->Resource cast failed: {err}"))?;
-                let staging_resource: ID3D11Resource = staging
-                    .cast()
-                    .map_err(|err| format!("Staging->Resource cast failed: {err}"))?;
+                    let context = self
+                        .context
+                        .as_ref()
+                        .ok_or_else(|| "D3D11 context unavailable".to_string())?;
+                    context.CopyResource(&staging_resource, &source_resource);
 
-                let context = self
-                    .context
-                    .as_ref()
-                    .ok_or_else(|| "D3D11 context unavailable".to_string())?;
-                context.CopyResource(&staging_resource, &source_resource);
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    context
+                        .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                        .map_err(|err| format!("Map staging texture failed: {err}"))?;
 
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                context
-                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                    .map_err(|err| format!("Map staging texture failed: {err}"))?;
+                    let width = desc.Width as usize;
+                    let height = desc.Height as usize;
+                    let row_pitch = mapped.RowPitch as usize;
+                    let byte_len = row_pitch.saturating_mul(height);
+                    let src = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), byte_len);
+                    let row_bytes = width * 4;
+                    let total_bytes = row_bytes * height;
+                    let bgra = if row_pitch == row_bytes {
+                        src[..total_bytes].to_vec()
+                    } else {
+                        let mut buf = Vec::with_capacity(total_bytes);
+                        for y in 0..height {
+                            buf.extend_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
+                        }
+                        buf
+                    };
 
-                let width = desc.Width as usize;
-                let height = desc.Height as usize;
-                let row_pitch = mapped.RowPitch as usize;
-                let byte_len = row_pitch.saturating_mul(height);
-                let src = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), byte_len);
-                let row_bytes = width * 4;
-                let total_bytes = row_bytes * height;
-                let bgra = if row_pitch == row_bytes {
-                    // Fast path: stride matches width, single contiguous copy
-                    src[..total_bytes].to_vec()
-                } else {
-                    // Stride path: row-by-row copy (GPU padding differs)
-                    let mut buf = Vec::with_capacity(total_bytes);
-                    for y in 0..height {
-                        buf.extend_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
-                    }
-                    buf
-                };
+                    context.Unmap(staging, 0);
 
-                context.Unmap(staging, 0);
+                    Ok(Some(DesktopFrame {
+                        width,
+                        height,
+                        stride: width * 4,
+                        captured_at: Instant::now(),
+                        bgra,
+                    }))
+                })();
+
                 let _ = duplication.ReleaseFrame();
-
-                Ok(Some(DesktopFrame {
-                    width,
-                    height,
-                    stride: width * 4,
-                    captured_at: Instant::now(),
-                    bgra,
-                }))
+                capture_result
             }
         }
 

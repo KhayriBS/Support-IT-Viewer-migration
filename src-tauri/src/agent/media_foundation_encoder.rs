@@ -274,19 +274,42 @@ mod imp {
                     self.frame_index * self.frame_duration_hns,
                     self.frame_duration_hns,
                 )?;
+                let mut retry_after_drain = true;
 
-                match self.transform.ProcessInput(0, &sample, 0) {
-                    Ok(()) => {
-                        self.frame_index += 1;
-                        drain_outputs_until_need_more_input(
-                            &self.transform,
-                            self.output_stream_id,
-                            self.output_sample_provided_by_mft,
-                            self.output_buffer_size,
-                        )
+                loop {
+                    match self.transform.ProcessInput(0, &sample, 0) {
+                        Ok(()) => {
+                            self.frame_index += 1;
+                            return drain_outputs_until_need_more_input(
+                                &self.transform,
+                                self.output_stream_id,
+                                self.output_sample_provided_by_mft,
+                                self.output_buffer_size,
+                            );
+                        }
+                        Err(err) if err.code() == MF_E_NOTACCEPTING => {
+                            // Encoder output queue is full; drain it first, then retry
+                            // the same input sample once.
+                            let drained = drain_outputs_until_need_more_input(
+                                &self.transform,
+                                self.output_stream_id,
+                                self.output_sample_provided_by_mft,
+                                self.output_buffer_size,
+                            )?;
+
+                            if !drained.is_empty() {
+                                return Ok(drained);
+                            }
+
+                            if retry_after_drain {
+                                retry_after_drain = false;
+                                continue;
+                            }
+
+                            return Ok(vec![]);
+                        }
+                        Err(err) => return Err(format!("ProcessInput failed: {err}")),
                     }
-                    Err(err) if err.code() == MF_E_NOTACCEPTING => Ok(vec![]),
-                    Err(err) => Err(format!("ProcessInput failed: {err}")),
                 }
             }
         }

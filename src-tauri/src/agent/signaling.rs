@@ -198,8 +198,10 @@ impl SignalingClient {
 
                             let payload = serde_json::json!({
                                 "kind": "socket-close",
-                                "code": serde_json::Value::Null,
-                                "reason": "",
+                                // Abnormal closure / no close frame details:
+                                // treat as transient network close for retry policy.
+                                "code": 1006,
+                                "reason": "abnormal closure",
                             });
                             let _ = event_tx_clone.send(SignalMessage {
                                 signal_type: SignalType::Error,
@@ -275,12 +277,6 @@ impl SignalingClient {
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
         self.send(SignalMessage::new(SignalType::StreamStats, "viewer", Some(payload))).await
-    }
-
-    pub async fn send_screen_frame(&self, payload: Value) -> Result<(), String> {
-        // Use FILE_DATA to ensure frames are routed to the viewer
-        // even if the backend treats STREAM_STATS as a special-case payload.
-        self.send(SignalMessage::new(SignalType::FileData, "viewer", Some(payload))).await
     }
 
     pub async fn send_file_list(&self, payload: Value) -> Result<(), String> {

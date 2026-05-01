@@ -226,6 +226,40 @@ impl FileTransferService {
         Ok(())
     }
 
+    // ── SaveFileBytes ─────────────────────────────────────────────────────────
+    /// Write raw bytes to a file (no base64 decoding).  Used by the WebRTC
+    /// DataChannel upload path which sends binary directly.
+    pub async fn save_file_bytes(
+        &self,
+        destination_path: &str,
+        data: &[u8],
+        append: bool,
+    ) -> Result<(), String> {
+        let path = Path::new(destination_path);
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        use tokio::io::AsyncWriteExt;
+        if append {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .map_err(|e| e.to_string())?;
+            file.write_all(data).await.map_err(|e| e.to_string())?;
+        } else {
+            tokio::fs::write(path, data)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
     // ── GetDownloadsPath ──────────────────────────────────────────────────────
     /// Equivalent of `GetDownloadsPath()` in `SessionManager.cs`.
     pub fn get_downloads_path() -> PathBuf {

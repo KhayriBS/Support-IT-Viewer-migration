@@ -79,6 +79,41 @@ export interface TypingNotification {
   isTyping: boolean;
 }
 
+// ─── File transfer types ──────────────────────────────────────────────────────
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+  lastModified: number;
+}
+
+export interface RemoteFileList {
+  path: string;
+  files: FileEntry[];
+  error?: string | null;
+}
+
+export type FileTransferState = "active" | "complete" | "error";
+
+export interface FileTransfer {
+  transferId: string;
+  type: "upload" | "download";
+  fileName: string;
+  totalSize: number;
+  totalChunks: number;
+  doneChunks: number;
+  doneBytes: number;
+  startedAt: number;
+  state: FileTransferState;
+  error?: string;
+  /** accumulated ArrayBuffers while download is in progress */
+  buffers?: ArrayBuffer[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export type SignalType =
   | "JOIN"
   | "OFFER"

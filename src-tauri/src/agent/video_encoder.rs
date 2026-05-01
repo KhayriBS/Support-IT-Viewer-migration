@@ -146,7 +146,8 @@ impl FfmpegRtpBridge {
             UdpSocket::from_std(std_socket).map_err(|err| format!("from_std udp failed: {err}"))?;
 
         let bitrate = preset.bitrate_bps.to_string();
-        let gop = (preset.target_fps.saturating_mul(5)).max(60).to_string();
+        // Low-latency GOP target: one keyframe every ~2 seconds.
+        let gop = (preset.target_fps.saturating_mul(2)).max(30).to_string();
         let mut command = Command::new(ffmpeg_binary);
         command
             .arg("-hide_banner")
@@ -242,7 +243,17 @@ fn parse_requested_backend(raw: &str) -> Option<VideoEncoderBackend> {
 fn detect_best_backend() -> VideoEncoderBackend {
     #[cfg(windows)]
     {
-        return VideoEncoderBackend::MediaFoundationH264;
+        // Production stability-first default on Windows:
+        // Media Foundation can stall on some Intel/driver combinations
+        // (first frame then freeze). Keep it opt-in via env when needed.
+        if env::var("LUMIERE_ENABLE_MF_AUTO")
+            .ok()
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            return VideoEncoderBackend::MediaFoundationH264;
+        }
+        return VideoEncoderBackend::OpenH264Software;
     }
 
     #[cfg(not(windows))]

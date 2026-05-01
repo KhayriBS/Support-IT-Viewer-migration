@@ -10,6 +10,7 @@ export class SignalingClient {
   private socket: WebSocket | null = null;
   private currentSessionId: string | null = null;
   private connectPromise: Promise<void> | null = null;
+  private lastCloseEvent: CloseEvent | null = null;
 
   connect(signalingToken: string, role: "viewer" | "agent", sessionId?: string): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) {
@@ -36,13 +37,15 @@ export class SignalingClient {
       this.socket = new WebSocket(wsUrl);
       this.socket.onopen = () => {
         this.connectPromise = null;
+        this.lastCloseEvent = null;
         resolve();
       };
       this.socket.onerror = () => {
         this.connectPromise = null;
         reject(new Error("WebSocket connection failed"));
       };
-      this.socket.onclose = () => {
+      this.socket.onclose = (event: CloseEvent) => {
+        this.lastCloseEvent = event;
         this.socket = null;
         this.connectPromise = null;
       };
@@ -55,6 +58,10 @@ export class SignalingClient {
     this.socket?.close();
     this.socket = null;
     this.connectPromise = null;
+  }
+
+  getLastCloseEvent() {
+    return this.lastCloseEvent;
   }
 
   isConnected() {
@@ -92,7 +99,7 @@ export class SignalingClient {
     return () => this.socket?.removeEventListener("message", listener);
   }
 
-  onClose(handler: () => void) {
+  onClose(handler: (event: CloseEvent) => void) {
     if (!this.socket) {
       return () => {};
     }
