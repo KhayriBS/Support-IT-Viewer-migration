@@ -6,7 +6,8 @@ import type {
   ControlSession,
   LoginRequest,
   MachineAuthStatus,
-  RegisterRequest
+  RegisterRequest,
+  SessionHistoryEntry
 } from "$lib/api/types";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "")
@@ -85,6 +86,25 @@ export const technicianApi = {
       body: {}
     });
     return unwrap(res);
+  },
+
+  /**
+   * Historique des sessions impliquant une machine (côté agent ou technicien).
+   * Voir SessionController#getSessionHistory côté backend.
+   */
+  async getSessionHistory(
+    machineId: string,
+    options: { direction?: "incoming" | "outgoing" | "all"; status?: string; q?: string } = {},
+    token?: string
+  ) {
+    const params = new URLSearchParams();
+    if (options.direction && options.direction !== "all") params.set("direction", options.direction);
+    if (options.status && options.status !== "all") params.set("status", options.status);
+    if (options.q && options.q.trim()) params.set("q", options.q.trim());
+    const qs = params.toString();
+    const path = `/sessions/history/${encodeURIComponent(machineId)}${qs ? `?${qs}` : ""}`;
+    const res = await request<ApiResponse<SessionHistoryEntry[]>>(path, { token });
+    return unwrap(res) ?? [];
   },
 
   async startSessionByCode(code: string, token?: string) {

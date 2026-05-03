@@ -39,6 +39,21 @@ export interface ControlSession {
   endedAt: string | null;
 }
 
+export interface SessionHistoryEntry {
+  id: number;
+  agentMachineId: string;
+  technicianUsername: string;
+  technicianRole?: string | null;
+  status: "PENDING_APPROVAL" | "ACTIVE" | "TERMINATED";
+  /** "incoming" si la machine demandée est l'agent, "outgoing" si elle est le technicien */
+  direction: "incoming" | "outgoing";
+  /** Identifiant de l'AUTRE peer à afficher (technicien si entrante, agent si sortante) */
+  peerLabel: string;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+}
+
 export interface LoginRequest {
   email: string;
   password: string;

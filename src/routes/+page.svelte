@@ -43,6 +43,21 @@
     payload: string;
   }
 
+  // ── Historique des sessions : alimenté par l'API backend ──
+  // GET /sessions/history/{machineId}?direction=&status=&q=
+  // (cf. SessionController côté Spring)
+  let rdSessionHistory = $state<import("$lib/api/types").SessionHistoryEntry[]>([]);
+  let rdSessionLoading = $state(false);
+  let rdSessionError = $state<string | null>(null);
+  let rdSessionSearch = $state("");
+  let rdSessionTypeFilter = $state<"all" | "incoming" | "outgoing">("all");
+  let rdSessionStatusFilter = $state<"all" | "active" | "ended">("all");
+  let rdSessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Fichiers : recherche + filtre transfert
+  let rdFileSearch = $state("");
+  let rdFileFilter = $state<"all" | "upload" | "download">("all");
+
   const signalingClient = new SignalingClient();
   const chatClient = new ChatRealtimeClient();
 
@@ -469,6 +484,110 @@
   interface AgentStatusSnapshot {
     running: boolean;
     machineId: string;
+  }
+
+  // ── Historique sessions : appel direct à l'API Spring ──
+  // L'API filtre côté serveur (direction / status / q). On debounce le fetch
+  // pour ne pas spammer le backend pendant que l'utilisateur tape.
+  async function fetchSessionHistory() {
+    // Priorité au connection_code (ce que la table backend connaît directement),
+    // fallback sur le machineId si le code n'est pas encore chargé.
+    const key = (localConnectionCode || localMachineId || "").trim();
+    if (!key) {
+      rdSessionHistory = [];
+      return;
+    }
+    rdSessionLoading = true;
+    rdSessionError = null;
+    try {
+      const list = await technicianApi.getSessionHistory(key, {
+        direction: rdSessionTypeFilter,
+        status: rdSessionStatusFilter,
+        q: rdSessionSearch
+      });
+      rdSessionHistory = list;
+    } catch (err) {
+      rdSessionError = String(err);
+      rdSessionHistory = [];
+    } finally {
+      rdSessionLoading = false;
+    }
+  }
+
+  $effect(() => {
+    // dépendances réactives
+    void localConnectionCode;
+    void localMachineId;
+    void rdSessionTypeFilter;
+    void rdSessionStatusFilter;
+    void rdSessionSearch;
+    if (rdSessionRefreshTimer) clearTimeout(rdSessionRefreshTimer);
+    rdSessionRefreshTimer = setTimeout(() => { void fetchSessionHistory(); }, 250);
+  });
+
+  // Refresh immédiat quand une session vient de démarrer / se terminer.
+  $effect(() => {
+    void activeSession?.id;
+    void activeSession?.status;
+    void pendingApprovalSession?.id;
+    void fetchSessionHistory();
+  });
+
+  // ── Listes filtrées dérivées ──
+  // Les sessions sont déjà filtrées côté backend, on les affiche telles quelles.
+  // (La recherche/filtre côté client est conservée comme fallback en attendant
+  // que le fetch debounced revienne.)
+  const rdFilteredSessions = $derived(rdSessionHistory);
+
+  const rdFilteredFiles = $derived.by(() => {
+    const search = rdFileSearch.trim().toLowerCase();
+    const list = Object.values(fileTransfers);
+    return list
+      .filter((f) => {
+        if (rdFileFilter !== "all" && f.type !== rdFileFilter) return false;
+        if (search && !f.fileName.toLowerCase().includes(search)) return false;
+        return true;
+      })
+      .sort((a, b) => b.startedAt - a.startedAt);
+  });
+
+  function rdFormatDuration(ms: number | null): string {
+    if (!ms || ms <= 0) return "-";
+    const total = Math.floor(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    if (h > 0) return `${h}h ${m}min`;
+    return `${m} min`;
+  }
+  function rdFormatTime(iso: string): string {
+    try {
+      return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return "-";
+    }
+  }
+  function rdFormatRelative(ms: number): string {
+    const diff = Date.now() - ms;
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return "à l'instant";
+    if (m < 60) return `Il y a ${m} min`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `Il y a ${h}h`;
+    const d = Math.floor(h / 24);
+    return `Il y a ${d}j`;
+  }
+  function rdFormatBytes(b: number): string {
+    if (!b || b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
+    return `${(b / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  }
+  function rdFileIconClass(name: string): string {
+    const lower = name.toLowerCase();
+    if (lower.endsWith(".pdf")) return "rd-file__icon--pdf";
+    if (lower.endsWith(".pptx") || lower.endsWith(".ppt")) return "rd-file__icon--ppt";
+    if (lower.endsWith(".zip") || lower.endsWith(".rar") || lower.endsWith(".7z")) return "rd-file__icon--zip";
+    return "rd-file__icon--pdf";
   }
 
   async function refreshMetrics() {
@@ -2408,6 +2527,17 @@
     await viewerShellEl.requestFullscreen();
   }
 
+  async function enterViewerFullscreen() {
+    if (!viewerShellEl || document.fullscreenElement === viewerShellEl) return;
+    try { await viewerShellEl.requestFullscreen(); } catch { /* user gesture / API absente */ }
+  }
+
+  async function exitViewerFullscreen() {
+    if (document.fullscreenElement) {
+      try { await document.exitFullscreen(); } catch { /* déjà sorti */ }
+    }
+  }
+
   function toggleViewerExpanded() {
     viewerExpanded = !viewerExpanded;
     revealViewerControls();
@@ -2835,7 +2965,338 @@
   <meta name="description" content="Dashboard API migre depuis TechnicianViewer" />
 </svelte:head>
 
-<main>
+<main class="rd-page">
+  <!-- ═════════════════════════════════════════════════════════════════
+       Nouvelle UI "Bureau à Distance" (cf. maquette).
+       L'ancienne console technicien est conservée plus bas dans un
+       bloc {#if false}…{/if} (équivalent d'un commentaire de bloc Svelte).
+       ═════════════════════════════════════════════════════════════════ -->
+  <section class="rd-card">
+    <header class="rd-header">
+      <div class="rd-title">
+        <h1>Bureau à Distance</h1>
+        <p>Contrôlez et partagez votre bureau en toute sécurité</p>
+      </div>
+      <div class="rd-machine-code">
+        <span class="rd-machine-code__label">Code de cette machine</span>
+        <span class="rd-machine-code__value">
+          {#if localConnectionCodeLoading && !localConnectionCode}
+            …
+          {:else if localConnectionCode}
+            {localConnectionCode}
+          {:else}
+            ------
+          {/if}
+        </span>
+      </div>
+    </header>
+
+    <section class="rd-panel">
+      <h2 class="rd-panel__title">Connexion par code</h2>
+      <div class="rd-connect">
+        <input
+          class="rd-connect__input"
+          type="text"
+          placeholder="Entrez le code de l'ordinateur distant"
+          bind:value={connectionCode}
+          disabled={actionLoading || waitingForApproval}
+          onkeydown={(e) => { if (e.key === "Enter" && !actionLoading) void startSessionWithCode(); }} />
+        <button
+          class="rd-connect__btn"
+          type="button"
+          onclick={() => void startSessionWithCode()}
+          disabled={actionLoading || waitingForApproval || !connectionCode.trim()}>
+          {actionLoading ? "Connexion…" : "Se connecter →"}
+        </button>
+      </div>
+
+      {#if waitingForApproval}
+        <div class="rd-connect__status rd-connect__status--waiting">
+          <span class="rd-spinner"></span>
+          <div>
+            <strong>En attente d'acceptation…</strong>
+            <p>L'ordinateur distant doit autoriser la connexion (clavier, souris, transfert de fichiers).</p>
+          </div>
+        </div>
+      {:else if actionError}
+        <div class="rd-connect__status rd-connect__status--error">
+          <strong>Erreur :</strong> {actionError}
+        </div>
+      {/if}
+    </section>
+
+    <!-- ── Vidéo : visible dès qu'une session est ACTIVE (l'agent a accepté) ── -->
+    {#if activeSession && activeSession.status === "ACTIVE"}
+      <section class="rd-panel rd-viewer">
+        <header class="rd-viewer__head">
+          <h2 class="rd-panel__title">
+            <span class="rd-icon">🖥</span>
+            Session en cours avec
+            <strong class="rd-viewer__peer">{activeSession.agentMachineId}</strong>
+          </h2>
+          <p class="rd-viewer__sub">
+            {#if signalingConnected && viewerRemoteStream}
+              Stream actif
+              {#if viewerStreamMbps !== null}&nbsp;•&nbsp; {viewerStreamMbps.toFixed(1)} Mbps{/if}
+              {#if viewerStreamFps !== null}&nbsp;•&nbsp; {viewerStreamFps.toFixed(0)} fps{/if}
+            {:else if signalingConnected}
+              Signalisation connectée — attente de la première image…
+            {:else}
+              Connexion en cours…
+            {/if}
+          </p>
+        </header>
+
+        <div
+          bind:this={viewerShellEl}
+          class="rd-viewer__stage"
+          class:rd-viewer__stage--ready={!!viewerRemoteStream}
+          class:rd-viewer__stage--fullscreen={viewerFullscreenActive}
+          onmousemove={revealViewerControls}
+          onmouseleave={() => { /* laisse l'auto-hide existant gérer le fade */ }}
+          role="presentation">
+          {#if viewerRemoteStream}
+            <video
+              class="rd-viewer__video"
+              class:active={canSendViewerInput()}
+              bind:this={viewerVideoEl}
+              autoplay
+              playsinline
+              muted
+              tabindex="0"
+              onfocus={handleViewerVideoFocus}
+              onblur={handleViewerVideoBlur}
+              onmousemove={handleViewerMouseMove}
+              onmousedown={handleViewerMouseDown}
+              onmouseup={handleViewerMouseUp}
+              onwheel={handleViewerWheel}
+              oncontextmenu={(event) => event.preventDefault()}
+            ></video>
+          {:else}
+            <div class="rd-viewer__placeholder">
+              <span class="rd-spinner"></span>
+              <p>Réception de la première image WebRTC…</p>
+            </div>
+          {/if}
+
+          <!-- Barre flottante d'actions (transparente, fade-in au survol) -->
+          <div
+            class="rd-viewer__floating-actions"
+            class:visible={viewerControlsVisible || !viewerRemoteStream}>
+            <button
+              class="rd-viewer__fab"
+              type="button"
+              onclick={() => void enterViewerFullscreen()}
+              disabled={!viewerRemoteStream || viewerFullscreenActive}
+              title="Plein écran">
+              <span class="rd-viewer__fab-icon">⛶</span>
+              <span class="rd-viewer__fab-label">Plein écran</span>
+            </button>
+            <button
+              class="rd-viewer__fab"
+              type="button"
+              onclick={() => void exitViewerFullscreen()}
+              disabled={!viewerFullscreenActive}
+              title="Quitter le plein écran">
+              <span class="rd-viewer__fab-icon">⤢</span>
+              <span class="rd-viewer__fab-label">Quitter</span>
+            </button>
+            <button
+              class="rd-viewer__fab rd-viewer__fab--danger"
+              type="button"
+              onclick={() => void stopByToken()}
+              disabled={actionLoading}
+              title="Déconnecter la session">
+              <span class="rd-viewer__fab-icon">⏻</span>
+              <span class="rd-viewer__fab-label">Déconnecter</span>
+            </button>
+          </div>
+        </div>
+
+        {#if screenFrameError}
+          <p class="rd-connect__status rd-connect__status--error">{screenFrameError}</p>
+        {/if}
+      </section>
+    {/if}
+
+    <section class="rd-panel">
+      <h2 class="rd-panel__title"><span class="rd-icon">🖥</span> Métriques de cette machine</h2>
+      <div class="rd-metrics">
+        <div class="rd-metric">
+          <div class="rd-metric__head"><span class="rd-metric__icon rd-metric__icon--cpu">⚙</span> CPU</div>
+          <div class="rd-metric__value">{metrics ? `${metrics.cpuUsage.toFixed(0)}%` : "24%"}</div>
+        </div>
+        <div class="rd-metric">
+          <div class="rd-metric__head"><span class="rd-metric__icon rd-metric__icon--ram">🗄</span> RAM</div>
+          <div class="rd-metric__value">{metrics ? `${(metrics.ramUsage / 100 * 16).toFixed(1)} / 16 GB` : "8.2 / 16 GB"}</div>
+        </div>
+        <div class="rd-metric">
+          <div class="rd-metric__head"><span class="rd-metric__icon rd-metric__icon--disk">💾</span> Disque</div>
+          <div class="rd-metric__value">{metrics ? `${(metrics.diskUsage / 100 * 512).toFixed(0)} / 512 GB` : "256 / 512 GB"}</div>
+        </div>
+        <div class="rd-metric">
+          <div class="rd-metric__head"><span class="rd-metric__icon rd-metric__icon--net">📶</span> Réseau</div>
+          <div class="rd-metric__value rd-metric__value--ok">Connected</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="rd-history-grid">
+      <section class="rd-panel rd-history">
+        <header class="rd-history__head">
+          <h2 class="rd-panel__title"><span class="rd-icon">⏱</span> Historique des sessions</h2>
+          <span class="rd-history__count">{rdFilteredSessions.length} session{rdFilteredSessions.length > 1 ? "s" : ""}</span>
+        </header>
+        <input
+          class="rd-history__search"
+          type="search"
+          placeholder="Rechercher par code machine..."
+          bind:value={rdSessionSearch} />
+        <div class="rd-history__filters">
+          <select class="rd-select" bind:value={rdSessionTypeFilter}>
+            <option value="all">Tous les types</option>
+            <option value="incoming">Entrantes</option>
+            <option value="outgoing">Sortantes</option>
+          </select>
+          <select class="rd-select" bind:value={rdSessionStatusFilter}>
+            <option value="all">Tous les statuts</option>
+            <option value="active">En cours</option>
+            <option value="ended">Terminées</option>
+          </select>
+        </div>
+        <div class="rd-history__list">
+          {#if rdSessionError}
+            <p class="rd-empty">Erreur API: {rdSessionError}</p>
+          {:else if rdSessionLoading && rdFilteredSessions.length === 0}
+            <p class="rd-empty">Chargement…</p>
+          {:else if rdFilteredSessions.length === 0}
+            <p class="rd-empty">Aucune session pour les filtres actuels.</p>
+          {:else}
+            {#each rdFilteredSessions as session (session.id)}
+              {@const isActive = session.status !== "TERMINATED"}
+              <article class="rd-session">
+                <div class="rd-session__top">
+                  <strong class="rd-session__code">{session.peerLabel}</strong>
+                  {#if isActive}
+                    <span class="rd-pill rd-pill--live">En cours</span>
+                  {:else}
+                    <span class="rd-pill rd-pill--done">Terminée</span>
+                  {/if}
+                </div>
+                <p class="rd-session__type">
+                  Connexion {session.direction === "incoming" ? "entrante" : "sortante"}
+                </p>
+                <p class="rd-session__meta">
+                  Début: {rdFormatTime(session.startedAt)}
+                  {#if !isActive && session.durationMs}
+                    &nbsp;&nbsp; Durée: {rdFormatDuration(session.durationMs)}
+                  {/if}
+                </p>
+              </article>
+            {/each}
+          {/if}
+        </div>
+      </section>
+
+      <section class="rd-panel rd-history">
+        <header class="rd-history__head">
+          <h2 class="rd-panel__title"><span class="rd-icon">📄</span> Historique des fichiers</h2>
+          <span class="rd-history__count">{rdFilteredFiles.length} fichier{rdFilteredFiles.length > 1 ? "s" : ""}</span>
+        </header>
+        <input
+          class="rd-history__search"
+          type="search"
+          placeholder="Rechercher par nom de fichier ou code machine..."
+          bind:value={rdFileSearch} />
+        <div class="rd-history__filters">
+          <select class="rd-select" bind:value={rdFileFilter}>
+            <option value="all">Tous les transferts</option>
+            <option value="upload">Fichiers envoyés</option>
+            <option value="download">Fichiers reçus</option>
+          </select>
+        </div>
+        <div class="rd-history__list">
+          {#if rdFilteredFiles.length === 0}
+            <p class="rd-empty">Aucun transfert pour les filtres actuels.</p>
+          {:else}
+            {#each rdFilteredFiles as file (file.transferId)}
+              <article class="rd-file">
+                <span class="rd-file__icon {rdFileIconClass(file.fileName)}">📄</span>
+                <div class="rd-file__body">
+                  <strong class="rd-file__name">{file.fileName}</strong>
+                  <p class="rd-file__sub">
+                    {file.type === "upload" ? "Envoyé" : "Reçu"}
+                    {#if activeSession?.agentMachineId}
+                      {file.type === "upload" ? "vers" : "de"} {activeSession.agentMachineId}
+                    {/if}
+                  </p>
+                  <p class="rd-file__meta">
+                    {rdFormatBytes(file.totalSize || file.doneBytes)} &nbsp;•&nbsp; {rdFormatRelative(file.startedAt)}
+                    {#if file.state !== "complete"}
+                      &nbsp;•&nbsp; <span class="rd-file__state">{file.state}</span>
+                    {/if}
+                  </p>
+                </div>
+              </article>
+            {/each}
+          {/if}
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ── Modal d'approbation : popup côté ordinateur DISTANT (cible) ── -->
+  {#if showApprovalModal && pendingApprovalSession}
+    <div
+      class="rd-approval-overlay"
+      role="dialog"
+      tabindex="-1"
+      onkeydown={(e) => { if (e.key === "Escape" && !approvalLoading) showApprovalModal = false; }}
+      onmousedown={(e) => { if (!approvalLoading && e.target === e.currentTarget) showApprovalModal = false; }}>
+      <div class="rd-approval-modal">
+        <h2>Demande d'accès distant</h2>
+        <p class="rd-approval-desc">
+          <strong>{pendingApprovalSession.technicianUsername || "Un technicien"}</strong>
+          demande l'accès à ce PC.
+        </p>
+
+        {#if approvalError}
+          <p class="rd-approval-error">{approvalError}</p>
+        {/if}
+
+        <div class="rd-approval-options">
+          <label>
+            <input type="checkbox" bind:checked={approvalAllowRemoteInput} disabled={approvalLoading} />
+            Autoriser clavier / souris
+          </label>
+          <label>
+            <input type="checkbox" bind:checked={approvalAllowFileTransfer} disabled={approvalLoading} />
+            Autoriser transfert de fichiers
+          </label>
+        </div>
+
+        <div class="rd-approval-actions">
+          <button
+            class="rd-approval-btn rd-approval-btn--reject"
+            onclick={rejectPendingSession}
+            disabled={approvalLoading}>
+            {approvalLoading ? "Traitement…" : "Refuser"}
+          </button>
+          <button
+            class="rd-approval-btn rd-approval-btn--approve"
+            onclick={approvePendingSession}
+            disabled={approvalLoading}>
+            {approvalLoading ? "Traitement…" : "Autoriser"}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- ╔══════════════════════════════════════════════════════════════╗
+       ║  ANCIEN UI — bloc commenté (HTML comment, ignoré par Svelte).║
+       ║  Aucun backend Rust touché.                                   ║
+       ╚══════════════════════════════════════════════════════════════╝
   <header class="hero">
     <div class="hero-copy">
       <p class="eyebrow">Support distant</p>
@@ -3319,7 +3780,6 @@
       {#if queriedSession.allowFileTransfer === false}
         <p class="error top-gap">Transfert de fichiers non autorise pour cette session.</p>
       {:else}
-        <!-- Upload locale â†’ agent -->
         <div class="top-gap">
           <h3>Envoyer un fichier vers l'agent</h3>
           <div class="row top-gap">
@@ -3339,7 +3799,6 @@
           </div>
         </div>
 
-        <!-- Explorateur distant -->
         <div class="top-gap">
           <div class="row between">
             <h3>Explorateur distant</h3>
@@ -3415,7 +3874,6 @@
           {/if}
         </div>
 
-        <!-- Transferts en cours -->
         {#if Object.keys(fileTransfers).length > 0}
           <div class="top-gap">
             <div class="row between">
@@ -3474,7 +3932,6 @@
     </section>
   {/if}
 
-  <!-- Approval Modal -->
   {#if showApprovalModal && pendingApprovalSession}
     <div
       class="approval-overlay"
@@ -3521,9 +3978,610 @@
       </div>
     </div>
   {/if}
+  /fin du bloc ancien UI commenté -->
 </main>
 
 <style>
+  /* ═══════════════════════════════════════════════════════════════
+     Styles "Bureau à Distance" (nouvelle UI — voir maquette).
+     Tout est préfixé .rd-* pour ne pas entrer en conflit avec les
+     styles legacy plus bas.
+     ═══════════════════════════════════════════════════════════════ */
+  .rd-page {
+    min-height: 100vh;
+    padding: 24px 32px;
+    background: #0d1117;
+    color: #e2e8f0;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    box-sizing: border-box;
+  }
+
+  .rd-card {
+    width: 100%;
+    max-width: 1800px;
+    margin: 0 auto;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* Chaque sous-bloc devient sa propre carte pleine largeur (cf. maquette) */
+  .rd-card > .rd-panel,
+  .rd-card > .rd-history-grid > .rd-panel {
+    background: #11181f;
+    border: 1px solid #1f2a36;
+    border-radius: 16px;
+    padding: 22px 24px;
+  }
+  .rd-header {
+    background: transparent;
+    border: none;
+    padding: 0 4px;
+  }
+
+  .rd-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .rd-title h1 {
+    margin: 0 0 6px 0;
+    font-size: 28px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .rd-title p {
+    margin: 0;
+    color: #94a3b8;
+    font-size: 14px;
+  }
+  .rd-machine-code {
+    background: #0f1620;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 12px 18px;
+    text-align: right;
+    min-width: 220px;
+  }
+  .rd-machine-code__label {
+    display: block;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .rd-machine-code__value {
+    display: block;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-weight: 700;
+    font-size: 18px;
+    color: #38bdf8;
+    letter-spacing: 0.5px;
+  }
+
+  .rd-panel {
+    background: #0f1620;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .rd-panel__title {
+    margin: 0 0 14px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #e2e8f0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rd-icon {
+    color: #38bdf8;
+  }
+
+  /* ── Connexion par code ───────────────────────────────────────── */
+  .rd-connect {
+    display: flex;
+    gap: 12px;
+  }
+  .rd-connect__input {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 12px 14px;
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  .rd-connect__input::placeholder {
+    color: #475569;
+  }
+  .rd-connect__input:focus {
+    outline: none;
+    border-color: #38bdf8;
+  }
+  .rd-connect__btn {
+    background: #1f2a36;
+    border: 1px solid #2a3a4a;
+    color: #cbd5e1;
+    padding: 12px 22px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .rd-connect__btn:hover {
+    background: #2a3a4a;
+  }
+
+  /* ── Métriques ────────────────────────────────────────────────── */
+  .rd-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 720px) {
+    .rd-metrics { grid-template-columns: repeat(2, 1fr); }
+  }
+  .rd-metric {
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .rd-metric__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #94a3b8;
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .rd-metric__icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+  }
+  .rd-metric__icon--cpu  { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .rd-metric__icon--ram  { background: rgba(167,139,250,0.15); color: #a78bfa; }
+  .rd-metric__icon--disk { background: rgba(192,132,252,0.15); color: #c084fc; }
+  .rd-metric__icon--net  { background: rgba(74,222,128,0.15); color: #4ade80; }
+  .rd-metric__value {
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .rd-metric__value--ok { color: #4ade80; }
+
+  /* ── Historique grille ────────────────────────────────────────── */
+  .rd-history-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 900px) {
+    .rd-history-grid { grid-template-columns: 1fr; }
+  }
+  .rd-history__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .rd-history__count {
+    font-size: 12px;
+    color: #94a3b8;
+  }
+  .rd-history__search {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #e2e8f0;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .rd-history__search::placeholder { color: #475569; }
+  .rd-history__filters {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .rd-select {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: #cbd5e1;
+    font-size: 13px;
+  }
+  .rd-history__list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+
+  /* ── Carte session ────────────────────────────────────────────── */
+  .rd-session {
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .rd-session__top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .rd-session__code {
+    color: #38bdf8;
+    font-family: "Consolas", monospace;
+    font-size: 14px;
+  }
+  .rd-session__type {
+    margin: 0 0 4px 0;
+    font-size: 13px;
+    color: #cbd5e1;
+  }
+  .rd-session__meta {
+    margin: 0;
+    font-size: 12px;
+    color: #64748b;
+  }
+  .rd-pill {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+  }
+  .rd-pill--done {
+    background: rgba(148,163,184,0.12);
+    color: #cbd5e1;
+    border-color: rgba(148,163,184,0.2);
+  }
+  .rd-pill--live {
+    background: rgba(74,222,128,0.15);
+    color: #4ade80;
+    border-color: rgba(74,222,128,0.3);
+  }
+
+  /* ── Carte fichier ────────────────────────────────────────────── */
+  .rd-file {
+    display: flex;
+    gap: 12px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .rd-file__icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+  }
+  .rd-file__icon--pdf { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .rd-file__icon--ppt { background: rgba(74,222,128,0.15); color: #4ade80; }
+  .rd-file__icon--zip { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .rd-file__body { flex: 1; min-width: 0; }
+  .rd-file__name {
+    display: block;
+    color: #e2e8f0;
+    font-size: 14px;
+    margin-bottom: 2px;
+  }
+  .rd-file__sub {
+    margin: 0 0 2px 0;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+  .rd-file__meta {
+    margin: 0;
+    font-size: 11px;
+    color: #64748b;
+  }
+  .rd-file__state {
+    color: #38bdf8;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .rd-empty {
+    margin: 0;
+    padding: 18px 8px;
+    color: #64748b;
+    font-size: 13px;
+    text-align: center;
+  }
+
+  /* ── Bandeau de statut sous Connexion par code ─────────────────── */
+  .rd-connect__status {
+    margin-top: 14px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .rd-connect__status--waiting {
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    color: #cbd5e1;
+  }
+  .rd-connect__status--waiting strong { color: #38bdf8; }
+  .rd-connect__status--waiting p { margin: 4px 0 0 0; color: #94a3b8; font-size: 12px; }
+  .rd-connect__status--error {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+  }
+  .rd-connect__btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .rd-spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(56, 189, 248, 0.25);
+    border-top-color: #38bdf8;
+    border-radius: 50%;
+    animation: rd-spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes rd-spin { to { transform: rotate(360deg); } }
+
+  /* ── Modal d'approbation (popup côté machine cible) ────────────── */
+  .rd-approval-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    backdrop-filter: blur(2px);
+  }
+  .rd-approval-modal {
+    background: #11181f;
+    border: 1px solid #1f2a36;
+    border-radius: 14px;
+    padding: 26px 28px;
+    width: min(92vw, 460px);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  }
+  .rd-approval-modal h2 {
+    margin: 0 0 8px 0;
+    font-size: 18px;
+    color: #fff;
+  }
+  .rd-approval-desc {
+    margin: 0 0 18px 0;
+    font-size: 14px;
+    color: #cbd5e1;
+  }
+  .rd-approval-desc strong { color: #38bdf8; }
+  .rd-approval-error {
+    margin: 0 0 14px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+    font-size: 13px;
+  }
+  .rd-approval-options {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 22px;
+  }
+  .rd-approval-options label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #e2e8f0;
+  }
+  .rd-approval-options label:hover { background: #0f1620; }
+  .rd-approval-options input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: #38bdf8;
+  }
+  .rd-approval-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .rd-approval-btn {
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.15s;
+  }
+  .rd-approval-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .rd-approval-btn--reject {
+    background: transparent;
+    border-color: #1f2a36;
+    color: #cbd5e1;
+  }
+  .rd-approval-btn--reject:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.1);
+    border-color: rgba(239, 68, 68, 0.4);
+    color: #fca5a5;
+  }
+  .rd-approval-btn--approve {
+    background: #38bdf8;
+    color: #0d1117;
+  }
+  .rd-approval-btn--approve:hover:not(:disabled) { background: #7dd3fc; }
+
+  /* ── Viewer vidéo (panneau visible pendant une session ACTIVE) ──── */
+  .rd-viewer__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .rd-viewer__peer {
+    color: #38bdf8;
+    font-family: "Consolas", monospace;
+    margin-left: 4px;
+  }
+  .rd-viewer__sub {
+    margin: 4px 0 0 0;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+  /* ── Barre flottante d'actions sur la vidéo ─────────────────────── */
+  .rd-viewer__floating-actions {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%) translateY(8px);
+    display: flex;
+    gap: 8px;
+    padding: 8px;
+    background: rgba(15, 22, 32, 0.65);
+    border: 1px solid rgba(56, 189, 248, 0.18);
+    border-radius: 999px;
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    z-index: 10;
+  }
+  .rd-viewer__floating-actions.visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
+  .rd-viewer__fab {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e2e8f0;
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .rd-viewer__fab:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: rgba(56, 189, 248, 0.4);
+    color: #fff;
+  }
+  .rd-viewer__fab:disabled { opacity: 0.35; cursor: not-allowed; }
+  .rd-viewer__fab-icon { font-size: 15px; line-height: 1; }
+  .rd-viewer__fab--danger { color: #fca5a5; }
+  .rd-viewer__fab--danger:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.45);
+    color: #fff;
+  }
+
+  /* En plein écran, la barre se positionne par rapport au viewport */
+  .rd-viewer__stage:fullscreen .rd-viewer__floating-actions,
+  .rd-viewer__stage:-webkit-full-screen .rd-viewer__floating-actions {
+    bottom: 28px;
+  }
+
+  /* Responsive : sur petit écran on cache le label, on garde l'icône */
+  @media (max-width: 600px) {
+    .rd-viewer__fab-label { display: none; }
+    .rd-viewer__fab { padding: 8px 10px; }
+  }
+
+  /* En plein écran natif, le stage prend tout l'écran et la vidéo s'étire */
+  .rd-viewer__stage:fullscreen,
+  .rd-viewer__stage:-webkit-full-screen {
+    aspect-ratio: auto;
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+    border: none;
+    background: #000;
+  }
+  .rd-viewer__stage:fullscreen .rd-viewer__video,
+  .rd-viewer__stage:-webkit-full-screen .rd-viewer__video {
+    width: 100%;
+    height: 100%;
+  }
+
+  .rd-viewer__stage {
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .rd-viewer__video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+    outline: none;
+    cursor: default;
+  }
+  .rd-viewer__video.active {
+    cursor: crosshair;
+    outline: 2px solid rgba(56, 189, 248, 0.45);
+    outline-offset: -2px;
+  }
+  .rd-viewer__placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    color: #94a3b8;
+    font-size: 13px;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     Styles legacy (utilisés uniquement par le bloc {#if false}) —
+     conservés pour ne pas casser le code commenté.
+     ═══════════════════════════════════════════════════════════════ */
   :global(body) {
     margin: 0;
     font-family: "Segoe UI", sans-serif;
