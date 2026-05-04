@@ -765,9 +765,8 @@
 
         if (session.status === "ACTIVE") {
           waitingForApproval = false;
-          if (!selectedFeature) {
-            selectedFeature = "screen";
-          }
+          // PAS d'auto-screen : laisse l'utilisateur choisir Écran/Fichier/Chat
+          // depuis le menu post-connexion. selectedFeature reste null.
           stopSessionActivationWatch();
           await connectSignaling();
           return;
@@ -2538,6 +2537,115 @@
     }
   }
 
+  // ── Contrôle d'émission de frames côté agent (Pause / Play / transfert) ──
+  // L'agent démarre PAUSÉ. On lui envoie VIDEO_RESUME / VIDEO_PAUSE via le
+  // DataChannel "input" (P2P, reste ouvert même quand le signaling WebSocket
+  // est fermé par Render avec un 1003 après l'OFFER/ANSWER).
+  let rdFileInputEl = $state<HTMLInputElement | null>(null);
+  let rdVideoPausedForTransfer = $state(false);
+  // Préférence utilisateur : true = on VEUT voir l'écran (Play). Combiné avec
+  // l'état des transferts, ça donne l'état réel envoyé à l'agent.
+  let rdScreenPlayRequested = $state(false);
+
+  function rdHasActiveTransfer(transfers: Record<string, FileTransfer>): boolean {
+    for (const t of Object.values(transfers)) {
+      if (t.state === "active") return true;
+    }
+    return false;
+  }
+
+  function rdSendVideoControl(paused: boolean) {
+    const payload = JSON.stringify({ type: paused ? "VIDEO_PAUSE" : "VIDEO_RESUME" });
+    // 1) Voie principale : DataChannel "input" (P2P, toujours ouvert si peer Connected)
+    try {
+      if (viewerControlChannel && viewerControlChannel.readyState === "open") {
+        viewerControlChannel.send(payload);
+      }
+    } catch {
+      /* canal momentanément KO */
+    }
+    // 2) Voie de secours : signaling, si encore connecté (utile au tout début
+    //    avant l'ouverture du DataChannel input).
+    try {
+      if (signalingClient.isConnected()) {
+        signalingClient.send({
+          type: "STREAM_PROFILE",
+          to: "agent",
+          sessionId: activeSession ? String(activeSession.id) : undefined,
+          payload: { profile: viewerPlaybackProfile, paused }
+        }, "viewer");
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function rdPlayScreen() {
+    rdScreenPlayRequested = true;
+  }
+  function rdPauseScreen() {
+    rdScreenPlayRequested = false;
+  }
+
+  // Reflète l'état désiré en envoi P2P. Pause si :
+  //  - l'utilisateur n'a pas (encore) cliqué Play, OU
+  //  - un transfert est en cours, OU
+  //  - on n'est pas sur le panneau Écran
+  $effect(() => {
+    const transferActive = rdHasActiveTransfer(fileTransfers);
+    rdVideoPausedForTransfer = transferActive;
+
+    const onScreenTab = selectedFeature === "screen";
+    const wantFrames = onScreenTab && rdScreenPlayRequested && !transferActive;
+    const paused = !wantFrames;
+
+    // Évite de spam : on track la dernière valeur envoyée
+    if (paused !== rdLastSentPaused) {
+      rdSendVideoControl(paused);
+      rdLastSentPaused = paused;
+    }
+  });
+  let rdLastSentPaused: boolean | null = null;
+
+  // Réinitialise les états quand la session se ferme
+  $effect(() => {
+    if (!activeSession) {
+      rdScreenPlayRequested = false;
+      rdLastSentPaused = null;
+    }
+  });
+
+  function rdTriggerFilePicker() {
+    if (!fileChannelOpen) return;
+    rdFileInputEl?.click();
+  }
+
+  async function rdHandleFilePicked(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const files = input.files;
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      try {
+        await uploadLocalFile(file);
+      } catch (err) {
+        console.error("[rd] upload failed:", err);
+      }
+    }
+    // Reset pour pouvoir re-sélectionner le même fichier plus tard
+    input.value = "";
+  }
+
+  function rdDismissTransfer(tid: string) {
+    const next = { ...fileTransfers };
+    delete next[tid];
+    fileTransfers = next;
+  }
+
+  function rdProgressPercent(t: FileTransfer): number {
+    if (t.totalSize <= 0) return 0;
+    return Math.min(100, Math.round((t.doneBytes / t.totalSize) * 100));
+  }
+
   function toggleViewerExpanded() {
     viewerExpanded = !viewerExpanded;
     revealViewerControls();
@@ -3025,8 +3133,123 @@
       {/if}
     </section>
 
-    <!-- ── Vidéo : visible dès qu'une session est ACTIVE (l'agent a accepté) ── -->
-    {#if activeSession && activeSession.status === "ACTIVE"}
+    <!-- ── Session active : menu Écran / Fichier / Chat ─────────────── -->
+    {#if activeSession && activeSession.status === "ACTIVE" && !selectedFeature}
+      <section class="rd-panel">
+        <header class="rd-session-menu__head">
+          <div>
+            <h2 class="rd-panel__title">
+              <span class="rd-icon">🔗</span>
+              Session établie avec
+              <strong class="rd-viewer__peer">{activeSession.agentMachineId}</strong>
+            </h2>
+            <p class="rd-viewer__sub">Choisis quelle fonctionnalité utiliser. La vidéo ne démarre que si tu cliques "Écran".</p>
+          </div>
+          <button
+            class="rd-viewer__disconnect"
+            type="button"
+            onclick={() => void stopByToken()}
+            disabled={actionLoading}>
+            Déconnecter
+          </button>
+        </header>
+
+        <div class="rd-features">
+          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "screen"; }}>
+            <span class="rd-feature__icon">🖥</span>
+            <strong>Écran</strong>
+            <span class="rd-feature__hint">Voir et contrôler le bureau distant</span>
+          </button>
+          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "files"; }}>
+            <span class="rd-feature__icon">📄</span>
+            <strong>Transfert de fichiers</strong>
+            <span class="rd-feature__hint">Envoyer/recevoir sans afficher l'écran</span>
+          </button>
+          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "chat"; }}>
+            <span class="rd-feature__icon">💬</span>
+            <strong>Chat</strong>
+            <span class="rd-feature__hint">Échanger des messages</span>
+          </button>
+        </div>
+      </section>
+    {/if}
+
+    <!-- ── Sous-panneau "Transfert de fichiers" (sans écran) ─────────── -->
+    {#if activeSession && activeSession.status === "ACTIVE" && selectedFeature === "files"}
+      <section class="rd-panel">
+        <header class="rd-session-menu__head">
+          <div>
+            <h2 class="rd-panel__title"><span class="rd-icon">📄</span> Transfert de fichiers</h2>
+            <p class="rd-viewer__sub">
+              Vidéo désactivée — toute la bande passante est dédiée au transfert.
+              {#if fileChannelOpen}Canal P2P ouvert{:else}Canal en attente…{/if}
+            </p>
+          </div>
+          <div class="rd-viewer__actions">
+            <button class="rd-viewer__btn" type="button" onclick={() => { selectedFeature = null; }}>← Menu</button>
+            <button
+              class="rd-viewer__btn"
+              type="button"
+              onclick={rdTriggerFilePicker}
+              disabled={!fileChannelOpen}>📤 Envoyer fichier</button>
+            <button
+              class="rd-viewer__disconnect"
+              type="button"
+              onclick={() => void stopByToken()}
+              disabled={actionLoading}>Déconnecter</button>
+          </div>
+        </header>
+        <input bind:this={rdFileInputEl} type="file" multiple style="display:none" onchange={rdHandleFilePicked} />
+        {#if Object.keys(fileTransfers).length === 0}
+          <p class="rd-empty">Aucun transfert pour l'instant. Clique "Envoyer fichier" pour démarrer.</p>
+        {:else}
+          <div class="rd-transfers" style="margin-top: 0;">
+            {#each Object.values(fileTransfers).sort((a, b) => b.startedAt - a.startedAt) as t (t.transferId)}
+              <article class="rd-transfer rd-transfer--{t.state}">
+                <div class="rd-transfer__icon">{t.type === "upload" ? "📤" : "📥"}</div>
+                <div class="rd-transfer__body">
+                  <div class="rd-transfer__line">
+                    <strong class="rd-transfer__name">{t.fileName}</strong>
+                    <span class="rd-transfer__meta">
+                      {rdFormatBytes(t.doneBytes)} / {rdFormatBytes(t.totalSize)}
+                      {#if t.state === "active"}&nbsp;•&nbsp; {rdProgressPercent(t)}%{/if}
+                    </span>
+                  </div>
+                  <div class="rd-transfer__bar">
+                    <div class="rd-transfer__bar-fill" style="width: {rdProgressPercent(t)}%"></div>
+                  </div>
+                  {#if t.state === "error"}<p class="rd-transfer__error">Erreur : {t.error ?? "inconnue"}</p>{/if}
+                  {#if t.state === "complete"}<p class="rd-transfer__done">{t.type === "upload" ? "Envoyé" : "Reçu"}</p>{/if}
+                </div>
+                {#if t.state !== "active"}
+                  <button class="rd-transfer__close" type="button" onclick={() => rdDismissTransfer(t.transferId)}>×</button>
+                {/if}
+              </article>
+            {/each}
+          </div>
+        {/if}
+      </section>
+    {/if}
+
+    <!-- ── Sous-panneau "Chat" (sans écran) ────────────────────────── -->
+    {#if activeSession && activeSession.status === "ACTIVE" && selectedFeature === "chat"}
+      <section class="rd-panel">
+        <header class="rd-session-menu__head">
+          <div>
+            <h2 class="rd-panel__title"><span class="rd-icon">💬</span> Chat</h2>
+            <p class="rd-viewer__sub">Vidéo désactivée pour économiser la bande passante.</p>
+          </div>
+          <div class="rd-viewer__actions">
+            <button class="rd-viewer__btn" type="button" onclick={() => { selectedFeature = null; }}>← Menu</button>
+            <button class="rd-viewer__disconnect" type="button" onclick={() => void stopByToken()} disabled={actionLoading}>Déconnecter</button>
+          </div>
+        </header>
+        <p class="rd-empty">Module chat — utilise le canal STOMP existant (WIP).</p>
+      </section>
+    {/if}
+
+    <!-- ── Sous-panneau "Écran" : vidéo + Play/Pause ──────────────── -->
+    {#if activeSession && activeSession.status === "ACTIVE" && selectedFeature === "screen"}
       <section class="rd-panel rd-viewer">
         <header class="rd-viewer__head">
           <h2 class="rd-panel__title">
@@ -3079,10 +3302,64 @@
             </div>
           {/if}
 
+          <!-- Overlay "transfert en cours" pendant que les frames sont coupées -->
+          {#if rdVideoPausedForTransfer}
+            <div class="rd-viewer__transfer-overlay">
+              <span class="rd-spinner"></span>
+              <p>Transfert de fichier en cours — émission de frames suspendue côté agent.</p>
+            </div>
+          {:else if !rdScreenPlayRequested}
+            <div class="rd-viewer__transfer-overlay">
+              <button class="rd-viewer__big-play" type="button" onclick={rdPlayScreen}>
+                <span class="rd-viewer__big-play-icon">▶</span>
+                <span>Démarrer la diffusion</span>
+              </button>
+              <p>L'agent ne capture rien tant que tu n'as pas cliqué Play.</p>
+            </div>
+          {/if}
+
           <!-- Barre flottante d'actions (transparente, fade-in au survol) -->
           <div
             class="rd-viewer__floating-actions"
-            class:visible={viewerControlsVisible || !viewerRemoteStream}>
+            class:visible={viewerControlsVisible || !viewerRemoteStream || !rdScreenPlayRequested}>
+            <button
+              class="rd-viewer__fab"
+              type="button"
+              onclick={() => { selectedFeature = null; }}
+              title="Retour au menu">
+              <span class="rd-viewer__fab-icon">←</span>
+              <span class="rd-viewer__fab-label">Menu</span>
+            </button>
+            {#if rdScreenPlayRequested}
+              <button
+                class="rd-viewer__fab"
+                type="button"
+                onclick={rdPauseScreen}
+                disabled={rdVideoPausedForTransfer}
+                title="Suspendre l'émission des frames">
+                <span class="rd-viewer__fab-icon">⏸</span>
+                <span class="rd-viewer__fab-label">Pause</span>
+              </button>
+            {:else}
+              <button
+                class="rd-viewer__fab rd-viewer__fab--accent"
+                type="button"
+                onclick={rdPlayScreen}
+                disabled={rdVideoPausedForTransfer}
+                title="Démarrer l'émission de frames">
+                <span class="rd-viewer__fab-icon">▶</span>
+                <span class="rd-viewer__fab-label">Play</span>
+              </button>
+            {/if}
+            <button
+              class="rd-viewer__fab"
+              type="button"
+              onclick={rdTriggerFilePicker}
+              disabled={!fileChannelOpen}
+              title={fileChannelOpen ? "Envoyer un fichier" : "Canal fichier non disponible"}>
+              <span class="rd-viewer__fab-icon">📤</span>
+              <span class="rd-viewer__fab-label">Fichier</span>
+            </button>
             <button
               class="rd-viewer__fab"
               type="button"
@@ -3112,6 +3389,59 @@
             </button>
           </div>
         </div>
+
+        <!-- Input fichier caché (déclenché par le bouton flottant) -->
+        <input
+          bind:this={rdFileInputEl}
+          type="file"
+          multiple
+          style="display:none"
+          onchange={rdHandleFilePicked} />
+
+        <!-- Panneau de transferts : visible dès qu'il y a au moins un transfer -->
+        {#if Object.keys(fileTransfers).length > 0}
+          <div class="rd-transfers">
+            <div class="rd-transfers__head">
+              <strong>Transferts de fichiers</strong>
+              <span class="rd-transfers__hint">
+                {fileChannelOpen ? "Canal P2P ouvert" : "Canal en attente…"}
+              </span>
+            </div>
+            {#each Object.values(fileTransfers).sort((a, b) => b.startedAt - a.startedAt) as t (t.transferId)}
+              <article class="rd-transfer rd-transfer--{t.state}">
+                <div class="rd-transfer__icon">
+                  {t.type === "upload" ? "📤" : "📥"}
+                </div>
+                <div class="rd-transfer__body">
+                  <div class="rd-transfer__line">
+                    <strong class="rd-transfer__name">{t.fileName}</strong>
+                    <span class="rd-transfer__meta">
+                      {rdFormatBytes(t.doneBytes)} / {rdFormatBytes(t.totalSize)}
+                      {#if t.state === "active"}&nbsp;•&nbsp; {rdProgressPercent(t)}%{/if}
+                    </span>
+                  </div>
+                  <div class="rd-transfer__bar">
+                    <div class="rd-transfer__bar-fill" style="width: {rdProgressPercent(t)}%"></div>
+                  </div>
+                  {#if t.state === "error"}
+                    <p class="rd-transfer__error">Erreur : {t.error ?? "inconnue"}</p>
+                  {:else if t.state === "complete"}
+                    <p class="rd-transfer__done">
+                      {t.type === "upload" ? "Envoyé à l'autre PC" : "Reçu et téléchargé"}
+                    </p>
+                  {/if}
+                </div>
+                {#if t.state !== "active"}
+                  <button
+                    class="rd-transfer__close"
+                    type="button"
+                    onclick={() => rdDismissTransfer(t.transferId)}
+                    title="Retirer de la liste">×</button>
+                {/if}
+              </article>
+            {/each}
+          </div>
+        {/if}
 
         {#if screenFrameError}
           <p class="rd-connect__status rd-connect__status--error">{screenFrameError}</p>
@@ -4523,6 +4853,101 @@
     bottom: 28px;
   }
 
+  /* Overlay "vidéo en pause pour transfert" */
+  .rd-viewer__transfer-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(13, 17, 23, 0.85);
+    backdrop-filter: blur(4px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    color: #cbd5e1;
+    font-size: 14px;
+    text-align: center;
+    padding: 24px;
+    z-index: 5;
+  }
+  .rd-viewer__transfer-overlay p { margin: 0; max-width: 420px; line-height: 1.5; }
+
+  /* Panneau de transferts (sous la vidéo) */
+  .rd-transfers {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .rd-transfers__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: #cbd5e1;
+    font-size: 13px;
+  }
+  .rd-transfers__hint { color: #64748b; font-size: 12px; }
+  .rd-transfer {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 10px 14px;
+    position: relative;
+  }
+  .rd-transfer--complete { border-color: rgba(74, 222, 128, 0.35); }
+  .rd-transfer--error { border-color: rgba(239, 68, 68, 0.4); }
+  .rd-transfer__icon {
+    width: 32px; height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    border-radius: 8px;
+    background: rgba(56, 189, 248, 0.12);
+    flex-shrink: 0;
+  }
+  .rd-transfer__body { flex: 1; min-width: 0; }
+  .rd-transfer__line {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .rd-transfer__name { color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rd-transfer__meta { color: #94a3b8; font-size: 12px; flex-shrink: 0; }
+  .rd-transfer__bar {
+    height: 4px;
+    background: rgba(56, 189, 248, 0.12);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .rd-transfer__bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #38bdf8, #4ade80);
+    transition: width 0.2s ease;
+  }
+  .rd-transfer--complete .rd-transfer__bar-fill { background: #4ade80; }
+  .rd-transfer--error .rd-transfer__bar-fill { background: #ef4444; }
+  .rd-transfer__error { margin: 6px 0 0 0; font-size: 12px; color: #fca5a5; }
+  .rd-transfer__done { margin: 6px 0 0 0; font-size: 12px; color: #4ade80; }
+  .rd-transfer__close {
+    position: absolute;
+    top: 6px; right: 8px;
+    width: 22px; height: 22px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    font-size: 18px;
+    cursor: pointer;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .rd-transfer__close:hover { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+
   /* Responsive : sur petit écran on cache le label, on garde l'icône */
   @media (max-width: 600px) {
     .rd-viewer__fab-label { display: none; }
@@ -4576,6 +5001,87 @@
     gap: 14px;
     color: #94a3b8;
     font-size: 13px;
+  }
+
+  /* ── Menu post-connexion (3 cartes) ─────────────────────────────── */
+  .rd-session-menu__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .rd-features {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  @media (max-width: 720px) {
+    .rd-features { grid-template-columns: 1fr; }
+  }
+  .rd-feature {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 22px 20px;
+    cursor: pointer;
+    text-align: left;
+    color: #e2e8f0;
+    transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  }
+  .rd-feature:hover {
+    background: #0f1620;
+    border-color: rgba(56, 189, 248, 0.4);
+    transform: translateY(-1px);
+  }
+  .rd-feature__icon {
+    font-size: 28px;
+    line-height: 1;
+    width: 48px; height: 48px;
+    border-radius: 10px;
+    background: rgba(56, 189, 248, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 4px;
+  }
+  .rd-feature strong { font-size: 16px; color: #fff; }
+  .rd-feature__hint { font-size: 12px; color: #94a3b8; }
+
+  /* ── Bouton Play central (overlay quand pas encore Play) ────────── */
+  .rd-viewer__big-play {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    background: rgba(56, 189, 248, 0.15);
+    border: 1px solid rgba(56, 189, 248, 0.5);
+    border-radius: 16px;
+    padding: 22px 36px;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.15s;
+  }
+  .rd-viewer__big-play:hover {
+    background: rgba(56, 189, 248, 0.25);
+    transform: scale(1.03);
+  }
+  .rd-viewer__big-play-icon { font-size: 36px; line-height: 1; }
+
+  .rd-viewer__fab--accent {
+    background: rgba(56, 189, 248, 0.18);
+    border-color: rgba(56, 189, 248, 0.5);
+    color: #38bdf8;
+  }
+  .rd-viewer__fab--accent:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.3);
+    color: #fff;
   }
 
   /* ═══════════════════════════════════════════════════════════════

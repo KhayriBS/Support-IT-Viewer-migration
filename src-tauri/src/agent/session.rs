@@ -738,6 +738,17 @@ async fn dispatch_signals(
                 if let Some(pc) = webrtc.as_ref() {
                     pc.set_stream_profile(profile);
 
+                    // Champ optionnel `paused` : suspend/reprend toute émission
+                    // de frame pendant un transfert de fichier.
+                    if let Some(paused) = msg
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("paused"))
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        pc.set_frame_emission_paused(paused);
+                    }
+
                     if let Some(bitrate_bps) = msg
                         .payload
                         .as_ref()

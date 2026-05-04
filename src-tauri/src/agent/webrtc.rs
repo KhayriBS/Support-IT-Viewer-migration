@@ -669,6 +669,12 @@ pub struct AgentWebRtc {
     bitrate_override_tx: watch::Sender<Option<u32>>,
     fps_tier_override_tx: watch::Sender<Option<FpsTier>>,
     activity_state: Arc<StreamingActivityState>,
+    /// Flag basculé via STREAM_PROFILE payload `{ paused: true }` pour
+    /// suspendre complètement la capture+encodage+envoi RTP. Quand `true`,
+    /// les boucles de capture des trois encodeurs (OpenH264 / Media Foundation /
+    /// FFmpeg) court-circuitent toute production de frame — bande passante
+    /// vidéo nulle, le DataChannel SCTP a la pipe pour lui seul.
+    frame_emission_paused: Arc<AtomicBool>,
     pending_remote_ice: Mutex<Vec<RTCIceCandidateInit>>,
 }
 
@@ -1378,9 +1384,15 @@ impl AgentWebRtc {
 
         let activity_state = Arc::new(StreamingActivityState::default());
         let activity_for_channel = Arc::clone(&activity_state);
+        // Démarre PAUSÉ : aucune frame n'est émise tant que le viewer n'a pas
+        // explicitement cliqué Play (envoi VIDEO_RESUME via DataChannel input).
+        // Le viewer choisit d'abord Écran/Fichier/Chat depuis le menu de session.
+        let frame_emission_paused = Arc::new(AtomicBool::new(true));
+        let frame_emission_paused_for_channel = Arc::clone(&frame_emission_paused);
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_handler = Arc::clone(&input_handler);
             let activity_for_channel = Arc::clone(&activity_for_channel);
+            let frame_emission_paused = Arc::clone(&frame_emission_paused_for_channel);
             Box::pin(async move {
                 let label = channel.label().to_string();
                 println!("DataChannel recu: {label}");
@@ -1402,21 +1414,52 @@ impl AgentWebRtc {
 
                 if label == "input" {
                     let message_label = label.clone();
+                    let frame_emission_paused = Arc::clone(&frame_emission_paused);
                     channel.on_message(Box::new(move |msg: DataChannelMessage| {
                         let input_handler = Arc::clone(&input_handler);
                         let message_label = message_label.clone();
                         let activity_for_channel = Arc::clone(&activity_for_channel);
+                        let frame_emission_paused = Arc::clone(&frame_emission_paused);
                         Box::pin(async move {
                             if !msg.is_string {
                                 return;
                             }
 
-                            activity_for_channel.mark_input_activity();
-
                             let Ok(message) = String::from_utf8(msg.data.to_vec()) else {
                                 eprintln!("Message DataChannel invalide sur {message_label}");
                                 return;
                             };
+
+                            // Messages de contrôle vidéo : court-circuitent
+                            // l'input handler. Format JSON :
+                            //   { "type": "VIDEO_PAUSE" }   → suspend l'émission
+                            //   { "type": "VIDEO_RESUME" }  → reprend l'émission
+                            // Passent par le DataChannel input (P2P) plutôt que
+                            // par le signaling WebSocket qui est souvent fermé
+                            // (1003) après l'OFFER/ANSWER sur Render free-tier.
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) {
+                                if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
+                                    match t {
+                                        "VIDEO_PAUSE" => {
+                                            let was = frame_emission_paused.swap(true, Ordering::AcqRel);
+                                            if !was {
+                                                println!("🎬 Frame emission PAUSED (viewer request)");
+                                            }
+                                            return;
+                                        }
+                                        "VIDEO_RESUME" => {
+                                            let was = frame_emission_paused.swap(false, Ordering::AcqRel);
+                                            if was {
+                                                println!("🎬 Frame emission RESUMED (viewer request)");
+                                            }
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            activity_for_channel.mark_input_activity();
 
                             if !allow_remote_input {
                                 println!("Input distant ignore (lecture seule)");
@@ -1497,12 +1540,27 @@ impl AgentWebRtc {
             bitrate_override_tx,
             fps_tier_override_tx,
             activity_state,
+            frame_emission_paused,
             pending_remote_ice: Mutex::new(Vec::new()),
         })
     }
 
     pub fn set_stream_profile(&self, profile: StreamQualityProfile) {
         let _ = self.stream_profile_tx.send(profile);
+    }
+
+    /// Suspend ou reprend l'émission de frames vidéo. Utilisé par le viewer
+    /// pendant un transfert de fichier pour libérer toute la bande passante
+    /// du canal P2P au profit du DataChannel SCTP.
+    pub fn set_frame_emission_paused(&self, paused: bool) {
+        let was = self.frame_emission_paused.swap(paused, Ordering::AcqRel);
+        if was != paused {
+            println!(
+                "🎬 Frame emission {} (was {})",
+                if paused { "PAUSED" } else { "RESUMED" },
+                if was { "paused" } else { "running" }
+            );
+        }
     }
 
     pub fn adjust_bitrate(&self, bitrate: u32) {
@@ -1645,6 +1703,7 @@ impl AgentWebRtc {
         let bitrate_override_rx = self.bitrate_override_tx.subscribe();
         let fps_tier_override_rx = self.fps_tier_override_tx.subscribe();
         let activity_state = Arc::clone(&self.activity_state);
+        let frame_emission_paused = Arc::clone(&self.frame_emission_paused);
 
         tokio::spawn(async move {
             let selection = VideoEncoderSelection::resolve();
@@ -1667,6 +1726,7 @@ impl AgentWebRtc {
                         bitrate_override_rx.clone(),
                         fps_tier_override_rx.clone(),
                         Arc::clone(&activity_state),
+                        Arc::clone(&frame_emission_paused),
                     )
                     .await
                 }
@@ -1681,6 +1741,7 @@ impl AgentWebRtc {
                         bitrate_override_rx.clone(),
                         fps_tier_override_rx.clone(),
                         Arc::clone(&activity_state),
+                        Arc::clone(&frame_emission_paused),
                     )
                     .await
                     {
@@ -1699,6 +1760,7 @@ impl AgentWebRtc {
                                 bitrate_override_rx.clone(),
                                 fps_tier_override_rx.clone(),
                                 Arc::clone(&activity_state),
+                                Arc::clone(&frame_emission_paused),
                             )
                             .await
                         }
@@ -1711,6 +1773,7 @@ impl AgentWebRtc {
                         &track,
                         backend,
                         selection.preset,
+                        Arc::clone(&frame_emission_paused),
                     )
                     .await
                     {
@@ -1730,6 +1793,7 @@ impl AgentWebRtc {
                                 bitrate_override_rx.clone(),
                                 fps_tier_override_rx.clone(),
                                 Arc::clone(&activity_state),
+                                Arc::clone(&frame_emission_paused),
                             )
                             .await
                         }
@@ -1999,6 +2063,7 @@ async fn run_openh264_screen_sender(
     mut bitrate_override_rx: watch::Receiver<Option<u32>>,
     mut fps_tier_override_rx: watch::Receiver<Option<FpsTier>>,
     activity_state: Arc<StreamingActivityState>,
+    frame_emission_paused: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let initial_profile = *stream_profile_rx.borrow();
     let initial_config = profile_target_for_preset(initial_profile, preset);
@@ -2021,6 +2086,7 @@ async fn run_openh264_screen_sender(
     let capture_peer = Arc::clone(peer);
     let capture_track = Arc::clone(track);
     let capture_cfg_rx = adaptive_rx.clone();
+    let capture_paused = Arc::clone(&frame_emission_paused);
     let capture_task = tokio::spawn(async move {
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
@@ -2043,6 +2109,15 @@ async fn run_openh264_screen_sender(
             match capture_peer.connection_state() {
                 RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
                 _ => {}
+            }
+
+            // Pause demandée par le viewer (transfert de fichier en cours).
+            // On dort sans capturer ni encoder ni envoyer → bande passante
+            // vidéo strictement nulle, le DataChannel a la pipe pour lui seul.
+            if capture_paused.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                next_capture_deadline = Instant::now() + frame_interval_for_target_fps(capture_config.target_fps);
+                continue;
             }
 
             if !stream_is_ready(&capture_peer, &capture_track).await {
@@ -2484,6 +2559,7 @@ async fn run_media_foundation_screen_sender(
     mut bitrate_override_rx: watch::Receiver<Option<u32>>,
     mut fps_tier_override_rx: watch::Receiver<Option<FpsTier>>,
     activity_state: Arc<StreamingActivityState>,
+    frame_emission_paused: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let initial_profile = *stream_profile_rx.borrow();
     let initial_config = profile_target_for_preset(initial_profile, preset);
@@ -2506,6 +2582,7 @@ async fn run_media_foundation_screen_sender(
     let capture_peer = Arc::clone(peer);
     let capture_track = Arc::clone(track);
     let capture_cfg_rx = adaptive_rx.clone();
+    let capture_paused = Arc::clone(&frame_emission_paused);
     let capture_task = tokio::spawn(async move {
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
@@ -2528,6 +2605,13 @@ async fn run_media_foundation_screen_sender(
             match capture_peer.connection_state() {
                 RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
                 _ => {}
+            }
+
+            // Pause demandée par le viewer (transfert en cours).
+            if capture_paused.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                next_capture_deadline = Instant::now() + frame_interval_for_target_fps(capture_config.target_fps);
+                continue;
             }
 
             if !stream_is_ready(&capture_peer, &capture_track).await {
@@ -3037,6 +3121,7 @@ async fn run_ffmpeg_rtp_screen_sender(
     track: &Arc<TrackLocalStaticRTP>,
     backend: VideoEncoderBackend,
     preset: VideoEncoderPreset,
+    frame_emission_paused: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let frame_interval = frame_interval_for(preset);
     #[cfg(windows)]
@@ -3056,6 +3141,13 @@ async fn run_ffmpeg_rtp_screen_sender(
         match peer.connection_state() {
             RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
             _ => {}
+        }
+
+        // Pause demandée par le viewer (transfert en cours).
+        if frame_emission_paused.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            next_capture_deadline = Instant::now() + frame_interval;
+            continue;
         }
 
         if !stream_is_ready(peer, track).await {
