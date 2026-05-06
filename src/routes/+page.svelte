@@ -379,6 +379,8 @@
   let viewerControlsVisible = $state(true);
   let viewerExpanded = $state(false);
   let viewerFullscreenActive = $state(false);
+  // Side-panel chat over video — visible only on the screen sub-panel.
+  let viewerChatPanelOpen = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
   // Metered "global.relay" static credentials (account: lumieretech).
@@ -3616,6 +3618,18 @@
             </button>
             <button
               class="rd-viewer__fab"
+              class:rd-viewer__fab--accent={viewerChatPanelOpen}
+              type="button"
+              onclick={() => {
+                viewerChatPanelOpen = !viewerChatPanelOpen;
+                if (viewerChatPanelOpen) void connectChat();
+              }}
+              title={viewerChatPanelOpen ? "Fermer le chat" : "Ouvrir le chat"}>
+              <span class="rd-viewer__fab-icon">💬</span>
+              <span class="rd-viewer__fab-label">Chat</span>
+            </button>
+            <button
+              class="rd-viewer__fab"
               type="button"
               onclick={() => void enterViewerFullscreen()}
               disabled={!viewerRemoteStream || viewerFullscreenActive}
@@ -3642,6 +3656,66 @@
               <span class="rd-viewer__fab-label">Déconnecter</span>
             </button>
           </div>
+
+          <!-- Sidebar Chat : flotte sur la vidéo, vidéo continue de tourner -->
+          {#if viewerChatPanelOpen}
+            <aside class="rd-viewer__chat-side">
+              <header class="rd-viewer__chat-side-head">
+                <strong>💬 Chat</strong>
+                <span class="rd-chat__pill" class:rd-chat__pill--ok={chatConnected} class:rd-chat__pill--warn={!chatConnected}>
+                  {chatConnected ? "Connecté" : "Hors ligne"}
+                </span>
+                <button
+                  class="rd-viewer__chat-side-close"
+                  type="button"
+                  onclick={() => { viewerChatPanelOpen = false; }}
+                  title="Fermer">×</button>
+              </header>
+              <div class="rd-chat__list rd-viewer__chat-side-list" bind:this={chatListEl}>
+                {#if chatMessages.length === 0}
+                  <p class="rd-empty">Aucun message. Envoie le premier&nbsp;!</p>
+                {:else}
+                  {#each chatMessages as msg (msgKey(msg))}
+                    {@const mine = (msg.senderRole ?? msg.senderName) === chatLocalRole}
+                    <div class="rd-chat__row" class:rd-chat__row--mine={mine}>
+                      <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine}>
+                        <div class="rd-chat__meta">
+                          <span class="rd-chat__sender">{mine ? "Moi" : (msg.senderName === "agent" ? "PC distant" : "Technicien")}</span>
+                          <span class="rd-chat__ts">{new Date(msg.timestamp).toLocaleTimeString()}</span>
+                        </div>
+                        <p class="rd-chat__text">{msg.content}</p>
+                      </div>
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+              {#if typingInfo && typingInfo.senderRole !== chatLocalRole}
+                <p class="rd-chat__typing">
+                  <span class="rd-chat__typing-dot"></span>
+                  <span class="rd-chat__typing-dot"></span>
+                  <span class="rd-chat__typing-dot"></span>
+                  <span>{typingInfo.senderRole === "agent" ? "PC distant" : "Technicien"} écrit…</span>
+                </p>
+              {/if}
+              <div class="rd-chat__compose rd-viewer__chat-side-compose">
+                <input
+                  class="rd-chat__input"
+                  type="text"
+                  placeholder="Message…"
+                  bind:value={chatInput}
+                  onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
+                  oninput={dispatchChatTyping}
+                />
+                <button
+                  class="rd-chat__send"
+                  type="button"
+                  onclick={() => void sendChatMessage()}
+                  disabled={!chatInput.trim()}>
+                  →
+                </button>
+              </div>
+            </aside>
+          {/if}
         </div>
 
         <!-- Input fichier caché (déclenché par le bouton flottant) -->
@@ -6385,6 +6459,94 @@
   }
   .rd-chat__send:hover:not(:disabled) { background: #7dd3fc; }
   .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Chat sidebar par-dessus la vidéo ───────────────────────────── */
+  .rd-viewer__chat-side {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: 340px;
+    max-width: calc(100% - 24px);
+    background: rgba(13, 17, 23, 0.92);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    display: flex;
+    flex-direction: column;
+    z-index: 12;
+    overflow: hidden;
+    animation: rd-chat-slide-in 0.18s ease-out;
+  }
+  @keyframes rd-chat-slide-in {
+    from { transform: translateX(20px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+  .rd-viewer__chat-side-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  .rd-viewer__chat-side-head strong { flex: 0 0 auto; }
+  .rd-viewer__chat-side-head .rd-chat__pill { margin: 0 auto 0 0; }
+  .rd-viewer__chat-side-close {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #cbd5e1;
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    padding: 0;
+    transition: background 0.15s, color 0.15s;
+  }
+  .rd-viewer__chat-side-close:hover {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fff;
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  .rd-viewer__chat-side-list {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    padding: 12px;
+  }
+  .rd-viewer__chat-side-compose {
+    margin: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(56, 189, 248, 0.18);
+    gap: 8px;
+  }
+  .rd-viewer__chat-side-compose .rd-chat__send { padding: 8px 14px; font-size: 16px; }
+
+  /* En plein écran, la sidebar reste collée à droite */
+  .rd-viewer__stage:fullscreen .rd-viewer__chat-side,
+  .rd-viewer__stage:-webkit-full-screen .rd-viewer__chat-side {
+    top: 20px;
+    right: 20px;
+    bottom: 20px;
+    width: 360px;
+  }
+
+  @media (max-width: 720px) {
+    .rd-viewer__chat-side {
+      width: auto;
+      left: 12px;
+      right: 12px;
+      top: auto;
+      height: 60%;
+    }
+  }
 </style>
 
 
