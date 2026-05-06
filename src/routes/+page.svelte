@@ -88,40 +88,87 @@
   function startInboundStatsLogger(pc: RTCPeerConnection) {
     stopInboundStatsLogger();
     let lastBytes = 0;
-    let lastFrames = 0;
+    let lastFramesDecoded = 0;
+    let lastPacketsReceived = 0;
+    let lastPacketsLost = 0;
+    let lastTs = performance.now();
+
     inboundStatsTimer = setInterval(async () => {
       try {
         const stats = await pc.getStats();
+        const now = performance.now();
+        const elapsedSec = Math.max(0.001, (now - lastTs) / 1000);
+        let foundInbound = false;
+        let nominatedRttMs: number | null = null;
+
         stats.forEach((s) => {
           if (s.type === "inbound-rtp" && (s as RTCInboundRtpStreamStats).kind === "video") {
+            foundInbound = true;
             const r = s as RTCInboundRtpStreamStats & {
               bytesReceived?: number;
               framesReceived?: number;
               framesDecoded?: number;
               framesDropped?: number;
+              packetsReceived?: number;
               packetsLost?: number;
               jitter?: number;
+              frameWidth?: number;
+              frameHeight?: number;
             };
             const bytes = r.bytesReceived ?? 0;
-            const frames = r.framesReceived ?? 0;
-            diag("inbound-rtp video", {
-              bytesReceived: bytes,
-              deltaBytes: bytes - lastBytes,
-              framesReceived: frames,
-              deltaFrames: frames - lastFrames,
-              framesDecoded: r.framesDecoded ?? 0,
-              framesDropped: r.framesDropped ?? 0,
-              packetsLost: r.packetsLost ?? 0,
-              jitter: r.jitter ?? 0
-            });
+            const framesDecoded = r.framesDecoded ?? 0;
+            const packetsReceived = r.packetsReceived ?? 0;
+            const packetsLost = r.packetsLost ?? 0;
+
+            const deltaBytes = Math.max(0, bytes - lastBytes);
+            const deltaFramesDecoded = Math.max(0, framesDecoded - lastFramesDecoded);
+            const deltaPacketsReceived = Math.max(0, packetsReceived - lastPacketsReceived);
+            const deltaPacketsLost = Math.max(0, packetsLost - lastPacketsLost);
+
+            // Mbps = (octets * 8) / 1_000_000 / dt
+            viewerLocalMbps = (deltaBytes * 8) / 1_000_000 / elapsedSec;
+            viewerLocalFps = deltaFramesDecoded / elapsedSec;
+
+            const totalPackets = deltaPacketsReceived + deltaPacketsLost;
+            viewerLocalLossPct = totalPackets > 0 ? (deltaPacketsLost / totalPackets) * 100 : 0;
+            viewerLocalJitterMs = (r.jitter ?? 0) * 1000;
+            viewerLocalFramesDropped = r.framesDropped ?? 0;
+
+            if (r.frameWidth && r.frameHeight) {
+              viewerLocalResolution = `${r.frameWidth}×${r.frameHeight}`;
+            }
+
             lastBytes = bytes;
-            lastFrames = frames;
+            lastFramesDecoded = framesDecoded;
+            lastPacketsReceived = packetsReceived;
+            lastPacketsLost = packetsLost;
+          }
+
+          // RTT depuis la paire ICE nominée (la seule qui transporte vraiment les médias)
+          if (s.type === "candidate-pair") {
+            const p = s as RTCIceCandidatePairStats & {
+              nominated?: boolean;
+              currentRoundTripTime?: number;
+            };
+            if (p.nominated && p.state === "succeeded" && typeof p.currentRoundTripTime === "number") {
+              nominatedRttMs = p.currentRoundTripTime * 1000;
+            }
           }
         });
+
+        if (nominatedRttMs !== null) viewerLocalRttMs = nominatedRttMs;
+
+        if (!foundInbound) {
+          // Aucune piste vidéo entrante → tout retomber à zéro pour pas afficher de fantôme
+          viewerLocalMbps = 0;
+          viewerLocalFps = 0;
+        }
+
+        lastTs = now;
       } catch (err) {
         diag("getStats failed", String(err));
       }
-    }, 2000);
+    }, 1000);
   }
   function stopInboundStatsLogger() {
     if (inboundStatsTimer) {
@@ -412,6 +459,17 @@
   let viewerIceServers = $state<RTCIceServer[]>(defaultViewerIceServers);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
+  // ── Stats locales calculées depuis pc.getStats() (mises à jour 1×/s) ──
+  // (On garde aussi viewerStreamMbps/Fps qui viennent de STREAM_STATS via
+  // signaling, mais ces locales sont plus fiables car peer-to-peer pure.)
+  let viewerLocalFps = $state<number | null>(null);
+  let viewerLocalMbps = $state<number | null>(null);
+  let viewerLocalRttMs = $state<number | null>(null);
+  let viewerLocalLossPct = $state<number | null>(null);
+  let viewerLocalJitterMs = $state<number | null>(null);
+  let viewerLocalResolution = $state<string | null>(null);
+  let viewerLocalFramesDropped = $state<number | null>(null);
+  let viewerStatsBarVisible = $state(true);
   let viewerPlaybackProfile = $state<"responsive" | "quality">("responsive");
   let viewerFpsTier = $state<"auto" | "idle" | "normal" | "active">("auto");
   let viewerBitrateTier = $state<"auto" | "poor" | "medium" | "good">("auto");
@@ -2085,6 +2143,13 @@
     viewerRemoteHeight = 1080;
     viewerStreamMbps = null;
     viewerStreamFps = null;
+    viewerLocalFps = null;
+    viewerLocalMbps = null;
+    viewerLocalRttMs = null;
+    viewerLocalLossPct = null;
+    viewerLocalJitterMs = null;
+    viewerLocalResolution = null;
+    viewerLocalFramesDropped = null;
     viewerFpsTier = "auto";
     viewerBitrateTier = "auto";
     viewerPreset = "balanced";
@@ -3572,6 +3637,62 @@
               </button>
               <p>Émission suspendue. Clique pour la reprendre.</p>
             </div>
+          {/if}
+
+          <!-- Barre flottante télémétrie : FPS, Mbps, RTT, perte, etc. -->
+          {#if viewerStatsBarVisible && viewerRemoteStream}
+            <div class="rd-viewer__stats-bar">
+              <div class="rd-stats__cell" title="Images par seconde décodées">
+                <span class="rd-stats__icon">🎞</span>
+                <span class="rd-stats__num">{viewerLocalFps !== null ? viewerLocalFps.toFixed(0) : "--"}</span>
+                <span class="rd-stats__unit">FPS</span>
+              </div>
+              <div class="rd-stats__cell" title="Débit vidéo entrant">
+                <span class="rd-stats__icon">📶</span>
+                <span class="rd-stats__num">{viewerLocalMbps !== null ? viewerLocalMbps.toFixed(2) : "--"}</span>
+                <span class="rd-stats__unit">Mb/s</span>
+              </div>
+              <div
+                class="rd-stats__cell"
+                class:rd-stats__cell--warn={viewerLocalRttMs !== null && viewerLocalRttMs > 150}
+                class:rd-stats__cell--bad={viewerLocalRttMs !== null && viewerLocalRttMs > 300}
+                title="Latence aller-retour (ICE candidate-pair nominée)">
+                <span class="rd-stats__icon">⏱</span>
+                <span class="rd-stats__num">{viewerLocalRttMs !== null ? viewerLocalRttMs.toFixed(0) : "--"}</span>
+                <span class="rd-stats__unit">ms</span>
+              </div>
+              <div
+                class="rd-stats__cell"
+                class:rd-stats__cell--warn={viewerLocalLossPct !== null && viewerLocalLossPct > 1}
+                class:rd-stats__cell--bad={viewerLocalLossPct !== null && viewerLocalLossPct > 5}
+                title="Paquets perdus sur la dernière seconde">
+                <span class="rd-stats__icon">📉</span>
+                <span class="rd-stats__num">{viewerLocalLossPct !== null ? viewerLocalLossPct.toFixed(1) : "--"}</span>
+                <span class="rd-stats__unit">%</span>
+              </div>
+              <div class="rd-stats__cell" title="Gigue (jitter)">
+                <span class="rd-stats__icon">📊</span>
+                <span class="rd-stats__num">{viewerLocalJitterMs !== null ? viewerLocalJitterMs.toFixed(0) : "--"}</span>
+                <span class="rd-stats__unit">ms</span>
+              </div>
+              {#if viewerLocalResolution}
+                <div class="rd-stats__cell" title="Résolution de la trame reçue">
+                  <span class="rd-stats__icon">🖼</span>
+                  <span class="rd-stats__num">{viewerLocalResolution}</span>
+                </div>
+              {/if}
+              <button
+                class="rd-stats__close"
+                type="button"
+                onclick={() => { viewerStatsBarVisible = false; }}
+                title="Masquer la barre de stats">×</button>
+            </div>
+          {:else if !viewerStatsBarVisible && viewerRemoteStream}
+            <button
+              class="rd-viewer__stats-restore"
+              type="button"
+              onclick={() => { viewerStatsBarVisible = true; }}
+              title="Afficher les stats">📊</button>
           {/if}
 
           <!-- Barre flottante d'actions (transparente, fade-in au survol) -->
@@ -6459,6 +6580,101 @@
   }
   .rd-chat__send:hover:not(:disabled) { background: #7dd3fc; }
   .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Barre flottante télémétrie (top-left du stage) ─────────────── */
+  .rd-viewer__stats-bar {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: rgba(13, 17, 23, 0.7);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    border-radius: 999px;
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    color: #e2e8f0;
+    font-size: 12px;
+    font-family: "Consolas", monospace;
+    z-index: 11;
+    flex-wrap: wrap;
+    max-width: calc(100% - 24px);
+  }
+  .rd-stats__cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .rd-stats__cell--warn {
+    background: rgba(250, 204, 21, 0.12);
+    border-color: rgba(250, 204, 21, 0.4);
+    color: #facc15;
+  }
+  .rd-stats__cell--bad {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.45);
+    color: #fca5a5;
+  }
+  .rd-stats__icon { font-size: 13px; line-height: 1; opacity: 0.9; }
+  .rd-stats__num {
+    color: #fff;
+    font-weight: 600;
+    min-width: 1ch;
+  }
+  .rd-stats__cell--warn .rd-stats__num { color: #facc15; }
+  .rd-stats__cell--bad .rd-stats__num { color: #fca5a5; }
+  .rd-stats__unit { color: #94a3b8; font-size: 11px; }
+  .rd-stats__close {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #cbd5e1;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    margin-left: 2px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .rd-stats__close:hover {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fff;
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+
+  .rd-viewer__stats-restore {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: rgba(13, 17, 23, 0.7);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    color: #cbd5e1;
+    cursor: pointer;
+    font-size: 14px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 11;
+    transition: background 0.15s, color 0.15s;
+  }
+  .rd-viewer__stats-restore:hover {
+    background: rgba(56, 189, 248, 0.18);
+    color: #fff;
+  }
+
+  /* En plein écran on garde la barre stats à la même place */
+  .rd-viewer__stage:fullscreen .rd-viewer__stats-bar,
+  .rd-viewer__stage:-webkit-full-screen .rd-viewer__stats-bar { top: 18px; left: 18px; }
 
   /* ── Chat sidebar par-dessus la vidéo ───────────────────────────── */
   .rd-viewer__chat-side {
