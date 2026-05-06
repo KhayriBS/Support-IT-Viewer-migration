@@ -51,15 +51,38 @@ export class ChatRealtimeClient {
     const wsUrl = `${toWsBaseUrl(baseUrl)}/ws/chat`;
     const httpUrl = `${baseUrl}/ws/chat`;
 
+    // Charge SockJS en avance — le backend Spring expose `/ws/chat` avec
+    // `.withSockJS()` ; un upgrade WebSocket "nu" sur la même URL est routé
+    // vers le handler SockJS qui attend le protocole SockJS, ce qui donne
+    // « HORS LIGNE ». Avec SockJS-client on parle le bon protocole.
+    let sockjsCtor: (new (url: string) => WebSocket) | null = null;
+    try {
+      const mod = await import("sockjs-client");
+      sockjsCtor = (mod as { default?: new (url: string) => WebSocket }).default
+        ?? (mod as unknown as new (url: string) => WebSocket);
+    } catch (err) {
+      console.warn("[stomp] sockjs-client unavailable, falling back to native WS", err);
+    }
+
     this.client = new Client({
       reconnectDelay: 5000,
       heartbeatIncoming: 4000,
       heartbeatOutgoing: 4000,
-      // Suppress verbose STOMP debug output
-      debug: () => {},
+      // Verbose STOMP logs en dev pour diagnostiquer "HORS LIGNE"
+      debug: (msg) => {
+        if (typeof console !== "undefined") console.debug("[stomp]", msg);
+      },
 
-      // WebSocket factory (overridden below with SockJS if available)
-      webSocketFactory: () => new WebSocket(wsUrl),
+      webSocketFactory: () => {
+        if (sockjsCtor) {
+          try {
+            return new sockjsCtor(httpUrl);
+          } catch (err) {
+            console.warn("[stomp] SockJS construct failed, fallback native WS", err);
+          }
+        }
+        return new WebSocket(wsUrl);
+      },
 
       onConnect: () => {
         // Called on first connect AND after each successful reconnect.
@@ -103,23 +126,6 @@ export class ChatRealtimeClient {
         this._setState("error");
       }
     });
-
-    // Prefer SockJS (Spring-compatible); fall back to native WebSocket.
-    try {
-      const mod = await import("sockjs-client");
-      const SockJS = (mod as { default?: typeof WebSocket }).default as unknown as new (
-        url: string
-      ) => WebSocket;
-      this.client.webSocketFactory = () => {
-        try {
-          return new SockJS(httpUrl);
-        } catch {
-          return new WebSocket(wsUrl);
-        }
-      };
-    } catch {
-      // SockJS not available; native WebSocket is fine
-    }
 
     this.client.activate();
   }

@@ -469,6 +469,8 @@
   let detachChatMessageListener: (() => void) | null = null;
   let detachChatTypingListener: (() => void) | null = null;
   let detachChatConnectionListener: (() => void) | null = null;
+  let chatListEl: HTMLDivElement | null = $state(null);
+  let chatTypingDispatchTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Session approval modal
   let machineId = $state<string>("");
@@ -538,11 +540,30 @@
     void fetchSessionHistory();
   });
 
+  // Auto-scroll de la liste de chat vers le bas dès qu'un message arrive
+  // (ou que la liste change de sujet). On lit chatMessages.length pour la
+  // réactivité, puis on défile le conteneur en bas.
+  $effect(() => {
+    void chatMessages.length;
+    const el = chatListEl;
+    if (!el) return;
+    queueMicrotask(() => { el.scrollTop = el.scrollHeight; });
+  });
+
   // ── Listes filtrées dérivées ──
   // Les sessions sont déjà filtrées côté backend, on les affiche telles quelles.
   // (La recherche/filtre côté client est conservée comme fallback en attendant
   // que le fetch debounced revienne.)
   const rdFilteredSessions = $derived(rdSessionHistory);
+
+  // Local chat role: "agent" if this PC is the agent of the active session,
+  // "viewer" otherwise. Used so that chat messages from the agent side carry
+  // the right sender label and bubble alignment matches the local user.
+  const chatLocalRole = $derived.by<"agent" | "viewer">(() => {
+    const session = activeSession ?? queriedSession;
+    return session && shouldBridgeSessionToLocalAgent(session) ? "agent" : "viewer";
+  });
+  const chatRemoteRole = $derived(chatLocalRole === "agent" ? "viewer" : "agent");
 
   const rdFilteredFiles = $derived.by(() => {
     const search = rdFileSearch.trim().toLowerCase();
@@ -886,9 +907,11 @@
 
   function startChatPoll() {
     if (chatPollTimer) return; // already running
+    // Poll rapide (1.5 s) tant que STOMP n'est pas connecté, pour que les
+    // messages du pair s'affichent quasi en temps réel même en mode REST.
     chatPollTimer = setInterval(() => {
       void refreshChatMessages();
-    }, 5000);
+    }, 1500);
   }
 
   function stopChatPoll() {
@@ -1001,19 +1024,29 @@
       return;
     }
 
+    const senderRole = chatLocalRole;
+    const receiverRole = chatRemoteRole;
+
     const sentViaStomp = chatClient.sendMessage(
       roomId,
-      "viewer",
-      "viewer",
-      "agent",
-      "agent",
+      senderRole,
+      senderRole,
+      receiverRole,
+      receiverRole,
       content
     );
 
     if (!sentViaStomp) {
       // REST fallback: send then merge-refresh (server assigns timestamp/id)
       try {
-        await technicianApi.sendMessageRest(roomId, "viewer", "viewer", "agent", "agent", content);
+        await technicianApi.sendMessageRest(
+          roomId,
+          senderRole,
+          senderRole,
+          receiverRole,
+          receiverRole,
+          content
+        );
         await refreshChatMessages();
       } catch (error) {
         chatError = String(error);
@@ -1023,6 +1056,17 @@
 
     chatInput = "";
     chatError = null;
+  }
+
+  function dispatchChatTyping() {
+    const roomId = chatRoomId || resolveRoomId();
+    if (!roomId) return;
+    chatClient.sendTyping(roomId, chatLocalRole, chatLocalRole, true);
+    if (chatTypingDispatchTimer) clearTimeout(chatTypingDispatchTimer);
+    chatTypingDispatchTimer = setTimeout(() => {
+      chatClient.sendTyping(roomId, chatLocalRole, chatLocalRole, false);
+      chatTypingDispatchTimer = null;
+    }, 1500);
   }
 
   // â”€â”€ File DataChannel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3066,6 +3110,21 @@
         approvalAllowRemoteInput,
         approvalAllowFileTransfer
       );
+
+      // Côté PC distant (agent), on bascule la session approuvée comme
+      // session active pour que l'UI affiche le menu Écran/Fichier/Chat
+      // — exactement comme côté technicien après acceptation.
+      const approved = pendingApprovalSession;
+      activeSession = {
+        ...approved,
+        allowRemoteInput: approvalAllowRemoteInput,
+        allowFileTransfer: approvalAllowFileTransfer,
+        status: "ACTIVE"
+      };
+      queriedSession = activeSession;
+      selectedFeature = null;
+      waitingForApproval = false;
+
       approvalLoading = false;
       showApprovalModal = false;
       pendingApprovalSession = null;
@@ -3252,21 +3311,27 @@
           </button>
         </header>
 
-        <div class="rd-features">
-          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "screen"; }}>
-            <span class="rd-feature__icon">🖥</span>
-            <strong>Écran</strong>
-            <span class="rd-feature__hint">Voir et contrôler le bureau distant</span>
-          </button>
-          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "files"; }}>
-            <span class="rd-feature__icon">📄</span>
-            <strong>Transfert de fichiers</strong>
-            <span class="rd-feature__hint">Envoyer/recevoir sans afficher l'écran</span>
-          </button>
-          <button class="rd-feature" type="button" onclick={() => { selectedFeature = "chat"; }}>
+        <div class="rd-features" class:rd-features--single={chatLocalRole === "agent"}>
+          {#if chatLocalRole !== "agent"}
+            <button class="rd-feature" type="button" onclick={() => { selectedFeature = "screen"; }}>
+              <span class="rd-feature__icon">🖥</span>
+              <strong>Écran</strong>
+              <span class="rd-feature__hint">Voir et contrôler le bureau distant</span>
+            </button>
+            <button class="rd-feature" type="button" onclick={() => { selectedFeature = "files"; }}>
+              <span class="rd-feature__icon">📄</span>
+              <strong>Transfert de fichiers</strong>
+              <span class="rd-feature__hint">Envoyer/recevoir sans afficher l'écran</span>
+            </button>
+          {/if}
+          <button class="rd-feature" type="button" onclick={() => chooseFeature("chat")}>
             <span class="rd-feature__icon">💬</span>
             <strong>Chat</strong>
-            <span class="rd-feature__hint">Échanger des messages</span>
+            <span class="rd-feature__hint">
+              {chatLocalRole === "agent"
+                ? "Communiquer avec le technicien connecté"
+                : "Échanger des messages"}
+            </span>
           </button>
         </div>
       </section>
@@ -3364,18 +3429,76 @@
 
     <!-- ── Sous-panneau "Chat" (sans écran) ────────────────────────── -->
     {#if activeSession && activeSession.status === "ACTIVE" && selectedFeature === "chat"}
-      <section class="rd-panel">
+      <section class="rd-panel rd-chat">
         <header class="rd-session-menu__head">
           <div>
             <h2 class="rd-panel__title"><span class="rd-icon">💬</span> Chat</h2>
-            <p class="rd-viewer__sub">Vidéo désactivée pour économiser la bande passante.</p>
+            <p class="rd-viewer__sub">
+              <span class="rd-chat__pill" class:rd-chat__pill--ok={chatConnected} class:rd-chat__pill--warn={!chatConnected}>
+                {chatConnected ? "Connecté" : "Hors ligne"}
+              </span>
+              <span class="rd-chat__role">Vous êtes&nbsp;: <strong>{chatLocalRole === "agent" ? "PC distant" : "Technicien"}</strong></span>
+            </p>
           </div>
           <div class="rd-viewer__actions">
+            {#if !chatConnected}
+              <button class="rd-viewer__btn" type="button" onclick={() => void connectChat()}>Reconnecter</button>
+            {/if}
             <button class="rd-viewer__btn" type="button" onclick={() => { selectedFeature = null; }}>← Menu</button>
             <button class="rd-viewer__disconnect" type="button" onclick={() => void stopByToken()} disabled={actionLoading}>Déconnecter</button>
           </div>
         </header>
-        <p class="rd-empty">Module chat — utilise le canal STOMP existant (WIP).</p>
+
+        {#if chatError}
+          <p class="rd-chat__error">{chatError}</p>
+        {/if}
+
+        <div class="rd-chat__list" bind:this={chatListEl}>
+          {#if chatMessages.length === 0}
+            <p class="rd-empty">Aucun message pour l'instant. Envoie le premier&nbsp;!</p>
+          {:else}
+            {#each chatMessages as msg (msgKey(msg))}
+              {@const mine = (msg.senderRole ?? msg.senderName) === chatLocalRole}
+              <div class="rd-chat__row" class:rd-chat__row--mine={mine}>
+                <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine}>
+                  <div class="rd-chat__meta">
+                    <span class="rd-chat__sender">{mine ? "Moi" : (msg.senderName === "agent" ? "PC distant" : "Technicien")}</span>
+                    <span class="rd-chat__ts">{new Date(msg.timestamp).toLocaleTimeString()}</span>
+                  </div>
+                  <p class="rd-chat__text">{msg.content}</p>
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        {#if typingInfo && typingInfo.senderRole !== chatLocalRole}
+          <p class="rd-chat__typing">
+            <span class="rd-chat__typing-dot"></span>
+            <span class="rd-chat__typing-dot"></span>
+            <span class="rd-chat__typing-dot"></span>
+            <span>{typingInfo.senderRole === "agent" ? "PC distant" : "Technicien"} est en train d'écrire…</span>
+          </p>
+        {/if}
+
+        <div class="rd-chat__compose">
+          <input
+            class="rd-chat__input"
+            type="text"
+            placeholder="Écris un message…"
+            bind:value={chatInput}
+            disabled={!activeSession || activeSession.status !== "ACTIVE"}
+            onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
+            oninput={dispatchChatTyping}
+          />
+          <button
+            class="rd-chat__send"
+            type="button"
+            onclick={() => void sendChatMessage()}
+            disabled={!chatInput.trim()}>
+            Envoyer
+          </button>
+        </div>
       </section>
     {/if}
 
@@ -5182,6 +5305,11 @@
     grid-template-columns: repeat(3, 1fr);
     gap: 14px;
   }
+  .rd-features--single {
+    grid-template-columns: 1fr;
+    max-width: 480px;
+    margin: 0 auto;
+  }
   @media (max-width: 720px) {
     .rd-features { grid-template-columns: 1fr; }
   }
@@ -6104,6 +6232,159 @@
   .chat-input {
     flex: 1;
   }
+
+  /* ── Sous-panneau Chat (rd-chat) ───────────────────────────────── */
+  .rd-chat {
+    display: flex;
+    flex-direction: column;
+    min-height: 480px;
+  }
+  .rd-chat__pill {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 10px;
+    border: 1px solid transparent;
+  }
+  .rd-chat__pill--ok {
+    background: rgba(34, 197, 94, 0.12);
+    border-color: rgba(34, 197, 94, 0.4);
+    color: #4ade80;
+  }
+  .rd-chat__pill--warn {
+    background: rgba(250, 204, 21, 0.12);
+    border-color: rgba(250, 204, 21, 0.4);
+    color: #facc15;
+  }
+  .rd-chat__role { color: #94a3b8; font-size: 12px; }
+  .rd-chat__role strong { color: #e2e8f0; }
+
+  .rd-chat__error {
+    margin: 0 0 12px 0;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+    font-size: 13px;
+  }
+
+  .rd-chat__list {
+    flex: 1;
+    min-height: 320px;
+    max-height: 520px;
+    overflow-y: auto;
+    padding: 14px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    scroll-behavior: smooth;
+  }
+  .rd-chat__list::-webkit-scrollbar { width: 8px; }
+  .rd-chat__list::-webkit-scrollbar-thumb {
+    background: rgba(56, 189, 248, 0.25);
+    border-radius: 4px;
+  }
+
+  .rd-chat__row {
+    display: flex;
+    justify-content: flex-start;
+  }
+  .rd-chat__row--mine { justify-content: flex-end; }
+
+  .rd-chat__bubble {
+    max-width: 72%;
+    background: #111a25;
+    border: 1px solid #1f2a36;
+    border-radius: 14px 14px 14px 4px;
+    padding: 8px 12px;
+    color: #e2e8f0;
+  }
+  .rd-chat__bubble--mine {
+    background: rgba(56, 189, 248, 0.18);
+    border-color: rgba(56, 189, 248, 0.4);
+    border-radius: 14px 14px 4px 14px;
+  }
+  .rd-chat__meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .rd-chat__sender { font-weight: 600; color: #cbd5e1; }
+  .rd-chat__bubble--mine .rd-chat__sender { color: #38bdf8; }
+  .rd-chat__ts { font-family: "Consolas", monospace; }
+  .rd-chat__text {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .rd-chat__typing {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 4px 0 4px;
+    font-size: 12px;
+    color: #94a3b8;
+    font-style: italic;
+  }
+  .rd-chat__typing-dot {
+    width: 5px; height: 5px;
+    background: #38bdf8;
+    border-radius: 50%;
+    display: inline-block;
+    animation: rd-chat-typing-bounce 1.2s infinite ease-in-out;
+  }
+  .rd-chat__typing-dot:nth-child(2) { animation-delay: 0.15s; }
+  .rd-chat__typing-dot:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes rd-chat-typing-bounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+    40% { transform: translateY(-3px); opacity: 1; }
+  }
+
+  .rd-chat__compose {
+    display: flex;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .rd-chat__input {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: #e2e8f0;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .rd-chat__input:focus {
+    border-color: rgba(56, 189, 248, 0.55);
+  }
+  .rd-chat__input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .rd-chat__send {
+    background: #38bdf8;
+    border: none;
+    color: #0d1117;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .rd-chat__send:hover:not(:disabled) { background: #7dd3fc; }
+  .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 
 
