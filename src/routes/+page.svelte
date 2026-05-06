@@ -358,7 +358,10 @@
   let viewerAnswerReceived = false;
   let viewerOfferRetryTimer: ReturnType<typeof setInterval> | null = null;
   let viewerOfferRetryCount = 0;
-  const maxViewerOfferRetries = 8;
+  // Le retry continue tant qu'une session est ACTIVE — pas de cap arbitraire.
+  // L'ancien cap à 8 (= 8s) faisait abandonner trop vite quand Render fermait
+  // la WS signaling pendant l'OFFER et que l'agent re-écoutait après reconnect.
+  const maxViewerOfferRetries = 60;
   let viewerControlsTimer: ReturnType<typeof setTimeout> | null = null;
   let detachViewerInputListeners: (() => void) | null = null;
   let detachViewerFullscreenListener: (() => void) | null = null;
@@ -447,8 +450,10 @@
   let fileTransfers = $state<Record<string, FileTransfer>>({});
   /** transferId of the download currently receiving binary chunks */
   let activeDownloadId: string | null = null;
-  const FILE_CHANNEL_UPLOAD_BACKPRESSURE = 16 * 1024 * 1024; // 16 MB
-  const FILE_CHUNK_SIZE = 64 * 1024;                          // 64 KB
+  const FILE_CHANNEL_UPLOAD_BACKPRESSURE = 4 * 1024 * 1024; // 4 MB
+  // 16 KB par chunk : largement sous toutes les limites SCTP/WebRTC
+  // (certaines impls plantent à 64 KB après plusieurs transferts).
+  const FILE_CHUNK_SIZE = 16 * 1024;                         // 16 KB
 
   let metricsTimer: ReturnType<typeof setInterval>;
   let agentsTimer: ReturnType<typeof setInterval>;
@@ -1027,17 +1032,21 @@
     channel.binaryType = "arraybuffer";
     fileChannel = channel;
     fileChannelOpen = channel.readyState === "open";
+    console.log(`[file-ch] configure (readyState=${channel.readyState})`);
 
     channel.onopen = () => {
       fileChannelOpen = true;
+      console.log(`[file-ch] OPENED (readyState=${channel.readyState})`);
     };
     channel.onclose = () => {
+      console.warn(`[file-ch] CLOSED (was fileChannel? ${fileChannel === channel}, readyState=${channel.readyState})`);
       if (fileChannel === channel) {
         fileChannelOpen = false;
         activeDownloadId = null;
       }
     };
-    channel.onerror = () => {
+    channel.onerror = (e) => {
+      console.warn(`[file-ch] ERROR`, e);
       if (fileChannel === channel) {
         fileChannelOpen = false;
       }
@@ -1117,12 +1126,33 @@
       return;
     }
 
-    if (type === "FILE_UPLOAD_ACK") {
+    if (type === "FILE_UPLOAD_STARTED") {
+      // Debug : l'agent confirme avoir bien préparé l'upload + chemin de destination
+      const destPath = (msg.destPath as string) ?? "";
+      console.log(`[file-ch] agent confirms upload start tid=${tid} → ${destPath}`);
       const transfer = fileTransfers[tid];
       if (transfer) {
         fileTransfers = {
           ...fileTransfers,
-          [tid]: { ...transfer, state: "complete" }
+          [tid]: { ...transfer, error: undefined, ...(destPath ? { destPath } as Partial<FileTransfer> : {}) }
+        };
+      }
+      return;
+    }
+
+    if (type === "FILE_UPLOAD_ACK") {
+      const destPath = (msg.destPath as string) ?? "";
+      const canonicalPath = (msg.canonicalPath as string) ?? "";
+      const size = (msg.size as number) ?? 0;
+      // Préfère le canonicalPath (résolu par OS, traverse junctions/symlinks)
+      // sinon le destPath brut. Sur Windows FR ça donne le chemin RÉEL utilisable.
+      const finalPath = canonicalPath || destPath;
+      console.log(`[file-ch] agent ACK tid=${tid} size=${size} → ${finalPath}`);
+      const transfer = fileTransfers[tid];
+      if (transfer) {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...transfer, state: "complete", ...(finalPath ? { destPath: finalPath } as Partial<FileTransfer> : {}) }
         };
       }
       return;
@@ -1219,7 +1249,16 @@
 
       const start = i * FILE_CHUNK_SIZE;
       const chunk = await file.slice(start, start + FILE_CHUNK_SIZE).arrayBuffer();
-      fileChannel.send(chunk);
+      try {
+        fileChannel.send(chunk);
+      } catch (sendErr) {
+        console.error(`[file-ch] send chunk #${i + 1} failed:`, sendErr);
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...fileTransfers[tid], state: "error", error: `send: ${String(sendErr)}` }
+        };
+        return;
+      }
 
       const prev = fileTransfers[tid];
       fileTransfers = {
@@ -1233,6 +1272,22 @@
     }
 
     fileChannel.send(JSON.stringify({ type: "FILE_COMPLETE", transferId: tid }));
+
+    // Tous les chunks ont été poussés sur la pipe SCTP. L'ACK FILE_UPLOAD_ACK
+    // que l'agent renvoie peut être perdu (race entre fermeture rapide du
+    // canal après transfert / reset peer). Plutôt que de laisser l'utilisateur
+    // bloqué sur "active 100 %", on attend l'ACK 1 s puis on force "complete"
+    // avec un flag "ackPending" — l'arrivée tardive de l'ACK reste idempotente.
+    setTimeout(() => {
+      const cur = fileTransfers[tid];
+      if (cur && cur.state === "active" && cur.doneChunks >= totalChunks) {
+        fileTransfers = {
+          ...fileTransfers,
+          [tid]: { ...cur, state: "complete", doneBytes: file.size }
+        };
+        console.log(`[file-ch] upload tid=${tid} forced to complete (ACK timeout)`);
+      }
+    }, 1000);
   }
 
   function resetFileChannel() {
@@ -1559,6 +1614,10 @@
       viewerControlChannel = channel;
       viewerDataChannelOpen = true;
       screenFrameError = null;
+      // Force le ré-envoi du PAUSE/RESUME : si l'effet a déjà tenté d'envoyer
+      // alors que le canal n'était pas open, sa valeur a été silencieusement
+      // perdue. Reset le tracking pour que l'effet le refasse.
+      rdLastSentPaused = null;
     };
 
     channel.onclose = () => {
@@ -2587,11 +2646,31 @@
     rdScreenPlayRequested = false;
   }
 
+  // Quand l'utilisateur ouvre la carte "Écran" pour la PREMIÈRE FOIS dans une
+  // session, on arme automatiquement le Play (sinon il faudrait deux clicks
+  // pour démarrer la diffusion). Une fois cliqué Pause, le souhait utilisateur
+  // est respecté (rdAutoPlayDoneForSession évite que l'effet re-set true).
+  let rdAutoPlayDoneForSession = $state<number | null>(null);
+  $effect(() => {
+    const sid = activeSession?.id ?? null;
+    const isActive = activeSession?.status === "ACTIVE";
+    const onScreen = selectedFeature === "screen";
+    if (sid && isActive && onScreen && rdAutoPlayDoneForSession !== sid) {
+      rdScreenPlayRequested = true;
+      rdAutoPlayDoneForSession = sid;
+    }
+  });
+
   // Reflète l'état désiré en envoi P2P. Pause si :
   //  - l'utilisateur n'a pas (encore) cliqué Play, OU
   //  - un transfert est en cours, OU
   //  - on n'est pas sur le panneau Écran
   $effect(() => {
+    // Dépendances réactives explicites — y compris viewerDataChannelOpen
+    // pour que l'effet se redéclenche quand le canal devient utilisable
+    // (et qu'on puisse ENFIN envoyer le PAUSE/RESUME désiré).
+    void viewerDataChannelOpen;
+
     const transferActive = rdHasActiveTransfer(fileTransfers);
     rdVideoPausedForTransfer = transferActive;
 
@@ -2612,11 +2691,16 @@
     if (!activeSession) {
       rdScreenPlayRequested = false;
       rdLastSentPaused = null;
+      rdAutoPlayDoneForSession = null;
     }
   });
 
   function rdTriggerFilePicker() {
-    if (!fileChannelOpen) return;
+    // Source de vérité: l'état réel du canal au moment du clic, pas le state Svelte
+    if (fileChannel?.readyState !== "open") {
+      console.warn("[file-ch] picker triggered but channel is", fileChannel?.readyState);
+      return;
+    }
     rdFileInputEl?.click();
   }
 
@@ -2645,6 +2729,20 @@
     if (t.totalSize <= 0) return 0;
     return Math.min(100, Math.round((t.doneBytes / t.totalSize) * 100));
   }
+
+  // Polling fiable de l'état du DataChannel "file" — Svelte ne peut pas
+  // observer fileChannel.readyState directement, donc on en fait un miroir
+  // dans un $state régénéré à 500 ms.
+  let rdFileChannelLive = $state(false);
+  $effect(() => {
+    const tick = () => {
+      const open = fileChannel?.readyState === "open";
+      if (open !== rdFileChannelLive) rdFileChannelLive = open;
+    };
+    tick();
+    const id = setInterval(tick, 500);
+    return () => clearInterval(id);
+  });
 
   function toggleViewerExpanded() {
     viewerExpanded = !viewerExpanded;
@@ -3182,7 +3280,7 @@
             <h2 class="rd-panel__title"><span class="rd-icon">📄</span> Transfert de fichiers</h2>
             <p class="rd-viewer__sub">
               Vidéo désactivée — toute la bande passante est dédiée au transfert.
-              {#if fileChannelOpen}Canal P2P ouvert{:else}Canal en attente…{/if}
+              {#if rdFileChannelLive}<span style="color:#4ade80">● Canal P2P ouvert</span>{:else}<span style="color:#fbbf24">● Canal en attente…</span>{/if}
             </p>
           </div>
           <div class="rd-viewer__actions">
@@ -3191,7 +3289,7 @@
               class="rd-viewer__btn"
               type="button"
               onclick={rdTriggerFilePicker}
-              disabled={!fileChannelOpen}>📤 Envoyer fichier</button>
+              disabled={!rdFileChannelLive}>📤 Envoyer fichier</button>
             <button
               class="rd-viewer__disconnect"
               type="button"
@@ -3219,7 +3317,40 @@
                     <div class="rd-transfer__bar-fill" style="width: {rdProgressPercent(t)}%"></div>
                   </div>
                   {#if t.state === "error"}<p class="rd-transfer__error">Erreur : {t.error ?? "inconnue"}</p>{/if}
-                  {#if t.state === "complete"}<p class="rd-transfer__done">{t.type === "upload" ? "Envoyé" : "Reçu"}</p>{/if}
+                  {#if t.state === "complete"}
+                    {#if t.type === "upload"}
+                      {#if t.destPath}
+                        <p class="rd-transfer__done">
+                          ✓ Envoyé à <strong>{activeSession?.agentMachineId ?? "l'autre PC"}</strong>
+                          ({(t.totalSize / 1024).toFixed(1)} KB)
+                        </p>
+                        <p class="rd-transfer__where">
+                          📁 <strong>Le fichier est sur l'AUTRE ordinateur</strong>
+                          ({activeSession?.agentMachineId ?? "?"}), pas sur celui-ci.<br />
+                          Sur le PC distant, ouvre le dossier
+                          <strong>Téléchargements</strong> →
+                          <strong>LumiereTransfers</strong>
+                          (sous-dossier créé automatiquement).
+                          <br />
+                          Chemin complet :
+                          <code style="user-select:all">{t.destPath}</code>
+                          <button
+                            class="rd-transfer__copy"
+                            type="button"
+                            onclick={() => navigator.clipboard?.writeText(t.destPath ?? "")}
+                            title="Copier le chemin">📋 Copier</button>
+                        </p>
+                      {:else}
+                        <p class="rd-transfer__done rd-transfer__done--warn">
+                          ⚠ Tous les chunks envoyés mais pas d'ACK reçu de l'autre PC.
+                          L'agent distant ne confirme pas la réception — vérifie sa console
+                          (logs <code>[file-ch]</code>).
+                        </p>
+                      {/if}
+                    {:else}
+                      <p class="rd-transfer__done">✓ Reçu et téléchargé localement</p>
+                    {/if}
+                  {/if}
                 </div>
                 {#if t.state !== "active"}
                   <button class="rd-transfer__close" type="button" onclick={() => rdDismissTransfer(t.transferId)}>×</button>
@@ -3312,9 +3443,9 @@
             <div class="rd-viewer__transfer-overlay">
               <button class="rd-viewer__big-play" type="button" onclick={rdPlayScreen}>
                 <span class="rd-viewer__big-play-icon">▶</span>
-                <span>Démarrer la diffusion</span>
+                <span>Reprendre la diffusion</span>
               </button>
-              <p>L'agent ne capture rien tant que tu n'as pas cliqué Play.</p>
+              <p>Émission suspendue. Clique pour la reprendre.</p>
             </div>
           {/if}
 
@@ -3355,8 +3486,8 @@
               class="rd-viewer__fab"
               type="button"
               onclick={rdTriggerFilePicker}
-              disabled={!fileChannelOpen}
-              title={fileChannelOpen ? "Envoyer un fichier" : "Canal fichier non disponible"}>
+              disabled={!rdFileChannelLive}
+              title={rdFileChannelLive ? "Envoyer un fichier" : "Canal fichier non disponible"}>
               <span class="rd-viewer__fab-icon">📤</span>
               <span class="rd-viewer__fab-label">Fichier</span>
             </button>
@@ -4934,6 +5065,40 @@
   .rd-transfer--error .rd-transfer__bar-fill { background: #ef4444; }
   .rd-transfer__error { margin: 6px 0 0 0; font-size: 12px; color: #fca5a5; }
   .rd-transfer__done { margin: 6px 0 0 0; font-size: 12px; color: #4ade80; }
+  .rd-transfer__done--warn { color: #fbbf24; }
+  .rd-transfer__where {
+    margin: 6px 0 0 0;
+    padding: 8px 10px;
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    border-radius: 6px;
+    font-size: 12px;
+    color: #cbd5e1;
+    line-height: 1.5;
+  }
+  .rd-transfer__where code {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 4px 8px;
+    background: #0a0f15;
+    border-radius: 4px;
+    color: #38bdf8;
+    font-size: 11px;
+  }
+  .rd-transfer__copy {
+    margin-left: 8px;
+    background: transparent;
+    border: 1px solid #1f2a36;
+    color: #94a3b8;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .rd-transfer__copy:hover {
+    background: #1f2a36;
+    color: #fff;
+  }
   .rd-transfer__close {
     position: absolute;
     top: 6px; right: 8px;

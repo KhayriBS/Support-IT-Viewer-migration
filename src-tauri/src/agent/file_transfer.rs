@@ -263,18 +263,63 @@ impl FileTransferService {
     // ── GetDownloadsPath ──────────────────────────────────────────────────────
     /// Equivalent of `GetDownloadsPath()` in `SessionManager.cs`.
     pub fn get_downloads_path() -> PathBuf {
-        // Try well-known Downloads folder
-        let home = dirs_path_home();
+        // 1) Sur Windows, on demande le chemin officiel via SHGetKnownFolderPath
+        //    avec FOLDERID_Downloads. C'est la SEULE manière correcte de gérer
+        //    les Windows localisés (où le dossier peut s'appeler "Téléchargements"
+        //    sur disque), les dossiers redirigés (OneDrive), et les chemins
+        //    personnalisés via Group Policy.
+        #[cfg(windows)]
+        if let Some(p) = downloads_via_shell_known_folder() {
+            return p;
+        }
 
-        for candidate in &["Downloads", "Téléchargements"] {
+        // 2) Fallback : recherche manuelle sous USERPROFILE / HOME
+        let home = dirs_path_home();
+        for candidate in &["Downloads", "Téléchargements", "Descargas", "下载", "Загрузки"] {
             let p = home.join(candidate);
             if p.exists() {
                 return p;
             }
         }
 
-        // Fallback: create Downloads in home
+        // 3) Dernière option : crée Downloads sous home
         home.join("Downloads")
+    }
+}
+
+/// Résout le dossier Téléchargements via l'API Shell Windows officielle
+/// (`SHGetKnownFolderPath` + `FOLDERID_Downloads`). Renvoie `None` si l'appel
+/// échoue.
+#[cfg(windows)]
+fn downloads_via_shell_known_folder() -> Option<PathBuf> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+
+    unsafe {
+        let path_ptr = match SHGetKnownFolderPath(
+            &FOLDERID_Downloads,
+            KF_FLAG_DEFAULT,
+            HANDLE::default(),
+        ) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+        if path_ptr.is_null() {
+            return None;
+        }
+        // Mesure la longueur (NUL-terminated UTF-16)
+        let mut len = 0usize;
+        while *path_ptr.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(path_ptr.0, len);
+        let s = String::from_utf16_lossy(slice);
+        // Libère la mémoire allouée par SHGetKnownFolderPath
+        CoTaskMemFree(Some(path_ptr.0 as *const _));
+        Some(PathBuf::from(s))
     }
 }
 

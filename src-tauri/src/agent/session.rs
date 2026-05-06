@@ -81,6 +81,11 @@ pub struct SharedState {
     pub stop_notify: Notify,
     /// Channel to push inbound chat messages to the frontend via Tauri events
     pub chat_tx: Mutex<Option<mpsc::UnboundedSender<(String, String)>>>,
+    /// ANSWER calculé mais pas encore livré (signaling fermée au moment de
+    /// l'envoi). Re-tenté à chaque entrée fraîche dans dispatch_signals tant
+    /// qu'il n'a pas été acquitté (= jusqu'à ce que send réussisse). Cleared
+    /// par leave_session.
+    pub pending_answer: Mutex<Option<serde_json::Value>>,
 }
 
 impl SharedState {
@@ -96,19 +101,42 @@ impl SharedState {
             grace_cancel: Notify::new(),
             stop_notify: Notify::new(),
             chat_tx: Mutex::new(None),
+            pending_answer: Mutex::new(None),
         })
     }
 }
 
 /// Default grace period (seconds) granted when the viewer disconnects
 /// non-explicitly (peer_disconnected / socket close 1000 / 1006…).
-/// Configurable via `LUMIERE_VIEWER_GRACE_SECS`.
+/// Configurable via `LUMIERE_VIEWER_GRACE_SECS` (env ou .env.local).
+///
+/// Default monté à 180 s : sur Render free-tier la WS signaling se ferme en
+/// 1003/1011 dès l'OFFER/ANSWER échangé, et notre reconnect peut prendre
+/// jusqu'à plusieurs dizaines de secondes (back-off + reject côté serveur).
+/// Tant que le peer WebRTC est Connected, on n'a aucune raison de tuer la
+/// session — la grâce est de toute façon ré-armée à chaque expiration tant
+/// que `is_peer_connected()` répond true.
 fn viewer_grace_period_secs() -> u64 {
-    std::env::var("LUMIERE_VIEWER_GRACE_SECS")
+    let raw = std::env::var("LUMIERE_VIEWER_GRACE_SECS")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|v| v.clamp(5, 300))
-        .unwrap_or(45)
+        .or_else(|| {
+            // Fallback .env.local pour les builds dev Tauri.
+            std::fs::read_to_string("../.env.local")
+                .ok()
+                .and_then(|content| {
+                    content.lines().find_map(|line| {
+                        let line = line.trim();
+                        if line.starts_with("LUMIERE_VIEWER_GRACE_SECS=") {
+                            Some(line.trim_start_matches("LUMIERE_VIEWER_GRACE_SECS=").to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(5, 600))
+        .unwrap_or(180)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -624,6 +652,30 @@ async fn dispatch_signals(
                 state.consecutive_1003.store(0, Ordering::Release);
                 state.grace_cancel.notify_waiters();
                 println!("👋 Viewer rejoint la session — attente de l'OFFER SDP");
+
+                // Si on a une ANSWER pendante (signaling était tombée juste
+                // avant son envoi sur la dispatch précédente), on la renvoie
+                // dès que le viewer revient en ligne — évite que le viewer
+                // boucle sur "Aucune réponse SDP recue" pendant les coupures
+                // signaling de Render.
+                let pending = state.pending_answer.lock().await.clone();
+                if let Some(answer) = pending {
+                    println!("🔁 Renvoi de l'ANSWER pendante au viewer (reconnect signaling)");
+                    match sig.send_answer(answer).await {
+                        Ok(()) => {
+                            *state.pending_answer.lock().await = None;
+                            println!("📤 Answer SDP renvoyé avec succès");
+                            if !h264_sender_started {
+                                if let Some(pc) = webrtc.as_ref() {
+                                    println!("🎥 Démarrage stream WebRTC H.264 (screen)");
+                                    pc.start_h264_screen_sender();
+                                    h264_sender_started = true;
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("⚠️ Renvoi ANSWER pendante échoué: {e}"),
+                    }
+                }
             }
 
             // ── SDP Offer → create Answer ──────────────────────────────
@@ -677,17 +729,25 @@ async fn dispatch_signals(
                         Ok(answer_payload) => {
                             pc.set_stream_profile(requested_stream_profile);
                             last_offer_fingerprint = current_offer_fingerprint;
-                            if let Err(e) = sig.send_answer(answer_payload).await {
-                                eprintln!("❌ Envoi ANSWER échoué: {e}");
-                            } else {
-                                println!("📤 Answer SDP envoyé");
-
-                                if !h264_sender_started {
-                                    if let Some(pc) = webrtc.as_ref() {
-                                        println!("🎥 Démarrage stream WebRTC H.264 (screen)");
-                                        pc.start_h264_screen_sender();
-                                        h264_sender_started = true;
+                            // Stocke l'ANSWER pour qu'il soit re-tenté si la
+                            // signaling est tombée juste avant son envoi.
+                            *state.pending_answer.lock().await = Some(answer_payload.clone());
+                            match sig.send_answer(answer_payload).await {
+                                Ok(()) => {
+                                    println!("📤 Answer SDP envoyé");
+                                    *state.pending_answer.lock().await = None;
+                                    if !h264_sender_started {
+                                        if let Some(pc) = webrtc.as_ref() {
+                                            println!("🎥 Démarrage stream WebRTC H.264 (screen)");
+                                            pc.start_h264_screen_sender();
+                                            h264_sender_started = true;
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "❌ Envoi ANSWER échoué: {e} — gardé pour retry au prochain reconnect signaling"
+                                    );
                                 }
                             }
                         }
@@ -1086,6 +1146,9 @@ pub async fn leave_session(state: Arc<SharedState>) {
 
     // Cancel any pending grace task; the session is going away for real now.
     state.grace_cancel.notify_waiters();
+
+    // Reset pending answer
+    *state.pending_answer.lock().await = None;
 
     // Tear down the persisted WebRTC peer (DataChannels, video sender, …).
     if let Some(pc) = state.webrtc.lock().await.take() {

@@ -73,4 +73,8 @@ windows = { version = "0.58", features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    # Shell : SHGetKnownFolderPath (résolution correcte du dossier Téléchargements
+    # même sur Windows localisé / OneDrive / dossiers redirigés)
+    "Win32_UI_Shell",
+    "Win32_System_Com_StructuredStorage",
 ] }

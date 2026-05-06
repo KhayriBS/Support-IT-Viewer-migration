@@ -123,6 +123,8 @@ export interface FileTransfer {
   startedAt: number;
   state: FileTransferState;
   error?: string;
+  /** Chemin absolu où l'agent a sauvegardé le fichier (renvoyé via FILE_UPLOAD_ACK) */
+  destPath?: string;
   /** accumulated ArrayBuffers while download is in progress */
   buffers?: ArrayBuffer[];
 }

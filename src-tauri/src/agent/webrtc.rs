@@ -408,21 +408,36 @@ use webrtc::track::track_local::TrackLocalWriter;
 use webrtc_util::marshal::Unmarshal;
 
 fn env_flag_true(key: &str) -> bool {
-    let Ok(value) = env::var(key) else {
-        return false;
-    };
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    // 1) Variable d'environnement directe (process env, posée par le shell ou
+    //    Cargo) — chemin canonique pour CI / production.
+    if let Ok(value) = env::var(key) {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    // 2) Fallback : .env.local au repo root (utilisé en dev Tauri où le binaire
+    //    tourne depuis src-tauri/target/debug/, hors du process env).
+    if let Some(value) = read_env_or_local(key) {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    false
 }
 
 fn agent_ice_gather_timeout_secs() -> u64 {
-    std::env::var("LUMIERE_AGENT_ICE_GATHER_TIMEOUT_SECS")
+    // Lit env var, sinon .env.local (cas dev Tauri où le binaire tourne hors
+    // du process env du shell). Default réduit à 3 s parce que les passerelles
+    // freemium (Render) ferment la WebSocket en 5-8 s d'idle — il vaut mieux
+    // envoyer l'ANSWER avec des candidats partiels que pas du tout.
+    let raw = std::env::var("LUMIERE_AGENT_ICE_GATHER_TIMEOUT_SECS")
         .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| value.clamp(3, 15))
-        .unwrap_or(8)
+        .or_else(|| read_env_or_local("LUMIERE_AGENT_ICE_GATHER_TIMEOUT_SECS"));
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(1, 15))
+        .unwrap_or(3)
 }
 
 fn video_debug_enabled() -> bool {
@@ -1300,10 +1315,16 @@ impl StreamStatsWindow {
 
 // ─── File DataChannel upload state ────────────────────────────────────────────
 
+#[derive(Clone)]
 struct FileChannelUploadState {
     transfer_id: String,
     dest_path: String,
     received_chunks: usize,
+    /// Buffer accumulé en mémoire — on écrit le fichier UNE SEULE FOIS à
+    /// FILE_COMPLETE plutôt qu'en append progressif. Évite les races
+    /// avec antivirus / Defender, les append failures sur fichier locké,
+    /// et garantit un fichier complet ou rien (pas de fichier corrompu).
+    buffer: Vec<u8>,
 }
 
 // ─── AgentWebRtc impl ─────────────────────────────────────────────────────────
@@ -1384,9 +1405,14 @@ impl AgentWebRtc {
 
         let activity_state = Arc::new(StreamingActivityState::default());
         let activity_for_channel = Arc::clone(&activity_state);
-        // Démarre PAUSÉ : aucune frame n'est émise tant que le viewer n'a pas
-        // explicitement cliqué Play (envoi VIDEO_RESUME via DataChannel input).
-        // Le viewer choisit d'abord Écran/Fichier/Chat depuis le menu de session.
+        // Démarre PAUSÉ (true) : aucune frame n'est émise tant que le viewer
+        // n'a pas explicitement cliqué la carte "Écran" (envoi VIDEO_RESUME
+        // via DataChannel input). À l'activation de session, le viewer
+        // affiche un menu Écran/Fichier/Chat — on ne veut pas gâcher de
+        // bande passante avant qu'il choisisse.
+        // Le viewer renvoie automatiquement VIDEO_RESUME à chaque fois que
+        // le DataChannel input s'ouvre, ce qui élimine le risque d'agent
+        // muet permanent même si le premier message se perd.
         let frame_emission_paused = Arc::new(AtomicBool::new(true));
         let frame_emission_paused_for_channel = Arc::clone(&frame_emission_paused);
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
@@ -1891,69 +1917,223 @@ async fn setup_file_channel(channel: Arc<RTCDataChannel>, allow_file_transfer: b
                     Some("FILE_UPLOAD_START") => {
                         let tid = json["transferId"].as_str().unwrap_or("").to_string();
                         let file_name = json["fileName"].as_str().unwrap_or("upload").to_string();
+                        let total_chunks = json["totalChunks"].as_u64().unwrap_or(1);
 
                         let safe_name = std::path::Path::new(&file_name)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "upload".to_string());
 
-                        let dest = FileTransferService::get_downloads_path()
-                            .join(&safe_name)
-                            .to_string_lossy()
-                            .to_string();
+                        // On sauve dans un sous-dossier qu'on POSSÈDE et nomme
+                        // explicitement : `<Downloads>/LumiereTransfers/`.
+                        // Avantages :
+                        //  - Nom identique en anglais/français/etc → l'user le
+                        //    trouve sans confusion sur Windows localisé
+                        //  - On crée le dossier nous-mêmes → pas de surprise
+                        //    si Downloads est introuvable
+                        //  - Isolé du dossier Downloads natif → pas de conflit
+                        //    avec d'autres fichiers
+                        let base_downloads = FileTransferService::get_downloads_path();
+                        let downloads_path = base_downloads.join("LumiereTransfers");
+                        match tokio::fs::create_dir_all(&downloads_path).await {
+                            Ok(_) => println!(
+                                "📁 [file-ch] Sub-folder ready: {}",
+                                downloads_path.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "❌ [file-ch] Cannot create sub-folder {}: {e}",
+                                downloads_path.display()
+                            ),
+                        }
+
+                        // Résolution canonique du chemin (suit symlinks/junctions)
+                        let dest_buf = downloads_path.join(&safe_name);
+                        let dest = dest_buf.to_string_lossy().to_string();
+
+                        // Diagnostic absolu + canonicalisation pour résoudre
+                        // les junctions / liens (sur Windows FR le dossier
+                        // peut être affiché "Téléchargements" mais s'appelle
+                        // bien "Downloads" sur disque, ou inversement).
+                        let canonical = tokio::fs::canonicalize(&downloads_path).await.ok();
+                        println!(
+                            "🔍 [file-ch] AGENT host={:?} userprofile={:?} downloads_dir={} canonical={:?} target={}",
+                            hostname::get().ok().map(|h| h.to_string_lossy().into_owned()),
+                            std::env::var("USERPROFILE").ok(),
+                            downloads_path.display(),
+                            canonical.as_ref().map(|p| p.display().to_string()),
+                            dest
+                        );
+
+                        // Liste le contenu actuel du dossier pour aider à
+                        // comprendre où chercher si le user ne trouve pas
+                        if let Ok(mut entries) = tokio::fs::read_dir(&downloads_path).await {
+                            let mut names: Vec<String> = Vec::new();
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                if let Some(n) = entry.file_name().to_str() {
+                                    names.push(n.to_string());
+                                }
+                                if names.len() >= 20 { break; }
+                            }
+                            println!("🔍 [file-ch] {} contient (max 20): {:?}", downloads_path.display(), names);
+                        } else {
+                            eprintln!("⚠️ [file-ch] Cannot list {}", downloads_path.display());
+                        }
 
                         // Remove stale file so we always start fresh
-                        let _ = tokio::fs::remove_file(&dest).await;
-                        println!("📤 [file-ch] Upload start: {safe_name} → {dest}");
+                        let _ = tokio::fs::remove_file(&dest_buf).await;
+                        println!(
+                            "📤 [file-ch] Upload START tid={tid} file='{safe_name}' totalChunks={total_chunks} → {dest}"
+                        );
 
                         *upload_state.lock().await = Some(FileChannelUploadState {
-                            transfer_id: tid,
-                            dest_path: dest,
+                            transfer_id: tid.clone(),
+                            dest_path: dest.clone(),
                             received_chunks: 0,
+                            buffer: Vec::with_capacity(
+                                (total_chunks as usize).saturating_mul(64 * 1024),
+                            ),
                         });
+
+                        // Confirme au viewer qu'on a bien enregistré le start
+                        // (utile pour debug — le viewer peut afficher la cible)
+                        let _ = channel.send_text(serde_json::json!({
+                            "type": "FILE_UPLOAD_STARTED",
+                            "transferId": tid,
+                            "destPath": dest,
+                        }).to_string()).await;
                     }
                     Some("FILE_COMPLETE") => {
                         let tid = json["transferId"].as_str().unwrap_or("").to_string();
-                        let mut state = upload_state.lock().await;
-                        let matches = state.as_ref()
-                            .map(|s| s.transfer_id == tid)
-                            .unwrap_or(false);
-                        if matches {
-                            let dest = state.as_ref()
-                                .map(|s| s.dest_path.clone())
-                                .unwrap_or_default();
-                            *state = None;
-                            drop(state);
-                            println!("✅ [file-ch] Upload complet: {dest}");
+                        let snapshot = {
+                            let mut state = upload_state.lock().await;
+                            let matches = state.as_ref()
+                                .map(|s| s.transfer_id == tid)
+                                .unwrap_or(false);
+                            if matches {
+                                let snap = state.as_ref().cloned();
+                                *state = None;
+                                snap
+                            } else {
+                                None
+                            }
+                        };
+
+                        let Some(snap) = snapshot else {
+                            eprintln!(
+                                "⚠️ [file-ch] FILE_COMPLETE tid={tid} mais pas d'upload_state — chunks perdus ?"
+                            );
                             let _ = channel.send_text(serde_json::json!({
-                                "type": "FILE_UPLOAD_ACK",
+                                "type": "FILE_ERROR",
                                 "transferId": tid,
+                                "message": "No upload state on agent — FILE_UPLOAD_START never received or processed",
                             }).to_string()).await;
+                            return;
+                        };
+
+                        let dest = snap.dest_path.clone();
+                        let received = snap.received_chunks;
+                        let buf_len = snap.buffer.len();
+                        let dest_buf = std::path::PathBuf::from(&dest);
+
+                        println!(
+                            "💾 [file-ch] Writing accumulated buffer tid={tid} chunks={received} bytes={buf_len} → {dest}"
+                        );
+
+                        // Écriture unique avec OpenOptions explicite
+                        // (write|create|truncate) puis flush + sync_all pour
+                        // garantir que le fichier est sur disque avant l'ACK.
+                        use tokio::io::AsyncWriteExt;
+                        let write_result: Result<(), String> = async {
+                            let mut file = tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .open(&dest_buf)
+                                .await
+                                .map_err(|e| format!("open: {e}"))?;
+                            file.write_all(&snap.buffer).await
+                                .map_err(|e| format!("write: {e}"))?;
+                            file.flush().await.map_err(|e| format!("flush: {e}"))?;
+                            file.sync_all().await.map_err(|e| format!("sync: {e}"))?;
+                            Ok(())
+                        }.await;
+
+                        if let Err(e) = write_result {
+                            eprintln!("❌ [file-ch] Failed to write {dest}: {e}");
+                            let _ = channel.send_text(serde_json::json!({
+                                "type": "FILE_ERROR",
+                                "transferId": tid,
+                                "message": format!("Cannot write file at {dest}: {e}"),
+                            }).to_string()).await;
+                            return;
+                        }
+
+                        // Vérifie que le fichier existe réellement après le sync
+                        let metadata = tokio::fs::metadata(&dest_buf).await;
+                        let canonical = tokio::fs::canonicalize(&dest_buf).await
+                            .map(|p| p.to_string_lossy().to_string())
+                            .ok();
+                        match metadata {
+                            Ok(meta) => {
+                                let final_path = canonical.clone().unwrap_or_else(|| dest.clone());
+                                println!(
+                                    "✅ [file-ch] Upload COMPLETE tid={tid} chunks={received} size={} → {final_path}",
+                                    meta.len()
+                                );
+                                if let Some(parent) = dest_buf.parent() {
+                                    if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+                                        let mut names = Vec::new();
+                                        while let Ok(Some(e)) = entries.next_entry().await {
+                                            if let Some(n) = e.file_name().to_str() { names.push(n.to_string()); }
+                                        }
+                                        println!("📁 [file-ch] {} contient: {:?}", parent.display(), names);
+                                    }
+                                }
+                                let _ = channel.send_text(serde_json::json!({
+                                    "type": "FILE_UPLOAD_ACK",
+                                    "transferId": tid,
+                                    "destPath": dest,
+                                    "canonicalPath": canonical,
+                                    "size": meta.len(),
+                                }).to_string()).await;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "❌ [file-ch] Wrote {buf_len} bytes but metadata fails for {dest}: {e}"
+                                );
+                                let _ = channel.send_text(serde_json::json!({
+                                    "type": "FILE_ERROR",
+                                    "transferId": tid,
+                                    "message": format!("File missing after save at {dest}: {e}"),
+                                }).to_string()).await;
+                            }
                         }
                     }
                     _ => {}
                 }
             } else {
-                // Binary chunk → upload
+                // Binary chunk → accumulate in memory (write happens at FILE_COMPLETE)
                 if !allow_file_transfer {
                     return;
                 }
-                let (dest, append) = {
+                let bytes_len = msg.data.len();
+                let chunk_idx = {
                     let mut state = upload_state.lock().await;
                     if let Some(ref mut s) = *state {
-                        let dest = s.dest_path.clone();
-                        let append = s.received_chunks > 0;
+                        s.buffer.extend_from_slice(&msg.data);
                         s.received_chunks += 1;
-                        (dest, append)
+                        s.received_chunks
                     } else {
+                        eprintln!(
+                            "⚠️ [file-ch] Binary chunk reçu sans upload_state actif (size={bytes_len}) — ignoré"
+                        );
                         return;
                     }
                 };
-                let data: Vec<u8> = msg.data.to_vec();
-                if let Err(e) =
-                    FileTransferService::new().save_file_bytes(&dest, &data, append).await
-                {
-                    eprintln!("❌ [file-ch] Upload write error: {e}");
+                if chunk_idx == 1 || chunk_idx % 16 == 0 {
+                    println!(
+                        "📦 [file-ch] chunk #{chunk_idx} ({bytes_len} bytes) accumulé"
+                    );
                 }
             }
         })
