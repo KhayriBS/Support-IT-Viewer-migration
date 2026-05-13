@@ -1501,6 +1501,25 @@ impl AgentWebRtc {
                                             .await;
                                             return;
                                         }
+                                        // Pre-Gemini : le viewer veut un screenshot REEL de notre
+                                        // ecran (et pas la frame WebRTC decodee, qui peut etre noire
+                                        // si emission_paused=true). On capture cote agent avec
+                                        // screenshots::Screen et on renvoie en base64 par le meme
+                                        // DataChannel, indexe par commandId pour matcher la response
+                                        // cote viewer en cas de requetes concurrentes.
+                                        "request_screenshot" => {
+                                            let command_id = value
+                                                .get("commandId")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            println!("📸 request_screenshot recu (commandId={command_id})");
+                                            let channel_reply = Arc::clone(&channel_for_ai);
+                                            tokio::spawn(async move {
+                                                handle_screenshot_request(channel_reply, command_id).await;
+                                            });
+                                            return;
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1887,6 +1906,83 @@ impl AgentWebRtc {
             }
         }
     }
+}
+
+// ─── AI screenshot bridge ─────────────────────────────────────────────────────
+
+/// Repond a un message DataChannel `{"type":"request_screenshot","commandId":"..."}`.
+///
+/// Capture l'ecran cote AGENT (pas via la frame WebRTC decodee qui peut etre
+/// noire si emission_paused=true) puis renvoie sur le meme DataChannel :
+///
+///   `{"type":"screenshot_response","commandId":"...","data":"<base64>","width":W,"height":H}`
+///
+/// En cas d'echec capture (ex: pas d'ecran primaire trouvable, surface bloquee
+/// par OBS, etc.), on renvoie `{"type":"screenshot_response","commandId":"...","error":"..."}`
+/// pour que le viewer puisse afficher un message clair plutot que de timeout.
+async fn handle_screenshot_request(channel: Arc<RTCDataChannel>, command_id: String) {
+    // q=70 -> ~150-400 KB de base64 pour un 1080p. Suffisant pour la vision
+    // Gemini Flash sans saturer le DataChannel SCTP.
+    let result = super::screen_capture::capture_primary_jpeg_base64(70);
+
+    // On a besoin de la resolution native pour que Spring/Gemini puisse
+    // raisonner sur les coordonnees -- on la rapatrie via la meme API que
+    // l'executor IA.
+    let dims = primary_screen_dimensions();
+
+    let reply = match (result, dims) {
+        (Ok(b64), Some((w, h))) => {
+            println!(
+                "📸 screenshot capture pour {command_id} (~{} KB, {w}x{h})",
+                b64.len() / 1024
+            );
+            serde_json::json!({
+                "type": "screenshot_response",
+                "commandId": command_id,
+                "data": b64,
+                "width": w,
+                "height": h,
+            })
+        }
+        (Ok(b64), None) => {
+            // Capture OK mais on n'a pas pu lire les dimensions -- renvoyer
+            // quand meme la donnee, Spring/Gemini saura faire sans.
+            println!(
+                "📸 screenshot capture pour {command_id} (~{} KB, dims unknown)",
+                b64.len() / 1024
+            );
+            serde_json::json!({
+                "type": "screenshot_response",
+                "commandId": command_id,
+                "data": b64,
+            })
+        }
+        (Err(e), _) => {
+            eprintln!("❌ screenshot capture failed for {command_id}: {e}");
+            serde_json::json!({
+                "type": "screenshot_response",
+                "commandId": command_id,
+                "error": format!("agent capture failed: {e}"),
+            })
+        }
+    };
+
+    if let Err(e) = channel.send_text(reply.to_string()).await {
+        eprintln!("❌ failed to send screenshot_response for {command_id}: {e}");
+    }
+}
+
+#[cfg(windows)]
+fn primary_screen_dimensions() -> Option<(i32, i32)> {
+    use screenshots::Screen;
+    let screens = Screen::all().ok()?;
+    let s = screens.iter().find(|s| s.display_info.is_primary).or_else(|| screens.first())?;
+    Some((s.display_info.width as i32, s.display_info.height as i32))
+}
+
+#[cfg(not(windows))]
+fn primary_screen_dimensions() -> Option<(i32, i32)> {
+    None
 }
 
 // ─── File DataChannel helpers ─────────────────────────────────────────────────

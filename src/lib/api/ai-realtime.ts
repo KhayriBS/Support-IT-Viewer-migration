@@ -119,6 +119,19 @@ export class AiRealtimeClient {
           }
         });
 
+        // Canal dedie pour les erreurs serveur (timeout 30s Gemini, exceptions
+        // inattendues). Spring pousse aussi l'erreur sur /actions en duplicate
+        // pour compat, mais ce canal permet de declencher une UI specifique
+        // (ex: banner rouge persistante au lieu d'une bulle dans le chat).
+        this.client?.subscribe("/user/queue/ai/error", (frame: IMessage) => {
+          try {
+            const payload = JSON.parse(frame.body) as AiActionEnvelope;
+            this.actionHandlers.forEach((h) => h(payload));
+          } catch (err) {
+            console.warn("[ai-stomp] malformed error frame", err);
+          }
+        });
+
         this._setState("connected");
       },
 

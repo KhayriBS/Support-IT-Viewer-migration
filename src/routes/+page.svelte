@@ -102,6 +102,19 @@
     action?: string;
   }
 
+  /**
+   * Map des requetes de screenshot en cours vers l'agent Rust distant.
+   * Cle = commandId UUID. Resolu quand on recoit un screenshot_response
+   * du DataChannel avec le meme commandId. Permet de gerer plusieurs /ai
+   * concurrents sans melanger les screenshots.
+   */
+  interface PendingScreenshot {
+    resolve: (payload: { jpegBase64: string; width: number; height: number }) => void;
+    reject: (err: Error) => void;
+    timeoutId: ReturnType<typeof setTimeout>;
+  }
+  const pendingScreenshots = new Map<string, PendingScreenshot>();
+
   // â”€â”€ Diagnostic logger (always on â€” strip these once issue is fixed) â”€â”€â”€â”€â”€â”€â”€â”€
   // Goal: see in DevTools console exactly which event/branch fires when the
   // session dies. Prefix every log with [DIAG] for easy grep.
@@ -1309,7 +1322,12 @@
 
   // ── AI Agent helpers ────────────────────────────────────────────────────
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   /**
+   * DEPRECATED — depuis l'ajout de requestScreenshotFromRemote(), l'IA n'utilise
+   * plus le canvas du <video> WebRTC. On garde la fonction pour usage futur
+   * (preview locale, debug, fallback offline si l'agent ne repond pas).
+   *
    * Capture une frame du <video> WebRTC en JPEG base64 (sans préfixe data:).
    * Retourne aussi la résolution native pour que l'agent distant puisse
    * dénormaliser les coordonnées de clic (canvas peut être redimensionné).
@@ -1339,6 +1357,76 @@
     const comma = dataUrl.indexOf(",");
     if (comma < 0) return null;
     return { jpegBase64: dataUrl.slice(comma + 1), width: w, height: h };
+  }
+
+  /**
+   * Demande a l'agent distant de capturer un screenshot REEL de son ecran et
+   * le renvoyer en JPEG base64 via le DataChannel "input". Plus fiable que
+   * captureFrame() qui depend du <video> WebRTC (peut etre noir si l'emission
+   * est suspendue, ou en retard de plusieurs frames sur le bureau actuel).
+   *
+   * Round-trip typique : 100-400 ms selon resolution + qualite reseau.
+   * Timeout par defaut 5s — au-dela on considere que l'agent ne repond plus.
+   */
+  async function requestScreenshotFromRemote(
+    timeoutMs = 5000
+  ): Promise<{ jpegBase64: string; width: number; height: number }> {
+    if (!viewerControlChannel || viewerControlChannel.readyState !== "open") {
+      throw new Error("DataChannel WebRTC non disponible");
+    }
+
+    const commandId = (typeof crypto !== "undefined" && "randomUUID" in crypto)
+      ? crypto.randomUUID()
+      : `cmd-${Date.now()}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        pendingScreenshots.delete(commandId);
+        reject(new Error(`PC distant ne repond pas (timeout ${timeoutMs}ms)`));
+      }, timeoutMs);
+
+      pendingScreenshots.set(commandId, { resolve, reject, timeoutId });
+
+      try {
+        viewerControlChannel!.send(JSON.stringify({
+          type: "request_screenshot",
+          commandId
+        }));
+      } catch (err) {
+        clearTimeout(timeoutId);
+        pendingScreenshots.delete(commandId);
+        reject(new Error(`Envoi request_screenshot impossible : ${String(err)}`));
+      }
+    });
+  }
+
+  /**
+   * Resoud (ou rejette) une requete de screenshot en attente quand l'agent
+   * Rust nous repond. Appele depuis viewerControlChannel.onmessage.
+   */
+  function handleScreenshotResponse(payload: Record<string, unknown>) {
+    const commandId = typeof payload.commandId === "string" ? payload.commandId : "";
+    if (!commandId) return;
+    const pending = pendingScreenshots.get(commandId);
+    if (!pending) {
+      console.warn(`[ai] screenshot_response avec commandId inconnu : ${commandId}`);
+      return;
+    }
+    clearTimeout(pending.timeoutId);
+    pendingScreenshots.delete(commandId);
+
+    if (typeof payload.error === "string" && payload.error.length > 0) {
+      pending.reject(new Error(payload.error));
+      return;
+    }
+    const data = typeof payload.data === "string" ? payload.data : "";
+    if (!data) {
+      pending.reject(new Error("Réponse screenshot vide"));
+      return;
+    }
+    const width = typeof payload.width === "number" ? payload.width : 0;
+    const height = typeof payload.height === "number" ? payload.height : 0;
+    pending.resolve({ jpegBase64: data, width, height });
   }
 
   /**
@@ -1375,6 +1463,24 @@
   }
 
   /**
+   * Raccourci UI : envoie le contenu courant du chat directement comme une
+   * commande IA, SANS exiger le prefixe "/ai ". Branchee sur le bouton 🤖 et
+   * sur Ctrl/Cmd+Entree dans la sidebar chat.
+   *
+   * Equivalent fonctionnel a sendAiCommand(chatInput) + vidage de l'input.
+   */
+  async function sendChatAsAi(): Promise<void> {
+    const content = chatInput.trim();
+    if (!content) return;
+    if (selectedFeature !== "screen") {
+      aiError = "L'IA n'est disponible que depuis le panneau Écran.";
+      return;
+    }
+    chatInput = "";
+    await sendAiCommand(content);
+  }
+
+  /**
    * Pousse la commande IA + screenshot vers Spring via STOMP.
    * Affiche aussi la commande comme message technicien dans le chat IA.
    */
@@ -1407,35 +1513,25 @@
       return;
     }
 
-    // ── Auto-resume vidéo si suspendue ──────────────────────────────────
-    // L'agent distant démarre PAUSÉ et ne reprend que sur VIDEO_RESUME. Si le
-    // technicien tape /ai sans avoir cliqué "Play", on serait coincé sur une
-    // frame fantôme (ou pas de frame du tout). On force ici l'émission et on
-    // attend qu'une frame fraiche soit réellement décodée avant de capturer.
-    const wasPaused = !rdScreenPlayRequested;
-    if (wasPaused) {
-      rdScreenPlayRequested = true; // déclenche l'effet → envoie VIDEO_RESUME
-      aiError = "Reprise de la diffusion vidéo pour capturer une frame…";
-    }
-
+    // ── Capture du screenshot via l'AGENT DISTANT (pas via le canvas WebRTC) ──
+    // Le DataChannel demande a l'agent Rust de capturer son ecran avec la lib
+    // `screenshots`. Avantages vs canvas.toBlob() :
+    //   • marche meme si le stream video est suspendu (frame_emission_paused=true)
+    //   • toujours pleine resolution native (pas d'echelle/encodage WebRTC)
+    //   • toujours frais (pas de frame en retard dans le jitter buffer)
     aiBusy = true;
-    const freshFrame = await waitForFreshFrame(wasPaused ? 4000 : 1500);
-    if (!freshFrame) {
-      aiBusy = false;
-      aiError = wasPaused
-        ? "Aucune frame reçue après reprise de la diffusion. L'agent distant ne semble pas émettre — vérifie la connexion WebRTC."
-        : "Aucune frame vidéo disponible. La diffusion est peut-être suspendue ou bloquée.";
-      return;
-    }
+    aiError = null;
 
-    const frame = captureFrame();
-    if (!frame) {
+    let frame: { jpegBase64: string; width: number; height: number };
+    try {
+      frame = await requestScreenshotFromRemote(5000);
+    } catch (err) {
       aiBusy = false;
-      aiError = "Capture de la frame impossible (canvas tainted ou décodeur silencieux).";
+      aiError = String((err as Error).message ?? err);
+      console.warn("[ai] requestScreenshotFromRemote failed:", err);
       return;
     }
     aiLastSentAtMs = Date.now();
-    aiError = null; // efface le message "Reprise…" si on est arrivé jusqu'ici
 
     // Affiche la commande dans le chat (côté local seulement — l'agent IA
     // ne passe pas par la room chat habituelle).
@@ -2318,20 +2414,26 @@
     };
 
     // ── Inbound messages from the remote agent ────────────────────────────
-    // Le DataChannel "input" est bi-directionnel : l'agent Rust nous renvoie
-    // les AI_ACTION_RESULT (succes/echec + screenshot de verification). On
-    // ne court-circuite pas les autres messages — il n'y en a pas d'autres
-    // attendus pour l'instant.
+    // Le DataChannel "input" est bi-directionnel — l'agent Rust nous renvoie :
+    //   • AI_ACTION_RESULT     : compte-rendu d'une action IA (click, type, …)
+    //   • screenshot_response  : reponse a notre request_screenshot pre-Gemini
     channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
       if (typeof event.data !== "string") return;
       try {
         const payload = JSON.parse(event.data) as Record<string, unknown>;
-        if (payload.type === "AI_ACTION_RESULT") {
-          handleAiActionResult(payload);
+        switch (payload.type) {
+          case "AI_ACTION_RESULT":
+            handleAiActionResult(payload);
+            break;
+          case "screenshot_response":
+            handleScreenshotResponse(payload);
+            break;
+          default:
+            // Ignore silencieusement les types inconnus (forward-compat).
+            break;
         }
       } catch {
-        // Pas un JSON — ignore silencieusement (peut etre un keepalive
-        // texte futur, ou un message inconnu).
+        // Pas un JSON — ignore silencieusement.
       }
     };
   }
@@ -4440,16 +4542,36 @@
                 <input
                   class="rd-chat__input"
                   type="text"
-                  placeholder="Message… ou /ai <commande>"
+                  placeholder="Message au technicien… (ou tape ici puis 🤖 pour demander à l'IA)"
                   bind:value={chatInput}
-                  onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      // Maj+Entree (déjà déclenché par la garde) reservé futur.
+                      // Ctrl/Cmd+Entree = envoie via IA directement (raccourci power-user).
+                      if (e.ctrlKey || e.metaKey) {
+                        void sendChatAsAi();
+                      } else {
+                        void sendChatMessage();
+                      }
+                    }
+                  }}
                   oninput={dispatchChatTyping}
                 />
+                <button
+                  class="rd-chat__send rd-chat__send-ai"
+                  type="button"
+                  onclick={() => void sendChatAsAi()}
+                  disabled={!chatInput.trim() || !aiConnected || aiBusy}
+                  title="Demander à l'IA (Ctrl+Entrée)">
+                  {aiBusy ? "…" : "🤖"}
+                </button>
                 <button
                   class="rd-chat__send"
                   type="button"
                   onclick={() => void sendChatMessage()}
-                  disabled={!chatInput.trim()}>
+                  disabled={!chatInput.trim()}
+                  title="Envoyer au technicien (Entrée)">
                   →
                 </button>
               </div>
@@ -7263,6 +7385,21 @@
     transition: background 0.15s;
   }
   .rd-chat__send:hover:not(:disabled) { background: #7dd3fc; }
+  .rd-chat__send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* Variante "IA" du bouton envoi — distincte visuellement pour que le user
+     ne se demande pas si son message va au technicien ou à l'IA. */
+  .rd-chat__send-ai {
+    background: linear-gradient(135deg, #a78bfa 0%, #818cf8 100%);
+    color: #fff;
+    font-size: 16px;
+  }
+  .rd-chat__send-ai:hover:not(:disabled) {
+    background: linear-gradient(135deg, #c4b5fd 0%, #a5b4fc 100%);
+  }
   .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* ── Barre flottante télémétrie (top-left du stage) ─────────────── */
