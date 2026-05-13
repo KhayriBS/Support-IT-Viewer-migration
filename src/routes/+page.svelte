@@ -1,8 +1,8 @@
 ﻿<script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, onMount } from "svelte";
-  import { ChatRealtimeClient, SignalingClient, technicianApi } from "$lib/api";
-  import type { Agent, ChatMessage, ControlSession, SignalMessage, TypingNotification } from "$lib/api";
+  import { AiRealtimeClient, ChatRealtimeClient, SignalingClient, technicianApi } from "$lib/api";
+  import type { AiAction, AiActionEnvelope, Agent, ChatMessage, ControlSession, SignalMessage, TypingNotification } from "$lib/api";
   import type { FileEntry, FileTransfer } from "$lib/api/types";
 
   interface AgentMetrics {
@@ -67,6 +67,21 @@
 
   const signalingClient = new SignalingClient();
   const chatClient = new ChatRealtimeClient();
+  const aiClient = new AiRealtimeClient();
+
+  // ── AI Agent state ──────────────────────────────────────────────────────
+  // Pipeline:
+  //   1. Technicien tape "/ai <command>" dans le chat.
+  //   2. captureFrame() snapshots <video> → JPEG base64.
+  //   3. aiClient.publishFrame() → Spring → Gemini → actions JSON.
+  //   4. onAction() les affiche dans le chat ET les renvoie via DataChannel
+  //      WebRTC à l'agent Rust qui les exécute (enigo / tokio::process).
+  let aiConnected = $state(false);
+  let aiBusy = $state(false);
+  let aiError = $state<string | null>(null);
+  let aiLastRationale = $state<string | null>(null);
+  let detachAiActionListener: (() => void) | null = null;
+  let detachAiConnectionListener: (() => void) | null = null;
 
   // â”€â”€ Diagnostic logger (always on â€” strip these once issue is fixed) â”€â”€â”€â”€â”€â”€â”€â”€
   // Goal: see in DevTools console exactly which event/branch fires when the
@@ -1187,6 +1202,9 @@
 
     // Start poll as baseline fallback; stopped automatically when STOMP connects
     startChatPoll();
+
+    // L'agent IA partage le cycle de vie du chat (même base STOMP /ws/chat).
+    connectAi();
   }
 
   function disconnectChat() {
@@ -1198,12 +1216,28 @@
     if (typingClearTimer) { clearTimeout(typingClearTimer); typingClearTimer = null; }
     typingInfo = null;
     clearChatListeners();
+    disconnectAi();
   }
 
   async function sendChatMessage() {
     const roomId = chatRoomId || resolveRoomId();
     const content = chatInput.trim();
     if (!roomId || !content) return;
+
+    // ── AI command shortcut ───────────────────────────────────────────────
+    // "/ai <prompt>"  → capture une frame WebRTC + envoie à l'agent IA via
+    // STOMP. Le message normal n'est pas envoyé à l'autre peer pour éviter
+    // de polluer le chat humain.
+    if (content.toLowerCase().startsWith("/ai ")) {
+      const aiPrompt = content.slice(4).trim();
+      if (!aiPrompt) {
+        chatError = "Usage: /ai <commande>";
+        return;
+      }
+      chatInput = "";
+      await sendAiCommand(aiPrompt);
+      return;
+    }
 
     // Guard: no active session
     const session = queriedSession ?? activeSession;
@@ -1244,6 +1278,197 @@
 
     chatInput = "";
     chatError = null;
+  }
+
+  // ── AI Agent helpers ────────────────────────────────────────────────────
+
+  /**
+   * Capture une frame du <video> WebRTC en JPEG base64 (sans préfixe data:).
+   * Retourne aussi la résolution native pour que l'agent distant puisse
+   * dénormaliser les coordonnées de clic (canvas peut être redimensionné).
+   */
+  function captureFrame(): { jpegBase64: string; width: number; height: number } | null {
+    const video = viewerVideoEl;
+    if (!video) return null;
+    // videoWidth / videoHeight = résolution réelle du flux décodé (pas le DOM).
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) return null;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    try {
+      ctx.drawImage(video, 0, 0, w, h);
+    } catch (err) {
+      // Peut throw "tainted" si Tauri sert le flux cross-origin (rare en WebRTC).
+      console.warn("[ai] captureFrame drawImage failed", err);
+      return null;
+    }
+    // JPEG q=0.7 — compromis taille/qualité pour la vision Gemini.
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) return null;
+    return { jpegBase64: dataUrl.slice(comma + 1), width: w, height: h };
+  }
+
+  /**
+   * Pousse la commande IA + screenshot vers Spring via STOMP.
+   * Affiche aussi la commande comme message technicien dans le chat IA.
+   */
+  async function sendAiCommand(command: string): Promise<void> {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+
+    const session = queriedSession ?? activeSession;
+    if (!session || session.status !== "ACTIVE") {
+      aiError = "Aucune session active.";
+      return;
+    }
+    if (!viewerDataChannelOpen) {
+      aiError = "DataChannel WebRTC pas encore ouvert.";
+      return;
+    }
+    if (!aiClient.isConnected()) {
+      aiError = "Canal IA STOMP hors ligne — tentative de reconnexion…";
+      void aiClient.connect().catch(() => {});
+      return;
+    }
+
+    const frame = captureFrame();
+    if (!frame) {
+      aiError = "Impossible de capturer une frame du flux vidéo.";
+      return;
+    }
+
+    // Affiche la commande dans le chat (côté local seulement — l'agent IA
+    // ne passe pas par la room chat habituelle).
+    appendAiChatMessage(`/ai ${trimmed}`, "ai-user");
+
+    aiBusy = true;
+    aiError = null;
+    const ok = aiClient.publishFrame({
+      sessionId: String(session.id),
+      command: trimmed,
+      screenshot: frame.jpegBase64,
+      frameWidth: frame.width,
+      frameHeight: frame.height,
+      technicianUsername: session.technicianUsername ?? undefined
+    });
+    if (!ok) {
+      aiBusy = false;
+      aiError = "Échec d'envoi STOMP — réessaie dans un instant.";
+    }
+  }
+
+  /**
+   * Insère un message synthétique dans le chat. On réutilise le tableau
+   * `chatMessages` existant pour bénéficier de l'UI déjà câblée, mais on
+   * marque les entrées IA via senderRole "ai-system" / "ai-user".
+   */
+  function appendAiChatMessage(content: string, role: "ai-system" | "ai-user" | "ai-action") {
+    // ai-user (commande du tech) → bulle "mine" (côté local)
+    // ai-system / ai-action     → bulle remote (côté droit), tag visuel via le préfixe
+    const senderRole = role === "ai-user" ? chatLocalRole : chatRemoteRole;
+    const senderName = role === "ai-user" ? "Technicien (IA)" : "Agent IA";
+    const msg: ChatMessage = {
+      roomId: chatRoomId || resolveRoomId() || "ai",
+      senderRole,
+      senderName,
+      receiverRole: role === "ai-user" ? chatRemoteRole : chatLocalRole,
+      receiverName: role === "ai-user" ? chatRemoteRole : chatLocalRole,
+      content,
+      // +1 ms à chaque message IA pour garantir un ordre stable même en cas
+      // de timestamp identique (msgKey utilise timestamp dans la clé).
+      timestamp: new Date(Date.now()).toISOString()
+    };
+    chatMessages = [...chatMessages, msg].slice(-200);
+  }
+
+  function formatAiActionForChat(a: AiAction): string {
+    switch (a.type) {
+      case "click":         return `🖱️ click(${a.x.toFixed(2)}, ${a.y.toFixed(2)}${a.button ? `, ${a.button}` : ""})`;
+      case "double_click":  return `🖱️🖱️ double_click(${a.x.toFixed(2)}, ${a.y.toFixed(2)})`;
+      case "move":          return `➡️ move(${a.x.toFixed(2)}, ${a.y.toFixed(2)})`;
+      case "type_text":     return `⌨️ type "${a.text}"`;
+      case "key":           return `🔑 key ${[...(a.modifiers ?? []), a.key].join("+")}`;
+      case "shell":         return `💻 shell(${a.shell ?? "default"}): ${a.cmd}`;
+      case "screenshot":    return `📸 screenshot`;
+      case "wait":          return `⏳ wait ${a.ms}ms`;
+      default:              return `❓ ${JSON.stringify(a)}`;
+    }
+  }
+
+  /**
+   * Forwarder : pousse une action IA vers l'agent Rust distant via le
+   * DataChannel WebRTC existant. On enveloppe dans un type `AI_ACTION` pour
+   * que le handler Rust ne le confonde pas avec les RemoteInputEvent
+   * standards (clic souris, touches clavier, etc.).
+   */
+  function forwardAiActionToAgent(action: AiAction): boolean {
+    if (!viewerControlChannel || viewerControlChannel.readyState !== "open") return false;
+    try {
+      viewerControlChannel.send(JSON.stringify({ type: "AI_ACTION", action }));
+      return true;
+    } catch (err) {
+      console.warn("[ai] forward to agent failed", err);
+      return false;
+    }
+  }
+
+  function handleAiActionEnvelope(env: AiActionEnvelope) {
+    aiBusy = false;
+    aiLastRationale = env.rationale ?? null;
+
+    const current = queriedSession ?? activeSession;
+    if (current && String(current.id) !== env.sessionId) {
+      // Réponse pour une autre session — ignore (peut arriver après un swap).
+      return;
+    }
+
+    if (env.status !== "ok") {
+      aiError = env.error ?? "Erreur IA inconnue.";
+      appendAiChatMessage(`❌ ${aiError}`, "ai-system");
+      return;
+    }
+    aiError = null;
+
+    if (env.rationale) {
+      appendAiChatMessage(`🧠 ${env.rationale}`, "ai-system");
+    }
+
+    for (const action of env.actions ?? []) {
+      appendAiChatMessage(formatAiActionForChat(action), "ai-action");
+      const ok = forwardAiActionToAgent(action);
+      if (!ok) {
+        appendAiChatMessage(`⚠️ Impossible d'envoyer cette action à l'agent (DataChannel indisponible).`, "ai-system");
+        break;
+      }
+    }
+  }
+
+  function connectAi() {
+    if (detachAiActionListener) return; // already wired
+    detachAiActionListener = aiClient.onAction(handleAiActionEnvelope);
+    detachAiConnectionListener = aiClient.onConnection((connected) => {
+      aiConnected = connected;
+      if (!connected) aiBusy = false;
+    });
+    void aiClient.connect().catch((err) => {
+      aiError = `Canal IA: ${String(err)}`;
+    });
+  }
+
+  function disconnectAi() {
+    detachAiActionListener?.();
+    detachAiActionListener = null;
+    detachAiConnectionListener?.();
+    detachAiConnectionListener = null;
+    aiClient.disconnect();
+    aiConnected = false;
+    aiBusy = false;
   }
 
   function dispatchChatTyping() {
@@ -3507,7 +3732,7 @@
     diag("onDestroy: real teardown (window closing)");
     stopSessionActivationWatch();
     void disconnectSignaling();
-    disconnectChat();
+    disconnectChat(); // appelle aussi disconnectAi() en cascade
     void stopAgentLifecycle();
   });
 </script>
@@ -3724,6 +3949,9 @@
               <span class="rd-chat__pill" class:rd-chat__pill--ok={chatConnected} class:rd-chat__pill--warn={!chatConnected}>
                 {chatConnected ? "Connecté" : "Hors ligne"}
               </span>
+              <span class="rd-chat__pill" class:rd-chat__pill--ok={aiConnected} class:rd-chat__pill--warn={!aiConnected}>
+                IA&nbsp;: {aiConnected ? (aiBusy ? "Analyse…" : "Prête") : "Hors ligne"}
+              </span>
               <span class="rd-chat__role">Vous êtes&nbsp;: <strong>{chatLocalRole === "agent" ? "PC distant" : "Technicien"}</strong></span>
             </p>
           </div>
@@ -3772,7 +4000,7 @@
           <input
             class="rd-chat__input"
             type="text"
-            placeholder="Écris un message…"
+            placeholder="Écris un message… ou /ai <commande>"
             bind:value={chatInput}
             disabled={!activeSession || activeSession.status !== "ACTIVE"}
             onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
