@@ -96,6 +96,58 @@ export interface TypingNotification {
 
 // ─── File transfer types ──────────────────────────────────────────────────────
 
+/**
+ * Sens du transfert tel que stocké en base, du point de vue technicien :
+ *  - UPLOAD   : technicien (viewer) envoie au PC distant (agent)
+ *  - DOWNLOAD : technicien rapatrie un fichier depuis le PC distant
+ */
+export type FileTransferDirection = "UPLOAD" | "DOWNLOAD";
+export type FileTransferStatus = "IN_PROGRESS" | "COMPLETED" | "FAILED" | "CANCELLED";
+
+export interface FileTransferStartRequest {
+  transferId: string;
+  sessionId?: number | null;
+  fromMachineId: string;
+  toMachineId: string;
+  direction: FileTransferDirection;
+  fileName: string;
+  fileSize?: number | null;
+  mimeType?: string | null;
+  destPath?: string | null;
+}
+
+export interface FileTransferUpdateRequest {
+  status: FileTransferStatus;
+  fileSize?: number | null;
+  errorMessage?: string | null;
+  destPath?: string | null;
+}
+
+export interface FileTransferLogEntry {
+  id: number;
+  transferId: string;
+  sessionId: number | null;
+  fromMachineId: string;
+  toMachineId: string;
+  direction: FileTransferDirection;
+  fileName: string;
+  fileSize: number;
+  mimeType: string | null;
+  destPath: string | null;
+  status: FileTransferStatus;
+  errorMessage: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+export interface FileTransferHistoryEntry extends FileTransferLogEntry {
+  /** "incoming" si la machine demandée est destinataire, "outgoing" si elle est expéditrice */
+  listDirection: "incoming" | "outgoing";
+  /** Identifiant de l'AUTRE peer (à afficher dans la carte) */
+  peerLabel: string;
+  durationMs: number | null;
+}
+
 export interface FileEntry {
   name: string;
   path: string;

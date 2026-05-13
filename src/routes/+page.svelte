@@ -58,6 +58,13 @@
   let rdFileSearch = $state("");
   let rdFileFilter = $state<"all" | "upload" | "download">("all");
 
+  // Historique fichiers : alimenté par l'API backend (audit BD persistant).
+  // GET /file-transfers/history/{key}?direction=&status=&q=
+  let rdFileHistory = $state<import("$lib/api/types").FileTransferHistoryEntry[]>([]);
+  let rdFileHistoryLoading = $state(false);
+  let rdFileHistoryError = $state<string | null>(null);
+  let rdFileHistoryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
   const signalingClient = new SignalingClient();
   const chatClient = new ChatRealtimeClient();
 
@@ -592,12 +599,64 @@
     rdSessionRefreshTimer = setTimeout(() => { void fetchSessionHistory(); }, 250);
   });
 
+  // ── Historique fichiers : appel direct à l'API Spring ──
+  // GET /file-transfers/history/{key}?direction=&status=&q=
+  // Filtre direction/status/q côté serveur, debounce client comme pour les sessions.
+  async function fetchFileHistory() {
+    const key = (localConnectionCode || localMachineId || "").trim();
+    if (!key) {
+      rdFileHistory = [];
+      return;
+    }
+    rdFileHistoryLoading = true;
+    rdFileHistoryError = null;
+    try {
+      // rdFileFilter "upload" = sortant (ce PC envoie) → "outgoing"
+      // rdFileFilter "download" = entrant (ce PC reçoit) → "incoming"
+      const direction =
+        rdFileFilter === "upload" ? "outgoing"
+          : rdFileFilter === "download" ? "incoming"
+          : "all";
+      const list = await technicianApi.getFileTransferHistory(key, {
+        direction,
+        status: "all",
+        q: rdFileSearch
+      });
+      rdFileHistory = list;
+    } catch (err) {
+      rdFileHistoryError = String(err);
+      rdFileHistory = [];
+    } finally {
+      rdFileHistoryLoading = false;
+    }
+  }
+
+  $effect(() => {
+    void localConnectionCode;
+    void localMachineId;
+    void rdFileFilter;
+    void rdFileSearch;
+    if (rdFileHistoryRefreshTimer) clearTimeout(rdFileHistoryRefreshTimer);
+    rdFileHistoryRefreshTimer = setTimeout(() => { void fetchFileHistory(); }, 250);
+  });
+
   // Refresh immédiat quand une session vient de démarrer / se terminer.
   $effect(() => {
     void activeSession?.id;
     void activeSession?.status;
     void pendingApprovalSession?.id;
     void fetchSessionHistory();
+    void fetchFileHistory();
+  });
+
+  // Refresh quand un transfert se termine localement (l'API a été notifiée
+  // mais on veut voir la nouvelle ligne immédiatement dans la liste).
+  $effect(() => {
+    // dépendance sur la liste des transferts en cours pour réagir aux fins
+    void Object.keys(fileTransfers).length;
+    for (const t of Object.values(fileTransfers)) void t.state;
+    if (rdFileHistoryRefreshTimer) clearTimeout(rdFileHistoryRefreshTimer);
+    rdFileHistoryRefreshTimer = setTimeout(() => { void fetchFileHistory(); }, 400);
   });
 
   // Auto-scroll de la liste de chat vers le bas dès qu'un message arrive
@@ -625,16 +684,85 @@
   });
   const chatRemoteRole = $derived(chatLocalRole === "agent" ? "viewer" : "agent");
 
-  const rdFilteredFiles = $derived.by(() => {
+  /**
+   * Vue normalisée d'un transfert pour l'historique. Vient soit de l'API
+   * backend (audit BD persistant), soit du dictionnaire in-memory pour les
+   * transferts en cours (qui n'ont pas encore d'enregistrement complet).
+   */
+  type RdFileRow = {
+    transferId: string;
+    fileName: string;
+    /** "upload" = ce PC a envoyé, "download" = ce PC a reçu */
+    type: "upload" | "download";
+    /** Identifiant lisible de l'autre PC */
+    peerLabel: string;
+    sizeBytes: number;
+    state: "active" | "complete" | "error" | "cancelled";
+    error: string | null;
+    /** Epoch ms pour le tri */
+    startedMs: number;
+    /** Pour les transferts en cours : progression */
+    doneBytes: number;
+    isLive: boolean;
+  };
+
+  const rdFilteredFiles = $derived.by<RdFileRow[]>(() => {
     const search = rdFileSearch.trim().toLowerCase();
-    const list = Object.values(fileTransfers);
-    return list
+    const rows = new Map<string, RdFileRow>();
+
+    // 1) Source de vérité : historique BD via API
+    for (const h of rdFileHistory) {
+      const peerLabel = h.peerLabel || (h.listDirection === "incoming" ? h.fromMachineId : h.toMachineId);
+      const row: RdFileRow = {
+        transferId: h.transferId,
+        fileName: h.fileName,
+        type: h.listDirection === "incoming" ? "download" : "upload",
+        peerLabel,
+        sizeBytes: h.fileSize,
+        state:
+          h.status === "COMPLETED" ? "complete"
+            : h.status === "FAILED" ? "error"
+            : h.status === "CANCELLED" ? "cancelled"
+            : "active",
+        error: h.errorMessage,
+        startedMs: h.startedAt ? Date.parse(h.startedAt) : Date.now(),
+        doneBytes: h.fileSize,
+        isLive: false
+      };
+      rows.set(h.transferId, row);
+    }
+
+    // 2) Override avec les transferts in-flight (progression live, état temps réel)
+    for (const t of Object.values(fileTransfers)) {
+      const peer =
+        activeSession?.agentMachineId
+          ?? rows.get(t.transferId)?.peerLabel
+          ?? "—";
+      rows.set(t.transferId, {
+        transferId: t.transferId,
+        fileName: t.fileName,
+        type: t.type,
+        peerLabel: peer,
+        sizeBytes: t.totalSize || t.doneBytes,
+        state:
+          t.state === "complete" ? "complete"
+            : t.state === "error" ? "error"
+            : "active",
+        error: t.error ?? null,
+        startedMs: t.startedAt,
+        doneBytes: t.doneBytes,
+        isLive: t.state === "active"
+      });
+    }
+
+    return Array.from(rows.values())
       .filter((f) => {
         if (rdFileFilter !== "all" && f.type !== rdFileFilter) return false;
-        if (search && !f.fileName.toLowerCase().includes(search)) return false;
+        if (search && !f.fileName.toLowerCase().includes(search)
+            && !f.peerLabel.toLowerCase().includes(search)) return false;
         return true;
       })
-      .sort((a, b) => b.startedAt - a.startedAt);
+      .sort((a, b) => b.startedMs - a.startedMs);
   });
 
   function rdFormatDuration(ms: number | null): string {
@@ -1182,13 +1310,15 @@
 
     if (type === "FILE_DOWNLOAD_RESPONSE") {
       activeDownloadId = tid;
+      const fileName = (msg.fileName as string) ?? "file";
+      const totalSize = (msg.totalSize as number) ?? 0;
       fileTransfers = {
         ...fileTransfers,
         [tid]: {
           transferId: tid,
           type: "download",
-          fileName: (msg.fileName as string) ?? "file",
-          totalSize: (msg.totalSize as number) ?? 0,
+          fileName,
+          totalSize,
           totalChunks: (msg.totalChunks as number) ?? 1,
           doneChunks: 0,
           doneBytes: 0,
@@ -1197,6 +1327,17 @@
           buffers: []
         } satisfies FileTransfer
       };
+      // Audit BD : direction inverse de upload — l'agent envoie, le viewer reçoit
+      logTransferStartSafe({
+        transferId: tid,
+        sessionId: activeSession?.id ?? null,
+        fromMachineId: peerMachineIdForLog(),
+        toMachineId: localMachineId,
+        direction: downloadDirectionForLog(),
+        fileName,
+        fileSize: totalSize,
+        mimeType: null
+      });
       return;
     }
 
@@ -1221,11 +1362,19 @@
         if (activeDownloadId === tid) {
           activeDownloadId = null;
         }
+        logTransferUpdateSafe(tid, {
+          status: "COMPLETED",
+          fileSize: transfer.totalSize
+        });
       } else if (transfer?.type === "upload") {
         fileTransfers = {
           ...fileTransfers,
           [tid]: { ...transfer, state: "complete" }
         };
+        logTransferUpdateSafe(tid, {
+          status: "COMPLETED",
+          fileSize: transfer.totalSize
+        });
       }
       return;
     }
@@ -1258,22 +1407,31 @@
           ...fileTransfers,
           [tid]: { ...transfer, state: "complete", ...(finalPath ? { destPath: finalPath } as Partial<FileTransfer> : {}) }
         };
+        logTransferUpdateSafe(tid, {
+          status: "COMPLETED",
+          fileSize: size > 0 ? size : transfer.totalSize,
+          destPath: finalPath || null
+        });
       }
       return;
     }
 
     if (type === "FILE_ERROR") {
+      const errMsg = (msg.message as string) ?? "unknown error";
       const transfer = fileTransfers[tid];
       if (transfer) {
         fileTransfers = {
           ...fileTransfers,
-          [tid]: { ...transfer, state: "error", error: (msg.message as string) ?? "unknown error" }
+          [tid]: { ...transfer, state: "error", error: errMsg }
         };
       } else {
-        console.error("[file-ch] remote error:", msg.message);
+        console.error("[file-ch] remote error:", errMsg);
       }
       if (activeDownloadId === tid) {
         activeDownloadId = null;
+      }
+      if (tid) {
+        logTransferUpdateSafe(tid, { status: "FAILED", errorMessage: errMsg });
       }
     }
   }
@@ -1311,6 +1469,44 @@
     console.info("[file-ch] download requested:", fileName, tid);
   }
 
+  // ── Audit BD : log les transferts dans /file-transfers ────────────────────
+  // Best-effort : on n'interrompt jamais le transfert si l'API échoue.
+
+  /** Identifiant de la machine pair (l'autre côté). */
+  function peerMachineIdForLog(): string {
+    const session = activeSession ?? queriedSession;
+    if (!session) return "";
+    if (chatLocalRole === "agent") {
+      return session.technicianUsername ?? "";
+    }
+    return session.agentMachineId ?? "";
+  }
+
+  /** Direction stockée en BD selon qui démarre (technicien=UPLOAD, agent=DOWNLOAD). */
+  function uploadDirectionForLog(): "UPLOAD" | "DOWNLOAD" {
+    return chatLocalRole === "agent" ? "DOWNLOAD" : "UPLOAD";
+  }
+
+  /** Direction stockée en BD pour un download (inverse du upload). */
+  function downloadDirectionForLog(): "UPLOAD" | "DOWNLOAD" {
+    return chatLocalRole === "agent" ? "UPLOAD" : "DOWNLOAD";
+  }
+
+  function logTransferStartSafe(payload: import("$lib/api/types").FileTransferStartRequest) {
+    void technicianApi.logFileTransferStart(payload).catch((err) => {
+      console.warn("[file-log] start failed:", err);
+    });
+  }
+
+  function logTransferUpdateSafe(
+    transferId: string,
+    payload: import("$lib/api/types").FileTransferUpdateRequest
+  ) {
+    void technicianApi.logFileTransferUpdate(transferId, payload).catch((err) => {
+      console.warn("[file-log] update failed:", err);
+    });
+  }
+
   async function uploadLocalFile(file: File) {
     if (!fileChannel || fileChannel.readyState !== "open") return;
 
@@ -1338,12 +1534,28 @@
       totalChunks
     }));
 
+    // Audit BD — best effort
+    logTransferStartSafe({
+      transferId: tid,
+      sessionId: activeSession?.id ?? null,
+      fromMachineId: localMachineId,
+      toMachineId: peerMachineIdForLog(),
+      direction: uploadDirectionForLog(),
+      fileName: file.name,
+      fileSize: file.size,
+      mimeType: file.type || null
+    });
+
     for (let i = 0; i < totalChunks; i++) {
       if (!fileChannel || fileChannel.readyState !== "open") {
         fileTransfers = {
           ...fileTransfers,
           [tid]: { ...fileTransfers[tid], state: "error", error: "Canal fermÃ© pendant l'envoi" }
         };
+        logTransferUpdateSafe(tid, {
+          status: "FAILED",
+          errorMessage: "Canal fermé pendant l'envoi"
+        });
         return;
       }
       // Backpressure
@@ -1361,6 +1573,10 @@
           ...fileTransfers,
           [tid]: { ...fileTransfers[tid], state: "error", error: `send: ${String(sendErr)}` }
         };
+        logTransferUpdateSafe(tid, {
+          status: "FAILED",
+          errorMessage: `send chunk #${i + 1}: ${String(sendErr)}`
+        });
         return;
       }
 
@@ -1390,6 +1606,10 @@
           [tid]: { ...cur, state: "complete", doneBytes: file.size }
         };
         console.log(`[file-ch] upload tid=${tid} forced to complete (ACK timeout)`);
+        logTransferUpdateSafe(tid, {
+          status: "COMPLETED",
+          fileSize: file.size
+        });
       }
     }, 1000);
   }
@@ -3995,8 +4215,10 @@
           </select>
         </div>
         <div class="rd-history__list">
-          {#if rdFilteredFiles.length === 0}
-            <p class="rd-empty">Aucun transfert pour les filtres actuels.</p>
+          {#if rdFileHistoryError}
+            <p class="rd-empty" style="color:#fca5a5">Erreur historique : {rdFileHistoryError}</p>
+          {:else if rdFilteredFiles.length === 0}
+            <p class="rd-empty">{rdFileHistoryLoading ? "Chargement…" : "Aucun transfert pour les filtres actuels."}</p>
           {:else}
             {#each rdFilteredFiles as file (file.transferId)}
               <article class="rd-file">
@@ -4004,15 +4226,16 @@
                 <div class="rd-file__body">
                   <strong class="rd-file__name">{file.fileName}</strong>
                   <p class="rd-file__sub">
-                    {file.type === "upload" ? "Envoyé" : "Reçu"}
-                    {#if activeSession?.agentMachineId}
-                      {file.type === "upload" ? "vers" : "de"} {activeSession.agentMachineId}
-                    {/if}
+                    {file.type === "upload" ? "Envoyé vers" : "Reçu de"}
+                    <strong>{file.peerLabel}</strong>
                   </p>
                   <p class="rd-file__meta">
-                    {rdFormatBytes(file.totalSize || file.doneBytes)} &nbsp;•&nbsp; {rdFormatRelative(file.startedAt)}
+                    {rdFormatBytes(file.sizeBytes)} &nbsp;•&nbsp; {rdFormatRelative(file.startedMs)}
                     {#if file.state !== "complete"}
                       &nbsp;•&nbsp; <span class="rd-file__state">{file.state}</span>
+                    {/if}
+                    {#if file.error}
+                      &nbsp;•&nbsp; <span class="rd-file__state" style="color:#fca5a5">{file.error}</span>
                     {/if}
                   </p>
                 </div>

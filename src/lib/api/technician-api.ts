@@ -4,6 +4,10 @@ import type {
   ApiResponse,
   ChatMessage,
   ControlSession,
+  FileTransferHistoryEntry,
+  FileTransferLogEntry,
+  FileTransferStartRequest,
+  FileTransferUpdateRequest,
   LoginRequest,
   MachineAuthStatus,
   RegisterRequest,
@@ -13,7 +17,7 @@ import type {
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "")
   ?? "https://signaling-server-tgsj.onrender.com";
 
-type HttpMethod = "GET" | "POST";
+type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
 interface RequestOptions {
   method?: HttpMethod;
@@ -240,5 +244,57 @@ export const technicianApi = {
   async getPendingMessages(roomId: string, token?: string) {
     const res = await request<ApiResponse<ChatMessage[]>>(`/chat/pending/${encodeURIComponent(roomId)}`, { token });
     return res.data ?? [];
+  },
+
+  // ── File transfer logging (audit trail dans la BD) ────────────────────────
+
+  /**
+   * Enregistre le début d'un transfert P2P en BD. Idempotent sur transferId :
+   * si la même UUID est rejouée, le serveur met à jour la ligne existante.
+   * À appeler dès que le client choisit un fichier à envoyer / reçoit un
+   * FILE_DOWNLOAD_RESPONSE.
+   */
+  async logFileTransferStart(payload: FileTransferStartRequest, token?: string) {
+    const res = await request<ApiResponse<FileTransferLogEntry>>("/file-transfers", {
+      method: "POST",
+      token,
+      body: payload
+    });
+    return unwrap(res);
+  },
+
+  /**
+   * Met à jour le statut d'un transfert (COMPLETED / FAILED / CANCELLED).
+   * À appeler à la fin pour finaliser la ligne de log avec completedAt.
+   */
+  async logFileTransferUpdate(transferId: string, payload: FileTransferUpdateRequest, token?: string) {
+    const res = await request<ApiResponse<FileTransferLogEntry>>(
+      `/file-transfers/${encodeURIComponent(transferId)}`,
+      { method: "PATCH", token, body: payload }
+    );
+    return unwrap(res);
+  },
+
+  /**
+   * Historique des transferts d'une machine donnée (machineId direct ou
+   * connection_code 6 chiffres). Filtres direction/status/q (search).
+   */
+  async getFileTransferHistory(
+    machineId: string,
+    options: {
+      direction?: "incoming" | "outgoing" | "all";
+      status?: "in_progress" | "completed" | "failed" | "cancelled" | "ended" | "all" | string;
+      q?: string;
+    } = {},
+    token?: string
+  ) {
+    const params = new URLSearchParams();
+    if (options.direction && options.direction !== "all") params.set("direction", options.direction);
+    if (options.status && options.status !== "all") params.set("status", options.status);
+    if (options.q && options.q.trim()) params.set("q", options.q.trim());
+    const qs = params.toString();
+    const path = `/file-transfers/history/${encodeURIComponent(machineId)}${qs ? `?${qs}` : ""}`;
+    const res = await request<ApiResponse<FileTransferHistoryEntry[]>>(path, { token });
+    return unwrap(res) ?? [];
   }
 };
