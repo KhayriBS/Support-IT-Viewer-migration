@@ -40,6 +40,12 @@ rtp = "0.11"
 bytes = "1"
 screenshots = "0.8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# ── AI agent input injection (souris/clavier portable) ────────────
+# Utilise par ai_executor pour les actions Click / TypeText / Key envoyees
+# par Gemini. Coexiste avec input_handler.rs (qui passe par les P/Invoke
+# Windows direct pour le streaming d'input temps-reel viewer→agent).
+enigo = "0.2"
 openh264 = "0.6"
 
 # ── Encoding ──────────────────────────────────────────────────────

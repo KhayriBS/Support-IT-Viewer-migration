@@ -80,8 +80,20 @@
   let aiBusy = $state(false);
   let aiError = $state<string | null>(null);
   let aiLastRationale = $state<string | null>(null);
+  /** Dernier screenshot de verification renvoye par l'agent Rust (data URL JPEG). */
+  let aiLastVerificationImage = $state<string | null>(null);
   let detachAiActionListener: (() => void) | null = null;
   let detachAiConnectionListener: (() => void) | null = null;
+
+  interface AiActionResult {
+    type: "AI_ACTION_RESULT";
+    ok: boolean;
+    message?: string;
+    /** Base64 JPEG sans prefixe data: — present uniquement pour action="screenshot". */
+    screenshot?: string;
+    /** Type de l'action executee (click, type_text, shell, screenshot, …). */
+    action?: string;
+  }
 
   // â”€â”€ Diagnostic logger (always on â€” strip these once issue is fixed) â”€â”€â”€â”€â”€â”€â”€â”€
   // Goal: see in DevTools console exactly which event/branch fires when the
@@ -1418,6 +1430,47 @@
     }
   }
 
+  /**
+   * Affiche dans le chat un AI_ACTION_RESULT renvoye par l'agent Rust apres
+   * execution d'une action. Pour les screenshots de verification, on stocke
+   * aussi l'image dans aiLastVerificationImage pour affichage hors-bulle.
+   */
+  function handleAiActionResult(payload: Record<string, unknown>) {
+    const result = payload as unknown as AiActionResult;
+    const action = result.action ?? "?";
+    const ok = !!result.ok;
+    const message = (result.message ?? "").trim();
+    const icon = ok ? "✅" : "❌";
+
+    if (action === "screenshot" && result.screenshot) {
+      // Stock l'image pour affichage en sous-bulle dans le chat.
+      aiLastVerificationImage = `data:image/jpeg;base64,${result.screenshot}`;
+      appendAiChatMessage(`${icon} screenshot de verification recu (${formatBytesApprox(result.screenshot.length)})`, "ai-system");
+      return;
+    }
+
+    if (!ok) {
+      appendAiChatMessage(`${icon} ${action} a echoue : ${message || "erreur inconnue"}`, "ai-system");
+      return;
+    }
+
+    // Succes — n'inonde pas le chat pour les actions silencieuses (move, wait).
+    if (action === "move" || action === "wait") return;
+    if (message) {
+      appendAiChatMessage(`${icon} ${action} : ${message}`, "ai-system");
+    } else {
+      appendAiChatMessage(`${icon} ${action} OK`, "ai-system");
+    }
+  }
+
+  /** Estimation grossiere de la taille decodee d'une chaine base64 (en KB). */
+  function formatBytesApprox(base64Len: number): string {
+    const approxBytes = Math.floor((base64Len * 3) / 4);
+    if (approxBytes < 1024) return `${approxBytes} B`;
+    if (approxBytes < 1024 * 1024) return `${(approxBytes / 1024).toFixed(1)} KB`;
+    return `${(approxBytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
   function handleAiActionEnvelope(env: AiActionEnvelope) {
     aiBusy = false;
     aiLastRationale = env.rationale ?? null;
@@ -2180,6 +2233,24 @@
       if (viewerControlChannel === channel) {
         viewerDataChannelOpen = false;
         viewerKeyboardCaptured = false;
+      }
+    };
+
+    // ── Inbound messages from the remote agent ────────────────────────────
+    // Le DataChannel "input" est bi-directionnel : l'agent Rust nous renvoie
+    // les AI_ACTION_RESULT (succes/echec + screenshot de verification). On
+    // ne court-circuite pas les autres messages — il n'y en a pas d'autres
+    // attendus pour l'instant.
+    channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+      if (typeof event.data !== "string") return;
+      try {
+        const payload = JSON.parse(event.data) as Record<string, unknown>;
+        if (payload.type === "AI_ACTION_RESULT") {
+          handleAiActionResult(payload);
+        }
+      } catch {
+        // Pas un JSON — ignore silencieusement (peut etre un keepalive
+        // texte futur, ou un message inconnu).
       }
     };
   }
@@ -3966,6 +4037,16 @@
 
         {#if chatError}
           <p class="rd-chat__error">{chatError}</p>
+        {/if}
+
+        {#if aiLastVerificationImage}
+          <div class="rd-ai-verif">
+            <div class="rd-ai-verif__head">
+              <span>📸 Screenshot de verification IA</span>
+              <button class="rd-viewer__btn" type="button" onclick={() => { aiLastVerificationImage = null; }}>Fermer</button>
+            </div>
+            <img src={aiLastVerificationImage} alt="Screenshot de verification IA" class="rd-ai-verif__img" />
+          </div>
         {/if}
 
         <div class="rd-chat__list" bind:this={chatListEl}>
@@ -6916,6 +6997,33 @@
     border: 1px solid rgba(239, 68, 68, 0.35);
     color: #fca5a5;
     font-size: 13px;
+  }
+
+  /* Screenshot de verification renvoye par l'agent Rust apres une action IA. */
+  .rd-ai-verif {
+    margin: 0 0 12px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid rgba(99, 102, 241, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .rd-ai-verif__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: #c7d2fe;
+  }
+  .rd-ai-verif__img {
+    width: 100%;
+    height: auto;
+    max-height: 320px;
+    object-fit: contain;
+    border-radius: 6px;
+    background: #000;
   }
 
   .rd-chat__list {

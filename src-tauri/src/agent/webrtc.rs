@@ -1441,11 +1441,15 @@ impl AgentWebRtc {
                 if label == "input" {
                     let message_label = label.clone();
                     let frame_emission_paused = Arc::clone(&frame_emission_paused);
+                    // Clone du channel pour que l'executor IA puisse renvoyer
+                    // les AI_ACTION_RESULT sur le meme tuyau.
+                    let channel_for_ai = Arc::clone(&channel);
                     channel.on_message(Box::new(move |msg: DataChannelMessage| {
                         let input_handler = Arc::clone(&input_handler);
                         let message_label = message_label.clone();
                         let activity_for_channel = Arc::clone(&activity_for_channel);
                         let frame_emission_paused = Arc::clone(&frame_emission_paused);
+                        let channel_for_ai = Arc::clone(&channel_for_ai);
                         Box::pin(async move {
                             if !msg.is_string {
                                 return;
@@ -1478,6 +1482,23 @@ impl AgentWebRtc {
                                             if was {
                                                 println!("🎬 Frame emission RESUMED (viewer request)");
                                             }
+                                            return;
+                                        }
+                                        // Agent IA : actions envoyees par le viewer apres reponse Gemini.
+                                        // On les execute hors du chemin input_handler car la semantique
+                                        // est differente (clic absolu denormalise, shell, screenshot
+                                        // reply, etc.) et on respecte la meme regle allow_remote_input.
+                                        "AI_ACTION" | "AI_PLAN" => {
+                                            activity_for_channel.mark_input_activity();
+                                            if !allow_remote_input {
+                                                println!("AI action ignoree (lecture seule)");
+                                                return;
+                                            }
+                                            super::ai_executor::dispatch(
+                                                Arc::clone(&channel_for_ai),
+                                                &message,
+                                            )
+                                            .await;
                                             return;
                                         }
                                         _ => {}
