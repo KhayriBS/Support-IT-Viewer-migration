@@ -82,6 +82,13 @@
   let aiLastRationale = $state<string | null>(null);
   /** Dernier screenshot de verification renvoye par l'agent Rust (data URL JPEG). */
   let aiLastVerificationImage = $state<string | null>(null);
+  /** Anti-spam cote client : timestamp ms du dernier sendAiCommand. */
+  let aiLastSentAtMs = $state(0);
+  /**
+   * Cooldown minimal entre deux /ai. Le free-tier Gemini Flash plafonne a
+   * ~10 req/min — 6s laisse une marge de securite contre les 429.
+   */
+  const AI_MIN_INTERVAL_MS = 6_000;
   let detachAiActionListener: (() => void) | null = null;
   let detachAiConnectionListener: (() => void) | null = null;
 
@@ -1240,7 +1247,15 @@
     // "/ai <prompt>"  → capture une frame WebRTC + envoie à l'agent IA via
     // STOMP. Le message normal n'est pas envoyé à l'autre peer pour éviter
     // de polluer le chat humain.
+    //
+    // STRICT : l'IA n'est disponible QUE depuis le panneau Écran (where there's
+    // a video stream + a remote desktop to control). Dans le panneau Chat pur,
+    // /ai n'a pas de sens (pas de frame à capturer, pas de PC à piloter).
     if (content.toLowerCase().startsWith("/ai ")) {
+      if (selectedFeature !== "screen") {
+        chatError = "L'IA n'est disponible que depuis le panneau Écran (clique sur Écran pour démarrer le partage).";
+        return;
+      }
       const aiPrompt = content.slice(4).trim();
       if (!aiPrompt) {
         chatError = "Usage: /ai <commande>";
@@ -1327,6 +1342,39 @@
   }
 
   /**
+   * Attend qu'une frame WebRTC arrive et soit décodée par l'élément <video>.
+   * Utilisé avant captureFrame() quand on vient de demander VIDEO_RESUME — sinon
+   * captureFrame() renvoie soit null (videoWidth=0), soit pire : une frame noire
+   * "dernière connue" qui fait planter Gemini.
+   *
+   * Stratégie : on attend que TROIS conditions soient réunies :
+   *   1. videoWidth > 0           → le décodeur connaît la résolution
+   *   2. readyState >= HAVE_CURRENT_DATA → au moins une frame complète
+   *   3. currentTime > 0          → le pipeline a vraiment avancé d'au moins 1 frame
+   *      (sinon on aurait juste la frame d'init noire)
+   */
+  async function waitForFreshFrame(timeoutMs = 3000): Promise<boolean> {
+    const video = viewerVideoEl;
+    if (!video) return false;
+
+    const t0 = performance.now();
+    // On exige aussi que currentTime PROGRESSE pendant l'attente — pour
+    // distinguer "frame fraiche" vs "dernière frame collée avant pause".
+    const startTime = video.currentTime;
+
+    while (performance.now() - t0 < timeoutMs) {
+      const ok =
+        video.videoWidth > 0 &&
+        video.videoHeight > 0 &&
+        video.readyState >= 2 /* HAVE_CURRENT_DATA */ &&
+        video.currentTime > startTime;
+      if (ok) return true;
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    return false;
+  }
+
+  /**
    * Pousse la commande IA + screenshot vers Spring via STOMP.
    * Affiche aussi la commande comme message technicien dans le chat IA.
    */
@@ -1349,18 +1397,51 @@
       return;
     }
 
-    const frame = captureFrame();
-    if (!frame) {
-      aiError = "Impossible de capturer une frame du flux vidéo.";
+    // ── Cooldown anti-429 ────────────────────────────────────────────────
+    // Le free-tier Gemini Flash plafonne ~10 req/min. Un humain qui tape vite
+    // peut largement le saturer. On bloque ici avant meme l'appel reseau.
+    const sinceLastMs = Date.now() - aiLastSentAtMs;
+    if (sinceLastMs < AI_MIN_INTERVAL_MS) {
+      const remainingS = Math.ceil((AI_MIN_INTERVAL_MS - sinceLastMs) / 1000);
+      aiError = `Attends ${remainingS}s avant la prochaine commande IA (quota Gemini free-tier).`;
       return;
     }
+
+    // ── Auto-resume vidéo si suspendue ──────────────────────────────────
+    // L'agent distant démarre PAUSÉ et ne reprend que sur VIDEO_RESUME. Si le
+    // technicien tape /ai sans avoir cliqué "Play", on serait coincé sur une
+    // frame fantôme (ou pas de frame du tout). On force ici l'émission et on
+    // attend qu'une frame fraiche soit réellement décodée avant de capturer.
+    const wasPaused = !rdScreenPlayRequested;
+    if (wasPaused) {
+      rdScreenPlayRequested = true; // déclenche l'effet → envoie VIDEO_RESUME
+      aiError = "Reprise de la diffusion vidéo pour capturer une frame…";
+    }
+
+    aiBusy = true;
+    const freshFrame = await waitForFreshFrame(wasPaused ? 4000 : 1500);
+    if (!freshFrame) {
+      aiBusy = false;
+      aiError = wasPaused
+        ? "Aucune frame reçue après reprise de la diffusion. L'agent distant ne semble pas émettre — vérifie la connexion WebRTC."
+        : "Aucune frame vidéo disponible. La diffusion est peut-être suspendue ou bloquée.";
+      return;
+    }
+
+    const frame = captureFrame();
+    if (!frame) {
+      aiBusy = false;
+      aiError = "Capture de la frame impossible (canvas tainted ou décodeur silencieux).";
+      return;
+    }
+    aiLastSentAtMs = Date.now();
+    aiError = null; // efface le message "Reprise…" si on est arrivé jusqu'ici
 
     // Affiche la commande dans le chat (côté local seulement — l'agent IA
     // ne passe pas par la room chat habituelle).
     appendAiChatMessage(`/ai ${trimmed}`, "ai-user");
 
-    aiBusy = true;
-    aiError = null;
+    // aiBusy déjà à true depuis la phase d'attente de frame.
     const ok = aiClient.publishFrame({
       sessionId: String(session.id),
       command: trimmed,
@@ -4020,9 +4101,6 @@
               <span class="rd-chat__pill" class:rd-chat__pill--ok={chatConnected} class:rd-chat__pill--warn={!chatConnected}>
                 {chatConnected ? "Connecté" : "Hors ligne"}
               </span>
-              <span class="rd-chat__pill" class:rd-chat__pill--ok={aiConnected} class:rd-chat__pill--warn={!aiConnected}>
-                IA&nbsp;: {aiConnected ? (aiBusy ? "Analyse…" : "Prête") : "Hors ligne"}
-              </span>
               <span class="rd-chat__role">Vous êtes&nbsp;: <strong>{chatLocalRole === "agent" ? "PC distant" : "Technicien"}</strong></span>
             </p>
           </div>
@@ -4037,16 +4115,6 @@
 
         {#if chatError}
           <p class="rd-chat__error">{chatError}</p>
-        {/if}
-
-        {#if aiLastVerificationImage}
-          <div class="rd-ai-verif">
-            <div class="rd-ai-verif__head">
-              <span>📸 Screenshot de verification IA</span>
-              <button class="rd-viewer__btn" type="button" onclick={() => { aiLastVerificationImage = null; }}>Fermer</button>
-            </div>
-            <img src={aiLastVerificationImage} alt="Screenshot de verification IA" class="rd-ai-verif__img" />
-          </div>
         {/if}
 
         <div class="rd-chat__list" bind:this={chatListEl}>
@@ -4081,7 +4149,7 @@
           <input
             class="rd-chat__input"
             type="text"
-            placeholder="Écris un message… ou /ai <commande>"
+            placeholder="Écris un message…"
             bind:value={chatInput}
             disabled={!activeSession || activeSession.status !== "ACTIVE"}
             onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
@@ -4315,12 +4383,33 @@
                 <span class="rd-chat__pill" class:rd-chat__pill--ok={chatConnected} class:rd-chat__pill--warn={!chatConnected}>
                   {chatConnected ? "Connecté" : "Hors ligne"}
                 </span>
+                <span class="rd-chat__pill" class:rd-chat__pill--ok={aiConnected} class:rd-chat__pill--warn={!aiConnected}>
+                  IA&nbsp;: {aiConnected ? (aiBusy ? "Analyse…" : "Prête") : "Hors ligne"}
+                </span>
                 <button
                   class="rd-viewer__chat-side-close"
                   type="button"
                   onclick={() => { viewerChatPanelOpen = false; }}
                   title="Fermer">×</button>
               </header>
+
+              {#if aiError}
+                <div class="rd-ai-error" role="alert">
+                  <span class="rd-ai-error__icon">⚠️</span>
+                  <span class="rd-ai-error__text">{aiError}</span>
+                  <button class="rd-ai-error__close" type="button" onclick={() => { aiError = null; }} title="Masquer">×</button>
+                </div>
+              {/if}
+
+              {#if aiLastVerificationImage}
+                <div class="rd-ai-verif">
+                  <div class="rd-ai-verif__head">
+                    <span>📸 Screenshot de verification IA</span>
+                    <button class="rd-viewer__btn" type="button" onclick={() => { aiLastVerificationImage = null; }}>Fermer</button>
+                  </div>
+                  <img src={aiLastVerificationImage} alt="Screenshot de verification IA" class="rd-ai-verif__img" />
+                </div>
+              {/if}
               <div class="rd-chat__list rd-viewer__chat-side-list" bind:this={chatListEl}>
                 {#if chatMessages.length === 0}
                   <p class="rd-empty">Aucun message. Envoie le premier&nbsp;!</p>
@@ -4351,7 +4440,7 @@
                 <input
                   class="rd-chat__input"
                   type="text"
-                  placeholder="Message…"
+                  placeholder="Message… ou /ai <commande>"
                   bind:value={chatInput}
                   onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
                   oninput={dispatchChatTyping}
@@ -6997,6 +7086,42 @@
     border: 1px solid rgba(239, 68, 68, 0.35);
     color: #fca5a5;
     font-size: 13px;
+  }
+
+  /* Bannière d'erreur IA — visible en permanence tant que aiError != null. */
+  .rd-ai-error {
+    margin: 0 0 10px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fecaca;
+    font-size: 13px;
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .rd-ai-error__icon {
+    flex: 0 0 auto;
+    font-size: 16px;
+  }
+  .rd-ai-error__text {
+    flex: 1 1 auto;
+    word-break: break-word;
+  }
+  .rd-ai-error__close {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: #fecaca;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .rd-ai-error__close:hover {
+    color: #fff;
   }
 
   /* Screenshot de verification renvoye par l'agent Rust apres une action IA. */
