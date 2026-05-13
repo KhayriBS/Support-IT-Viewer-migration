@@ -1439,12 +1439,48 @@ impl AgentWebRtc {
                 }));
 
                 if label == "input" {
+                    // Fingerprint de version : si tu ne vois PAS cette ligne dans la
+                    // console agent quand le viewer se connecte, c'est que le binaire
+                    // qui tourne est l'ANCIEN (sans le handler request_screenshot).
+                    println!(
+                        "✅ DataChannel 'input' configure (AI build = v2 with request_screenshot handler)"
+                    );
+
                     let message_label = label.clone();
                     let frame_emission_paused = Arc::clone(&frame_emission_paused);
                     // Clone du channel pour que l'executor IA puisse renvoyer
                     // les AI_ACTION_RESULT sur le meme tuyau.
                     let channel_for_ai = Arc::clone(&channel);
                     channel.on_message(Box::new(move |msg: DataChannelMessage| {
+                        // ═══════════════════════════════════════════════════════════════
+                        // [WIRE TRACE] Tout premier point de contact — AVANT meme la
+                        // verification is_string, AVANT le parsing UTF-8, AVANT le JSON.
+                        // Si tu fais /ai cote viewer et tu ne vois RIEN ici cote agent,
+                        // c'est definitif : le message n'arrive physiquement pas au
+                        // DataChannel input de CE peer-connection-ci. → probleme reseau
+                        // ou double-instance d'agent qui se partage le code.
+                        //
+                        // Filtre anti-spam : on skippe les mousemove qui inondent a 60Hz.
+                        // ═══════════════════════════════════════════════════════════════
+                        {
+                            let is_str = msg.is_string;
+                            let n = msg.data.len();
+                            // Detection rapide "mousemove" sans parser le JSON complet :
+                            // {"type":"mousemove"...  → contains b"\"type\":\"mousemove\""
+                            let is_mousemove = is_str
+                                && (msg.data.windows(20).any(|w| w == b"\"type\":\"mousemove\"")
+                                    || msg.data.windows(21).any(|w| w == b"\"type\":\"mouse-move\""));
+                            if !is_mousemove {
+                                if is_str {
+                                    let preview: String = String::from_utf8_lossy(&msg.data)
+                                        .chars().take(80).collect();
+                                    println!("[wire] ENTRY len={n} str='{preview}'");
+                                } else {
+                                    println!("[wire] ENTRY len={n} <binary>");
+                                }
+                            }
+                        }
+
                         let input_handler = Arc::clone(&input_handler);
                         let message_label = message_label.clone();
                         let activity_for_channel = Arc::clone(&activity_for_channel);
@@ -1459,6 +1495,19 @@ impl AgentWebRtc {
                                 eprintln!("Message DataChannel invalide sur {message_label}");
                                 return;
                             };
+
+                            // Diagnostic IA : trace tous les messages JSON qui contiennent
+                            // un type (= messages de controle, pas les mousemove). Cible :
+                            // confirmer si request_screenshot arrive ou pas. A retirer
+                            // une fois le pipeline IA stabilise.
+                            if message.starts_with('{') {
+                                let preview = if message.len() > 160 {
+                                    format!("{}…", &message[..160])
+                                } else {
+                                    message.clone()
+                                };
+                                println!("🔎 input-msg: {preview}");
+                            }
 
                             // Messages de contrôle vidéo : court-circuitent
                             // l'input handler. Format JSON :
@@ -1920,69 +1969,112 @@ impl AgentWebRtc {
 /// En cas d'echec capture (ex: pas d'ecran primaire trouvable, surface bloquee
 /// par OBS, etc.), on renvoie `{"type":"screenshot_response","commandId":"...","error":"..."}`
 /// pour que le viewer puisse afficher un message clair plutot que de timeout.
+/// Limite de taille par message texte sur le DataChannel SCTP (webrtc-rs).
+/// L'impl rejette tout > ~64 KB par message. On chunke a 14 KB pour avoir une
+/// marge confortable (chunk + JSON envelope ~ 14.2 KB par send_text).
+const SCREENSHOT_CHUNK_SIZE: usize = 14 * 1024;
+
 async fn handle_screenshot_request(channel: Arc<RTCDataChannel>, command_id: String) {
-    // q=70 -> ~150-400 KB de base64 pour un 1080p. Suffisant pour la vision
-    // Gemini Flash sans saturer le DataChannel SCTP.
-    let result = super::screen_capture::capture_primary_jpeg_base64(70);
+    println!("📸 [{command_id}] starting capture (1280px width, JPEG q=50)…");
 
-    // On a besoin de la resolution native pour que Spring/Gemini puisse
-    // raisonner sur les coordonnees -- on la rapatrie via la meme API que
-    // l'executor IA.
-    let dims = primary_screen_dimensions();
+    let result = super::screen_capture::capture_primary_jpeg_base64_scaled(1280, 50);
 
-    let reply = match (result, dims) {
-        (Ok(b64), Some((w, h))) => {
+    match result {
+        Ok((b64, w, h)) => {
+            let size_kb = b64.len() / 1024;
             println!(
-                "📸 screenshot capture pour {command_id} (~{} KB, {w}x{h})",
-                b64.len() / 1024
+                "📸 [{command_id}] capture OK ({size_kb} KB base64, {w}x{h}) — chunking"
             );
-            serde_json::json!({
-                "type": "screenshot_response",
-                "commandId": command_id,
-                "data": b64,
-                "width": w,
-                "height": h,
-            })
+            send_screenshot_chunked(&channel, &command_id, &b64, w, h).await;
         }
-        (Ok(b64), None) => {
-            // Capture OK mais on n'a pas pu lire les dimensions -- renvoyer
-            // quand meme la donnee, Spring/Gemini saura faire sans.
-            println!(
-                "📸 screenshot capture pour {command_id} (~{} KB, dims unknown)",
-                b64.len() / 1024
-            );
-            serde_json::json!({
-                "type": "screenshot_response",
-                "commandId": command_id,
-                "data": b64,
-            })
-        }
-        (Err(e), _) => {
-            eprintln!("❌ screenshot capture failed for {command_id}: {e}");
-            serde_json::json!({
-                "type": "screenshot_response",
+        Err(e) => {
+            eprintln!("❌ [{command_id}] capture FAILED: {e}");
+            // L'erreur tient en 1 message (petit) → pas de chunking.
+            let err_msg = serde_json::json!({
+                "type": "screenshot_response_error",
                 "commandId": command_id,
                 "error": format!("agent capture failed: {e}"),
-            })
+            });
+            if let Err(e) = channel.send_text(err_msg.to_string()).await {
+                eprintln!("❌ [{command_id}] send_text error reply failed: {e}");
+            }
         }
-    };
-
-    if let Err(e) = channel.send_text(reply.to_string()).await {
-        eprintln!("❌ failed to send screenshot_response for {command_id}: {e}");
     }
 }
 
-#[cfg(windows)]
-fn primary_screen_dimensions() -> Option<(i32, i32)> {
-    use screenshots::Screen;
-    let screens = Screen::all().ok()?;
-    let s = screens.iter().find(|s| s.display_info.is_primary).or_else(|| screens.first())?;
-    Some((s.display_info.width as i32, s.display_info.height as i32))
-}
+/// Decoupe le base64 en chunks de SCREENSHOT_CHUNK_SIZE et les envoie sous
+/// forme de 3 types de messages :
+///   1. screenshot_chunk_start { commandId, totalChunks, totalBytes, width, height }
+///   2. screenshot_chunk       { commandId, index, data }  (N fois)
+///   3. screenshot_chunk_end   { commandId }
+///
+/// Le viewer reassemble dans handleScreenshotResponse() en concatenant les
+/// chunks par index. L'ordre est garanti par ordered=true sur le DataChannel,
+/// mais l'index permet quand meme de detecter une perte/incoherence.
+async fn send_screenshot_chunked(
+    channel: &Arc<RTCDataChannel>,
+    command_id: &str,
+    base64_data: &str,
+    width: u32,
+    height: u32,
+) {
+    let bytes = base64_data.as_bytes();
+    let total_bytes = bytes.len();
+    let total_chunks = total_bytes.div_ceil(SCREENSHOT_CHUNK_SIZE);
 
-#[cfg(not(windows))]
-fn primary_screen_dimensions() -> Option<(i32, i32)> {
-    None
+    // ─── Header ────────────────────────────────────────────────────────────
+    let header = serde_json::json!({
+        "type": "screenshot_chunk_start",
+        "commandId": command_id,
+        "totalChunks": total_chunks,
+        "totalBytes": total_bytes,
+        "width": width,
+        "height": height,
+    });
+    if let Err(e) = channel.send_text(header.to_string()).await {
+        eprintln!("❌ [{command_id}] chunk_start failed: {e}");
+        return;
+    }
+
+    // ─── Chunks ────────────────────────────────────────────────────────────
+    for (i, chunk) in bytes.chunks(SCREENSHOT_CHUNK_SIZE).enumerate() {
+        // chunk est en bytes, mais base64 est ASCII donc safe a recompose.
+        // Edge case : on a coupé en plein milieu d'un caractere UTF-8 ?
+        // Non — base64 ne contient que [A-Za-z0-9+/=] (ASCII single-byte).
+        let chunk_str = match std::str::from_utf8(chunk) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("❌ [{command_id}] chunk {i} not valid UTF-8 (bug)");
+                return;
+            }
+        };
+        let chunk_msg = serde_json::json!({
+            "type": "screenshot_chunk",
+            "commandId": command_id,
+            "index": i,
+            "data": chunk_str,
+        });
+        if let Err(e) = channel.send_text(chunk_msg.to_string()).await {
+            eprintln!("❌ [{command_id}] chunk {i}/{total_chunks} send failed: {e}");
+            return;
+        }
+    }
+
+    // ─── End marker ────────────────────────────────────────────────────────
+    let end_msg = serde_json::json!({
+        "type": "screenshot_chunk_end",
+        "commandId": command_id,
+    });
+    if let Err(e) = channel.send_text(end_msg.to_string()).await {
+        eprintln!("❌ [{command_id}] chunk_end failed: {e}");
+        return;
+    }
+
+    println!(
+        "✅ [{command_id}] sent {total_chunks} chunks, {} KB total ({} KB/chunk avg)",
+        total_bytes / 1024,
+        if total_chunks > 0 { (total_bytes / total_chunks) / 1024 } else { 0 }
+    );
 }
 
 // ─── File DataChannel helpers ─────────────────────────────────────────────────

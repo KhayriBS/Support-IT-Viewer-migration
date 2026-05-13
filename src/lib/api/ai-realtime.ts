@@ -56,12 +56,29 @@ function toWsBaseUrl(httpBase: string) {
  * .convertAndSendToUser).
  * Outbound: /app/ai/frame (AiFrameRequest payload).
  */
+/** STOMP subscription handle (opaque ; on appelle juste unsubscribe()). */
+interface StompSub {
+  unsubscribe(): void;
+}
+
 export class AiRealtimeClient {
   private client: Client | null = null;
   private state: AiConnectionState = "idle";
 
   private actionHandlers = new Set<(env: AiActionEnvelope) => void>();
   private connectionHandlers = new Set<(connected: boolean) => void>();
+
+  /** Topic subscription pour la session courante. Reabonne sur reconnect. */
+  private topicSub: { sessionId: string; sub: StompSub } | null = null;
+  /** Session id memorise pour reabonnement automatique apres reconnect. */
+  private wantedSessionId: string | null = null;
+
+  /**
+   * Dedup window — le serveur publie le meme envelope sur DEUX canaux
+   * (/user/queue/ai/actions + /topic/ai/<sessionId>) en garde-fou. On
+   * deduplique cote front sur une fenetre glissante de 2s.
+   */
+  private recentEnvelopes = new Map<string, number>();
 
   getConnectionState(): AiConnectionState {
     return this.state;
@@ -110,27 +127,18 @@ export class AiRealtimeClient {
       },
 
       onConnect: () => {
+        // Voie 1 : user-destination (sujet aux problemes de Principal/sessionId)
         this.client?.subscribe("/user/queue/ai/actions", (frame: IMessage) => {
-          try {
-            const payload = JSON.parse(frame.body) as AiActionEnvelope;
-            this.actionHandlers.forEach((h) => h(payload));
-          } catch (err) {
-            console.warn("[ai-stomp] malformed action frame", err);
-          }
+          this._dispatchEnvelope(frame.body, "/user/queue/ai/actions");
+        });
+        this.client?.subscribe("/user/queue/ai/error", (frame: IMessage) => {
+          this._dispatchEnvelope(frame.body, "/user/queue/ai/error");
         });
 
-        // Canal dedie pour les erreurs serveur (timeout 30s Gemini, exceptions
-        // inattendues). Spring pousse aussi l'erreur sur /actions en duplicate
-        // pour compat, mais ce canal permet de declencher une UI specifique
-        // (ex: banner rouge persistante au lieu d'une bulle dans le chat).
-        this.client?.subscribe("/user/queue/ai/error", (frame: IMessage) => {
-          try {
-            const payload = JSON.parse(frame.body) as AiActionEnvelope;
-            this.actionHandlers.forEach((h) => h(payload));
-          } catch (err) {
-            console.warn("[ai-stomp] malformed error frame", err);
-          }
-        });
+        // Voie 2 : topic dedie a la session (resouscrit auto apres reconnect).
+        if (this.wantedSessionId) {
+          this._subscribeTopic(this.wantedSessionId);
+        }
 
         this._setState("connected");
       },
@@ -152,11 +160,91 @@ export class AiRealtimeClient {
 
   private _internalDisconnect(silent: boolean): void {
     if (this.client?.active) {
+      try { this.topicSub?.sub.unsubscribe(); } catch { /* idem */ }
       void this.client.deactivate();
     }
     this.client = null;
+    this.topicSub = null;
     if (!silent && this.state !== "idle") this._setState("idle");
     else this.state = "idle";
+  }
+
+  /**
+   * S'abonne au topic dedie d'une session — appele par le viewer quand la
+   * session devient ACTIVE. Si la session change, on se desabonne de
+   * l'ancien topic avant.
+   *
+   * Voie de secours principale au cas ou /user/queue/ai/actions ne route
+   * pas (probleme de Principal absent, simpSessionId mismatch, etc.).
+   */
+  joinSession(sessionId: string): void {
+    if (!sessionId) return;
+    this.wantedSessionId = sessionId;
+    if (this.client?.connected) {
+      this._subscribeTopic(sessionId);
+    }
+    // Si pas encore connecte, le subscribe sera fait dans onConnect.
+  }
+
+  leaveSession(): void {
+    this.wantedSessionId = null;
+    try { this.topicSub?.sub.unsubscribe(); } catch { /* ignore */ }
+    this.topicSub = null;
+  }
+
+  private _subscribeTopic(sessionId: string): void {
+    if (!this.client?.connected) return;
+    if (this.topicSub?.sessionId === sessionId) return; // deja abonne
+
+    // Desabonnement de l'ancien topic si on change de session
+    if (this.topicSub) {
+      try { this.topicSub.sub.unsubscribe(); } catch { /* ignore */ }
+      this.topicSub = null;
+    }
+
+    const dest = `/topic/ai/${sessionId}`;
+    const sub = this.client.subscribe(dest, (frame: IMessage) => {
+      this._dispatchEnvelope(frame.body, dest);
+    });
+    this.topicSub = { sessionId, sub };
+    console.log(`[ai-stomp] subscribed to ${dest}`);
+  }
+
+  /**
+   * Decode + deduplique un frame entrant. Le serveur publie SCIEMMENT le
+   * meme envelope sur 2 destinations (defensive design) : on receptionne
+   * potentiellement le meme paquet deux fois, separes de quelques ms. On
+   * trash le doublon sur une fenetre de 2 secondes.
+   */
+  private _dispatchEnvelope(body: string, source: string): void {
+    let env: AiActionEnvelope;
+    try {
+      env = JSON.parse(body) as AiActionEnvelope;
+    } catch (err) {
+      console.warn(`[ai-stomp] malformed frame on ${source}`, err);
+      return;
+    }
+
+    // Cle de dedup : sessionId|command|rationale|status. Si plusieurs actions
+    // identiques arrivent dans la meme fenetre, c'est le meme envelope.
+    const dedupKey =
+      `${env.sessionId ?? ""}|${env.command ?? ""}|${env.rationale ?? ""}|${env.status}`;
+    const now = Date.now();
+
+    // Purge des entrees expirees (> 2s) — eviter une croissance illimitee.
+    for (const [k, t] of this.recentEnvelopes) {
+      if (now - t > 2000) this.recentEnvelopes.delete(k);
+    }
+
+    const prev = this.recentEnvelopes.get(dedupKey);
+    if (prev !== undefined && now - prev < 2000) {
+      console.log(`[ai-stomp] dedup: skipped duplicate envelope from ${source}`);
+      return;
+    }
+    this.recentEnvelopes.set(dedupKey, now);
+
+    console.log(`[ai-stomp] ◀ envelope from ${source} (status=${env.status}, actions=${env.actions?.length ?? 0})`);
+    this.actionHandlers.forEach((h) => h(env));
   }
 
   private _setState(next: AiConnectionState): void {
@@ -168,16 +256,61 @@ export class AiRealtimeClient {
   }
 
   /**
-   * Publishes a frame + command to the backend. Returns false if STOMP is not
-   * connected — caller should surface a UI error instead of silently dropping.
+   * Publishes a frame + command to the backend.
+   *
+   * Strategie en deux temps :
+   *   1. HTTP POST /ai/frame  ← voie principale, aucune limite de taille
+   *      (le screenshot fait ~95 KB ce qui est jete par certains proxys
+   *      WebSocket — Render free-tier notamment)
+   *   2. STOMP /app/ai/frame  ← fallback si REST echoue (rare)
+   *
+   * Dans les deux cas, la reponse Gemini arrive via STOMP sur
+   * /topic/ai/<sessionId> + /user/queue/ai/actions. Le client doit etre
+   * abonne AVANT d'appeler publishFrame (cf joinSession).
    */
-  publishFrame(req: AiFrameRequest): boolean {
-    if (!this.isConnected()) return false;
-    this.client!.publish({
-      destination: "/app/ai/frame",
-      body: JSON.stringify(req)
-    });
-    return true;
+  async publishFrame(req: AiFrameRequest): Promise<boolean> {
+    const baseUrl = technicianApi.baseUrl.replace(/\/$/, "");
+    const bodyStr = JSON.stringify(req);
+    const sizeKb = Math.round(bodyStr.length / 1024);
+
+    // ─── Tentative 1 : REST POST ─────────────────────────────────────
+    try {
+      console.log(`[ai-stomp] ▶ POST ${baseUrl}/ai/frame (${sizeKb} KB)`);
+      const response = await fetch(`${baseUrl}/ai/frame`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: bodyStr,
+        // 15s pour absorber les cold-starts Render free-tier.
+        signal: AbortSignal.timeout(15_000)
+      });
+
+      if (response.ok) {
+        const result = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+        console.log(`[ai-stomp] ✓ POST accepted, requestId=${result.requestId}, responseChannel=${result.responseChannel}`);
+        return true;
+      }
+      console.warn(`[ai-stomp] REST POST returned ${response.status} ${response.statusText}, falling back to STOMP`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[ai-stomp] REST POST failed (${msg}), falling back to STOMP`);
+    }
+
+    // ─── Fallback : STOMP /app/ai/frame ──────────────────────────────
+    if (!this.isConnected()) {
+      console.error("[ai-stomp] STOMP fallback impossible — pas connecte");
+      return false;
+    }
+    try {
+      this.client!.publish({
+        destination: "/app/ai/frame",
+        body: bodyStr
+      });
+      console.log("[ai-stomp] ▶ STOMP fallback frame envoyé");
+      return true;
+    } catch (err) {
+      console.error("[ai-stomp] STOMP publish failed:", err);
+      return false;
+    }
   }
 
   onAction(handler: (env: AiActionEnvelope) => void): () => void {

@@ -104,14 +104,27 @@
 
   /**
    * Map des requetes de screenshot en cours vers l'agent Rust distant.
-   * Cle = commandId UUID. Resolu quand on recoit un screenshot_response
-   * du DataChannel avec le meme commandId. Permet de gerer plusieurs /ai
-   * concurrents sans melanger les screenshots.
+   * Cle = commandId UUID. Resolu quand on a reassemble tous les chunks recus
+   * sur le DataChannel avec le meme commandId. Permet de gerer plusieurs /ai
+   * concurrents sans melanger les screenshots, ET de reassembler les
+   * messages > 64KB que SCTP/webrtc-rs refuse en une seule trame.
+   *
+   * Protocole agent → viewer :
+   *   1. screenshot_chunk_start { commandId, totalChunks, totalBytes, width, height }
+   *   2. screenshot_chunk       { commandId, index, data }   (N fois)
+   *   3. screenshot_chunk_end   { commandId }
+   *   ou  screenshot_response_error { commandId, error }     (sans chunking)
    */
   interface PendingScreenshot {
     resolve: (payload: { jpegBase64: string; width: number; height: number }) => void;
     reject: (err: Error) => void;
     timeoutId: ReturnType<typeof setTimeout>;
+    /** Nombre de chunks attendus (settled au reception de chunk_start). */
+    expectedChunks?: number;
+    /** Buffer indexe par chunk.index pour reassemblage. */
+    receivedChunks?: string[];
+    width?: number;
+    height?: number;
   }
   const pendingScreenshots = new Map<string, PendingScreenshot>();
 
@@ -1322,15 +1335,15 @@
 
   // ── AI Agent helpers ────────────────────────────────────────────────────
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   /**
-   * DEPRECATED — depuis l'ajout de requestScreenshotFromRemote(), l'IA n'utilise
-   * plus le canvas du <video> WebRTC. On garde la fonction pour usage futur
-   * (preview locale, debug, fallback offline si l'agent ne repond pas).
-   *
    * Capture une frame du <video> WebRTC en JPEG base64 (sans préfixe data:).
-   * Retourne aussi la résolution native pour que l'agent distant puisse
-   * dénormaliser les coordonnées de clic (canvas peut être redimensionné).
+   *
+   * Utilise comme FALLBACK quand requestScreenshotFromRemote() echoue. Avantage :
+   * pas de round-trip DataChannel. Inconvenient : depend du flux video WebRTC,
+   * donc :
+   *   • image noire si frame_emission_paused=true cote agent
+   *   • resolution down-scalee par l'encodeur H264
+   *   • potentiellement frame en retard (jitter buffer)
    */
   function captureFrame(): { jpegBase64: string; width: number; height: number } | null {
     const video = viewerVideoEl;
@@ -1372,26 +1385,37 @@
     timeoutMs = 5000
   ): Promise<{ jpegBase64: string; width: number; height: number }> {
     if (!viewerControlChannel || viewerControlChannel.readyState !== "open") {
-      throw new Error("DataChannel WebRTC non disponible");
+      throw new Error(
+        `DataChannel "input" non disponible (state=${viewerControlChannel?.readyState ?? "null"})`
+      );
     }
 
     const commandId = (typeof crypto !== "undefined" && "randomUUID" in crypto)
       ? crypto.randomUUID()
       : `cmd-${Date.now()}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 
+    const payload = JSON.stringify({ type: "request_screenshot", commandId });
+    console.log(`[ai] ▶ request_screenshot envoyé (commandId=${commandId}, len=${payload.length})`);
+
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         pendingScreenshots.delete(commandId);
-        reject(new Error(`PC distant ne repond pas (timeout ${timeoutMs}ms)`));
+        console.warn(
+          `[ai] ✖ timeout après ${timeoutMs}ms pour commandId=${commandId}. ` +
+            "Vérifie que l'agent Rust du PC distant a été recompilé avec le handler 'request_screenshot'."
+        );
+        reject(new Error(
+          `Le PC distant ne répond pas (timeout ${timeoutMs}ms). ` +
+            "Cause la plus probable : l'agent Rust sur le PC distant n'a pas été recompilé/redémarré " +
+            "avec la dernière version du code (handler 'request_screenshot' manquant). " +
+            "Vérifie sa console pour le log '📸 request_screenshot recu'."
+        ));
       }, timeoutMs);
 
       pendingScreenshots.set(commandId, { resolve, reject, timeoutId });
 
       try {
-        viewerControlChannel!.send(JSON.stringify({
-          type: "request_screenshot",
-          commandId
-        }));
+        viewerControlChannel!.send(payload);
       } catch (err) {
         clearTimeout(timeoutId);
         pendingScreenshots.delete(commandId);
@@ -1402,31 +1426,130 @@
 
   /**
    * Resoud (ou rejette) une requete de screenshot en attente quand l'agent
-   * Rust nous repond. Appele depuis viewerControlChannel.onmessage.
+   * Rust nous repond. Gere les 3 types du protocole chunked + les anciens
+   * messages mono-paquet pour backward-compat.
    */
   function handleScreenshotResponse(payload: Record<string, unknown>) {
     const commandId = typeof payload.commandId === "string" ? payload.commandId : "";
     if (!commandId) return;
     const pending = pendingScreenshots.get(commandId);
     if (!pending) {
-      console.warn(`[ai] screenshot_response avec commandId inconnu : ${commandId}`);
+      console.warn(`[ai] screenshot msg avec commandId inconnu : ${commandId}`);
       return;
     }
-    clearTimeout(pending.timeoutId);
-    pendingScreenshots.delete(commandId);
 
-    if (typeof payload.error === "string" && payload.error.length > 0) {
-      pending.reject(new Error(payload.error));
-      return;
+    const type = typeof payload.type === "string" ? payload.type : "";
+
+    switch (type) {
+      // ─── Protocole chunked (nouveau, robuste pour > 64KB) ──────────────
+      case "screenshot_chunk_start": {
+        const totalChunks = typeof payload.totalChunks === "number" ? payload.totalChunks : 0;
+        pending.expectedChunks = totalChunks;
+        pending.receivedChunks = new Array(totalChunks).fill("");
+        pending.width = typeof payload.width === "number" ? payload.width : 0;
+        pending.height = typeof payload.height === "number" ? payload.height : 0;
+        const totalKb = typeof payload.totalBytes === "number"
+          ? Math.round(payload.totalBytes / 1024)
+          : 0;
+        console.log(`[ai] chunk_start: ${totalChunks} chunks attendus (${totalKb} KB total, ${pending.width}x${pending.height})`);
+        return;
+      }
+
+      case "screenshot_chunk": {
+        if (!pending.receivedChunks) {
+          console.warn(`[ai] chunk recu avant chunk_start pour ${commandId}`);
+          return;
+        }
+        const index = typeof payload.index === "number" ? payload.index : -1;
+        const data = typeof payload.data === "string" ? payload.data : "";
+        if (index < 0 || index >= pending.receivedChunks.length) {
+          console.warn(`[ai] chunk index ${index} hors limites (max ${pending.receivedChunks.length})`);
+          return;
+        }
+        pending.receivedChunks[index] = data;
+        return;
+      }
+
+      case "screenshot_chunk_end": {
+        if (!pending.receivedChunks) {
+          clearTimeout(pending.timeoutId);
+          pendingScreenshots.delete(commandId);
+          pending.reject(new Error("chunk_end recu sans chunk_start"));
+          return;
+        }
+        // Verifie qu'on a recu tous les chunks (par integrite, pas par sécurité).
+        const missing = pending.receivedChunks.findIndex((c) => c === "");
+        if (missing !== -1 && pending.expectedChunks && missing < pending.expectedChunks) {
+          clearTimeout(pending.timeoutId);
+          pendingScreenshots.delete(commandId);
+          pending.reject(new Error(`Chunk manquant a l'index ${missing}/${pending.expectedChunks}`));
+          return;
+        }
+        const fullBase64 = pending.receivedChunks.join("");
+        clearTimeout(pending.timeoutId);
+        pendingScreenshots.delete(commandId);
+        console.log(`[ai] chunk_end: reassemble ${fullBase64.length} chars (${Math.round(fullBase64.length / 1024)} KB)`);
+        pending.resolve({
+          jpegBase64: fullBase64,
+          width: pending.width ?? 0,
+          height: pending.height ?? 0,
+        });
+        return;
+      }
+
+      case "screenshot_response_error": {
+        clearTimeout(pending.timeoutId);
+        pendingScreenshots.delete(commandId);
+        const err = typeof payload.error === "string" ? payload.error : "agent capture failed";
+        pending.reject(new Error(err));
+        return;
+      }
+
+      // ─── Ancien protocole mono-paquet (compat) ─────────────────────────
+      case "screenshot_response": {
+        clearTimeout(pending.timeoutId);
+        pendingScreenshots.delete(commandId);
+        if (typeof payload.error === "string" && payload.error.length > 0) {
+          pending.reject(new Error(payload.error));
+          return;
+        }
+        const data = typeof payload.data === "string" ? payload.data : "";
+        if (!data) {
+          pending.reject(new Error("Réponse screenshot vide"));
+          return;
+        }
+        const width = typeof payload.width === "number" ? payload.width : 0;
+        const height = typeof payload.height === "number" ? payload.height : 0;
+        pending.resolve({ jpegBase64: data, width, height });
+        return;
+      }
+
+      default:
+        // Type inconnu — ignore mais log pour debug.
+        console.warn(`[ai] screenshot msg avec type inconnu : "${type}"`);
+        return;
     }
-    const data = typeof payload.data === "string" ? payload.data : "";
-    if (!data) {
-      pending.reject(new Error("Réponse screenshot vide"));
-      return;
+  }
+
+  /**
+   * Fallback tier 2 : capture la frame du <video> WebRTC localement.
+   * Auto-resume la diffusion si elle est en pause, attend une frame fraiche,
+   * puis appelle captureFrame(). Renvoie null si tout echoue.
+   */
+  async function captureFrameWithAutoResume(): Promise<
+    { jpegBase64: string; width: number; height: number } | null
+  > {
+    const wasPaused = !rdScreenPlayRequested;
+    if (wasPaused) {
+      console.log("[ai] tier 2: auto-resume diffusion video…");
+      rdScreenPlayRequested = true; // declenche l'effet → envoie VIDEO_RESUME
     }
-    const width = typeof payload.width === "number" ? payload.width : 0;
-    const height = typeof payload.height === "number" ? payload.height : 0;
-    pending.resolve({ jpegBase64: data, width, height });
+    const freshFrame = await waitForFreshFrame(wasPaused ? 3500 : 1200);
+    if (!freshFrame) {
+      console.warn("[ai] tier 2: aucune frame fraiche disponible");
+      return null;
+    }
+    return captureFrame();
   }
 
   /**
@@ -1513,32 +1636,57 @@
       return;
     }
 
-    // ── Capture du screenshot via l'AGENT DISTANT (pas via le canvas WebRTC) ──
-    // Le DataChannel demande a l'agent Rust de capturer son ecran avec la lib
-    // `screenshots`. Avantages vs canvas.toBlob() :
-    //   • marche meme si le stream video est suspendu (frame_emission_paused=true)
-    //   • toujours pleine resolution native (pas d'echelle/encodage WebRTC)
-    //   • toujours frais (pas de frame en retard dans le jitter buffer)
+    // ── Capture du screenshot : strategie 2-tiers ────────────────────────
+    // Tier 1 : on demande a l'agent distant de capturer son ecran via
+    //          DataChannel (qualite native, ignore le pause video). Timeout 3s.
+    // Tier 2 : si Tier 1 echoue (DataChannel cape, agent qui ne repond pas,
+    //          message trop gros, etc.), on capture la frame du <video>
+    //          WebRTC localement. Auto-resume si pause.
+    //
+    // Cette boucle garantit que /ai marche TOUJOURS, meme si le DataChannel
+    // a un souci de routage.
     aiBusy = true;
     aiError = null;
 
     let frame: { jpegBase64: string; width: number; height: number };
+    let captureSource: "remote-agent" | "local-canvas";
+
     try {
-      frame = await requestScreenshotFromRemote(5000);
-    } catch (err) {
-      aiBusy = false;
-      aiError = String((err as Error).message ?? err);
-      console.warn("[ai] requestScreenshotFromRemote failed:", err);
-      return;
+      console.log("[ai] tier 1: requestScreenshotFromRemote (3s timeout)…");
+      frame = await requestScreenshotFromRemote(3000);
+      captureSource = "remote-agent";
+      console.log(`[ai] ✓ tier 1 OK (remote screenshot, ${frame.width}x${frame.height})`);
+    } catch (remoteErr) {
+      console.warn(`[ai] ✖ tier 1 KO (${(remoteErr as Error).message}). Fallback canvas…`);
+      const fallback = await captureFrameWithAutoResume();
+      if (!fallback) {
+        aiBusy = false;
+        aiError =
+          "Capture impossible : ni l'agent distant ni le flux vidéo local ne fournissent d'image. " +
+          "Vérifie que la diffusion vidéo est active (clique Play sur l'écran distant).";
+        return;
+      }
+      frame = fallback;
+      captureSource = "local-canvas";
+      console.log(`[ai] ✓ tier 2 OK (canvas fallback, ${frame.width}x${frame.height})`);
+      // Indique a l'utilisateur que la qualite peut etre degradee.
+      appendAiChatMessage(
+        "⚠️ Capture via flux vidéo local (l'agent distant n'a pas répondu). Qualité réduite.",
+        "ai-system"
+      );
     }
     aiLastSentAtMs = Date.now();
+    console.log(`[ai] capture source: ${captureSource}`);
+    startAiBusyWatchdog(); // garde-fou : 60s sans reponse → erreur + reset UI
 
     // Affiche la commande dans le chat (côté local seulement — l'agent IA
     // ne passe pas par la room chat habituelle).
     appendAiChatMessage(`/ai ${trimmed}`, "ai-user");
 
     // aiBusy déjà à true depuis la phase d'attente de frame.
-    const ok = aiClient.publishFrame({
+    // publishFrame tente HTTP POST en premier (pas de limite de taille), puis
+    // STOMP en fallback. Async car le POST attend la réponse HTTP.
+    const ok = await aiClient.publishFrame({
       sessionId: String(session.id),
       command: trimmed,
       screenshot: frame.jpegBase64,
@@ -1548,7 +1696,8 @@
     });
     if (!ok) {
       aiBusy = false;
-      aiError = "Échec d'envoi STOMP — réessaie dans un instant.";
+      stopAiBusyWatchdog();
+      aiError = "Échec d'envoi du frame IA (REST + STOMP tous les deux KO). Vérifie la connexion réseau.";
     }
   }
 
@@ -1650,6 +1799,7 @@
 
   function handleAiActionEnvelope(env: AiActionEnvelope) {
     aiBusy = false;
+    stopAiBusyWatchdog(); // reponse recue → annule le timer 60s
     aiLastRationale = env.rationale ?? null;
 
     const current = queriedSession ?? activeSession;
@@ -1696,10 +1846,51 @@
     detachAiActionListener = null;
     detachAiConnectionListener?.();
     detachAiConnectionListener = null;
+    aiClient.leaveSession();
     aiClient.disconnect();
     aiConnected = false;
     aiBusy = false;
+    stopAiBusyWatchdog();
   }
+
+  /**
+   * Surveille aiBusy : si on attend une reponse Spring plus de 60 s, on
+   * considere la voie cassee (timeout coté serveur aurait dû fire à 45 s).
+   * On reset l'UI pour ne pas laisser le user bloque indefiniment.
+   */
+  let aiBusyWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  const AI_BUSY_WATCHDOG_MS = 60_000;
+
+  function startAiBusyWatchdog() {
+    stopAiBusyWatchdog();
+    aiBusyWatchdogTimer = setTimeout(() => {
+      aiBusyWatchdogTimer = null;
+      if (!aiBusy) return; // deja resolu, rien a faire
+      aiBusy = false;
+      aiError =
+        "Aucune réponse du serveur après 60s. " +
+        "Vérifie les logs Spring : la requête est probablement bloquée côté Gemini ou le retour STOMP est cassé.";
+      appendAiChatMessage(`❌ ${aiError}`, "ai-system");
+    }, AI_BUSY_WATCHDOG_MS);
+  }
+
+  function stopAiBusyWatchdog() {
+    if (aiBusyWatchdogTimer) {
+      clearTimeout(aiBusyWatchdogTimer);
+      aiBusyWatchdogTimer = null;
+    }
+  }
+
+  // Effet : rejoindre le topic /topic/ai/<sessionId> dès qu'une session est ACTIVE
+  // et que le canal STOMP IA est connecté. C'est la voie principale (robuste)
+  // pour recevoir les réponses Gemini, en plus de /user/queue/ai/actions.
+  $effect(() => {
+    const session = queriedSession ?? activeSession;
+    const sid = session && session.status === "ACTIVE" ? String(session.id) : null;
+    if (sid && aiConnected) {
+      aiClient.joinSession(sid);
+    }
+  });
 
   function dispatchChatTyping() {
     const roomId = chatRoomId || resolveRoomId();
@@ -2421,11 +2612,21 @@
       if (typeof event.data !== "string") return;
       try {
         const payload = JSON.parse(event.data) as Record<string, unknown>;
-        switch (payload.type) {
+        const msgType = typeof payload.type === "string" ? payload.type : "?";
+        // Log diagnostique — utile pour confirmer que les retours agent
+        // arrivent bien (et leur type). A garder tant qu'on diagnostique
+        // les timeouts request_screenshot.
+        console.log(`[ai] ◀ DataChannel inbound type="${msgType}", len=${event.data.length}`);
+        switch (msgType) {
           case "AI_ACTION_RESULT":
             handleAiActionResult(payload);
             break;
+          // Anciens (mono-paquet) ET nouveaux (chunked) → meme dispatcher.
           case "screenshot_response":
+          case "screenshot_response_error":
+          case "screenshot_chunk_start":
+          case "screenshot_chunk":
+          case "screenshot_chunk_end":
             handleScreenshotResponse(payload);
             break;
           default:
@@ -4225,10 +4426,11 @@
           {:else}
             {#each chatMessages as msg (msgKey(msg))}
               {@const mine = (msg.senderRole ?? msg.senderName) === chatLocalRole}
+              {@const isAi = msg.senderName === "Agent IA" || msg.senderName === "Technicien (IA)"}
               <div class="rd-chat__row" class:rd-chat__row--mine={mine}>
-                <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine}>
+                <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine} class:rd-chat__bubble--ai={isAi}>
                   <div class="rd-chat__meta">
-                    <span class="rd-chat__sender">{mine ? "Moi" : (msg.senderName === "agent" ? "PC distant" : "Technicien")}</span>
+                    <span class="rd-chat__sender">{mine ? "Moi" : (isAi ? "🤖 IA" : (msg.senderName === "agent" ? "PC distant" : "Technicien"))}</span>
                     <span class="rd-chat__ts">{new Date(msg.timestamp).toLocaleTimeString()}</span>
                   </div>
                   <p class="rd-chat__text">{msg.content}</p>
@@ -4518,10 +4720,11 @@
                 {:else}
                   {#each chatMessages as msg (msgKey(msg))}
                     {@const mine = (msg.senderRole ?? msg.senderName) === chatLocalRole}
+                    {@const isAi = msg.senderName === "Agent IA" || msg.senderName === "Technicien (IA)"}
                     <div class="rd-chat__row" class:rd-chat__row--mine={mine}>
-                      <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine}>
+                      <div class="rd-chat__bubble" class:rd-chat__bubble--mine={mine} class:rd-chat__bubble--ai={isAi}>
                         <div class="rd-chat__meta">
-                          <span class="rd-chat__sender">{mine ? "Moi" : (msg.senderName === "agent" ? "PC distant" : "Technicien")}</span>
+                          <span class="rd-chat__sender">{mine ? "Moi" : (isAi ? "🤖 IA" : (msg.senderName === "agent" ? "PC distant" : "Technicien"))}</span>
                           <span class="rd-chat__ts">{new Date(msg.timestamp).toLocaleTimeString()}</span>
                         </div>
                         <p class="rd-chat__text">{msg.content}</p>
@@ -7312,6 +7515,16 @@
     border-color: rgba(56, 189, 248, 0.4);
     border-radius: 14px 14px 4px 14px;
   }
+  /* Bulles IA — fond violet pour bien distinguer du chat humain. */
+  .rd-chat__bubble--ai {
+    background: rgba(167, 139, 250, 0.14);
+    border-color: rgba(167, 139, 250, 0.4);
+  }
+  .rd-chat__bubble--ai.rd-chat__bubble--mine {
+    background: rgba(167, 139, 250, 0.22);
+    border-color: rgba(167, 139, 250, 0.5);
+  }
+  .rd-chat__bubble--ai .rd-chat__sender { color: #a78bfa; }
   .rd-chat__meta {
     display: flex;
     justify-content: space-between;
