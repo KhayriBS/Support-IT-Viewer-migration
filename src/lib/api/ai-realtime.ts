@@ -14,7 +14,9 @@ export type AiAction =
   | { type: "key"; key: string; modifiers?: string[] }
   | { type: "shell"; cmd: string; shell?: "cmd" | "powershell" | "bash" }
   | { type: "screenshot" }
-  | { type: "wait"; ms: number };
+  | { type: "wait"; ms: number }
+  | { type: "scroll"; x?: number; y?: number; dy: number; dx?: number }
+  | { type: "drag"; x: number; y: number; destX: number; destY: number; button?: "left" | "right" | "middle" };
 
 export interface AiActionEnvelope {
   sessionId: string;

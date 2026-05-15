@@ -1735,6 +1735,12 @@
       case "shell":         return `💻 shell(${a.shell ?? "default"}): ${a.cmd}`;
       case "screenshot":    return `📸 screenshot`;
       case "wait":          return `⏳ wait ${a.ms}ms`;
+      case "scroll": {
+        const dir = a.dy > 0 ? "↓" : a.dy < 0 ? "↑" : (a.dx && a.dx > 0 ? "→" : "←");
+        const loc = a.x !== undefined && a.y !== undefined ? ` @ (${a.x.toFixed(2)},${a.y.toFixed(2)})` : "";
+        return `🖱️ scroll ${dir} ${Math.abs(a.dy || a.dx || 0)}${loc}`;
+      }
+      case "drag":          return `🖐️ drag (${a.x.toFixed(2)},${a.y.toFixed(2)}) → (${a.destX.toFixed(2)},${a.destY.toFixed(2)})`;
       default:              return `❓ ${JSON.stringify(a)}`;
     }
   }

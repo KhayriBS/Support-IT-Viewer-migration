@@ -46,6 +46,14 @@ pub struct AiAction {
     pub cmd: Option<String>,
     pub shell: Option<String>,
     pub ms: Option<u64>,
+    // ── scroll ──────────────────────────────────────────────────────────
+    pub dy: Option<i32>,
+    pub dx: Option<i32>,
+    // ── drag (x/y = depart, destX/destY = arrivee) ──────────────────────
+    #[serde(rename = "destX")]
+    pub dest_x: Option<f64>,
+    #[serde(rename = "destY")]
+    pub dest_y: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,6 +191,8 @@ impl AiExecutor {
             "shell" => self.do_shell(&action).await,
             "wait" => self.do_wait(&action).await,
             "screenshot" => self.do_screenshot().await,
+            "scroll" => self.do_scroll(&action).await,
+            "drag" => self.do_drag(&action).await,
             other => Err(format!("Unsupported action type: {other}")),
         };
 
@@ -382,6 +392,112 @@ impl AiExecutor {
         Ok(Some(b64))
     }
 
+    // ── Scroll ───────────────────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    async fn do_scroll(&self, action: &AiAction) -> Result<Option<String>, String> {
+        use enigo::{Axis, Coordinate, Mouse};
+
+        let dy = action.dy.unwrap_or(0);
+        let dx = action.dx.unwrap_or(0);
+        if dy == 0 && dx == 0 {
+            return Err("scroll missing dy/dx".into());
+        }
+
+        let mut enigo = self.enigo.lock().await;
+
+        // Position le curseur si x/y fournis (sinon scroll a la position courante)
+        if let (Some(nx), Some(ny)) = (action.x, action.y) {
+            let (screen_w, screen_h) = primary_screen_size()?;
+            let px = (nx.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
+            let py = (ny.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+            enigo
+                .move_mouse(px, py, Coordinate::Abs)
+                .map_err(|e| format!("scroll: move_mouse failed: {e}"))?;
+        }
+
+        if dy != 0 {
+            enigo
+                .scroll(dy, Axis::Vertical)
+                .map_err(|e| format!("scroll vertical failed: {e}"))?;
+        }
+        if dx != 0 {
+            enigo
+                .scroll(dx, Axis::Horizontal)
+                .map_err(|e| format!("scroll horizontal failed: {e}"))?;
+        }
+        Ok(Some(format!("scrolled dy={dy} dx={dx}")))
+    }
+
+    #[cfg(not(windows))]
+    async fn do_scroll(&self, _action: &AiAction) -> Result<Option<String>, String> {
+        Err("scroll is Windows-only in this build".into())
+    }
+
+    // ── Drag ─────────────────────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    async fn do_drag(&self, action: &AiAction) -> Result<Option<String>, String> {
+        use enigo::{Button, Coordinate, Direction, Mouse};
+
+        let from_x = action.x.ok_or("drag missing x (origin)")?;
+        let from_y = action.y.ok_or("drag missing y (origin)")?;
+        let to_x = action.dest_x.ok_or("drag missing destX")?;
+        let to_y = action.dest_y.ok_or("drag missing destY")?;
+        let (screen_w, screen_h) = primary_screen_size()?;
+
+        let sx = (from_x.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
+        let sy = (from_y.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+        let ex = (to_x.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
+        let ey = (to_y.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+
+        let button = match action.button.as_deref().unwrap_or("left") {
+            "right" => Button::Right,
+            "middle" => Button::Middle,
+            _ => Button::Left,
+        };
+
+        let mut enigo = self.enigo.lock().await;
+
+        // 1. Position curseur au point de depart
+        enigo
+            .move_mouse(sx, sy, Coordinate::Abs)
+            .map_err(|e| format!("drag: move_mouse to origin failed: {e}"))?;
+
+        // 2. Bouton enfonce
+        enigo
+            .button(button, Direction::Press)
+            .map_err(|e| format!("drag: button press failed: {e}"))?;
+
+        // 3. Drag avec etapes intermediaires (simule un drag naturel) — 8 steps,
+        //    1ms entre chaque → assez rapide pour ne pas bloquer, assez progressif
+        //    pour que les controles type slider/scrollbar reagissent correctement
+        //    (certains UI ignorent les saut "teleport" et n'agissent que sur les
+        //    mouvements continus).
+        let steps = 8;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let ix = (sx as f64 + (ex - sx) as f64 * t).round() as i32;
+            let iy = (sy as f64 + (ey - sy) as f64 * t).round() as i32;
+            enigo
+                .move_mouse(ix, iy, Coordinate::Abs)
+                .map_err(|e| format!("drag: intermediate move failed: {e}"))?;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+
+        // 4. Relacher le bouton
+        enigo
+            .button(button, Direction::Release)
+            .map_err(|e| format!("drag: button release failed: {e}"))?;
+
+        Ok(Some(format!("dragged ({sx},{sy}) → ({ex},{ey})")))
+    }
+
+    #[cfg(not(windows))]
+    async fn do_drag(&self, _action: &AiAction) -> Result<Option<String>, String> {
+        Err("drag is Windows-only in this build".into())
+    }
+
     // ── Replies ──────────────────────────────────────────────────────────────
 
     async fn reply_ok(&self, action: Option<&str>, screenshot_or_msg: Option<String>) {
@@ -486,6 +602,19 @@ fn map_key_name(key: &str) -> Option<enigo::Key> {
         "f1" => Key::F1, "f2" => Key::F2, "f3" => Key::F3, "f4" => Key::F4,
         "f5" => Key::F5, "f6" => Key::F6, "f7" => Key::F7, "f8" => Key::F8,
         "f9" => Key::F9, "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,
+        // ── Touches média Windows ─────────────────────────────────────────
+        // Bien meilleures que cliquer le slider à l'œil — Gemini est
+        // explicitement instruit de les preferer (cf prompt Spring).
+        "volumeup"   | "volume_up"   | "volume-up"   => Key::VolumeUp,
+        "volumedown" | "volume_down" | "volume-down" => Key::VolumeDown,
+        "volumemute" | "volume_mute" | "volume-mute" | "mute" => Key::VolumeMute,
+        "medianext"     | "media_next"      | "media-next"      => Key::MediaNextTrack,
+        "mediaprev"     | "media_prev"      | "media-prev"
+            | "mediaprevious"| "media_previous"  | "media-previous"        => Key::MediaPrevTrack,
+        "mediaplay"     | "media_play"      | "media-play"
+            | "playpause"   | "play_pause"      | "play-pause"
+            | "mediaplaypause" | "media_play_pause" | "media-play-pause"  => Key::MediaPlayPause,
+        "mediastop"     | "media_stop"      | "media-stop"      => Key::MediaStop,
         _ => return None,
     })
 }
