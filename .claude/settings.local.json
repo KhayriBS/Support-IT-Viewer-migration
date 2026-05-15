@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx svelte-check *)"
+      "Bash(npx svelte-check *)",
+      "PowerShell(npm run check 2>&1)",
+      "PowerShell($lines = [System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\); Write-Output \"+page.svelte: $\\($lines.Length\\) lines\")",
+      "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; $sess = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdSessionHistory.svelte\"\\)\\).Length; $file = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdFileHistory.svelte\"\\)\\).Length; $modal = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdApprovalModal.svelte\"\\)\\).Length; Write-Output \"+page.svelte: $page\"; Write-Output \"RdApprovalModal: $modal\"; Write-Output \"RdSessionHistory: $sess\"; Write-Output \"RdFileHistory: $file\")",
+      "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; Write-Output \"+page.svelte: $page lines\"; Get-ChildItem \"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\" | ForEach-Object { $l = \\([System.IO.File]::ReadAllLines\\($_.FullName\\)\\).Length; Write-Output \"$\\($_.Name\\): $l\" })"
     ]
   }
 }

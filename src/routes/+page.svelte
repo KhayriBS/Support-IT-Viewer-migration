@@ -1,9 +1,37 @@
-﻿<script lang="ts">
+<script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, onMount } from "svelte";
   import { AiRealtimeClient, ChatRealtimeClient, SignalingClient, technicianApi } from "$lib/api";
   import type { AiAction, AiActionEnvelope, Agent, ChatMessage, ControlSession, SignalMessage, TypingNotification } from "$lib/api";
   import type { FileEntry, FileTransfer } from "$lib/api/types";
+  import { diag } from "$lib/utils/diag";
+  import { msgKey, mergeMessages } from "$lib/utils/chat";
+  import {
+    rdFormatDuration,
+    rdFormatTime,
+    rdFormatRelative,
+    rdFormatBytes,
+    rdFileIconClass,
+    formatFileSize,
+    formatBytesApprox
+  } from "$lib/utils/format";
+  import { transferProgress, transferSpeed } from "$lib/utils/transfer";
+  import {
+    defaultViewerIceServers,
+    resolveIceServers,
+    viewerStateClass,
+    viewerStateLabel,
+    viewerQualityClass,
+    viewerQualityLabel,
+    statusClass,
+    isEditableTarget
+  } from "$lib/utils/viewer";
+  import { formatSignalPayload, isRetryableSignalingCloseCode } from "$lib/utils/signal";
+  import RdApprovalModal from "$lib/components/RdApprovalModal.svelte";
+  import RdSessionHistory from "$lib/components/RdSessionHistory.svelte";
+  import RdFileHistory from "$lib/components/RdFileHistory.svelte";
+  import RdViewerStatsBar from "$lib/components/RdViewerStatsBar.svelte";
+  import type { RdFileRow } from "$lib/types/ui";
 
   interface AgentMetrics {
     cpuUsage: number;
@@ -127,26 +155,6 @@
     height?: number;
   }
   const pendingScreenshots = new Map<string, PendingScreenshot>();
-
-  // â”€â”€ Diagnostic logger (always on â€” strip these once issue is fixed) â”€â”€â”€â”€â”€â”€â”€â”€
-  // Goal: see in DevTools console exactly which event/branch fires when the
-  // session dies. Prefix every log with [DIAG] for easy grep.
-  // Note: we deep-clone payload via JSON to break Svelte 5 $state proxies
-  // (which would otherwise trigger the `console_log_state` warning).
-  function diag(tag: string, payload?: unknown) {
-    if (payload === undefined) {
-      console.log(`[DIAG] ${tag}`);
-      return;
-    }
-    let safe: unknown = payload;
-    try {
-      safe = JSON.parse(JSON.stringify(payload));
-    } catch {
-      // payload contains non-serializable values (Map, RTCPeerConnection, â€¦) â€”
-      // log as-is, the proxy warning is harmless.
-    }
-    console.log(`[DIAG] ${tag}`, safe);
-  }
 
   // Inbound video stats poller â€” confirms whether bytes/frames actually arrive.
   // If bytesReceived stays at 0 â†’ media path is broken (codec/SRTP/FEC/etc.).
@@ -497,32 +505,6 @@
   let viewerChatPanelOpen = $state(false);
   let viewerRemoteWidth = $state(1920);
   let viewerRemoteHeight = $state(1080);
-  // Metered "global.relay" static credentials (account: lumieretech).
-  // Hard fallback used when VITE_ICE_SERVERS is unset and the Tauri
-  // get_ice_servers_cmd returns nothing usable. Rotate if Metered invalidates.
-  const defaultViewerIceServers: RTCIceServer[] = [
-    { urls: "stun:stun.relay.metered.ca:80" },
-    {
-      urls: "turn:global.relay.metered.ca:80",
-      username: "d156f70e60e74c734ec39dc8",
-      credential: "Z9zO5Kp3c5P/c6e0"
-    },
-    {
-      urls: "turn:global.relay.metered.ca:80?transport=tcp",
-      username: "d156f70e60e74c734ec39dc8",
-      credential: "Z9zO5Kp3c5P/c6e0"
-    },
-    {
-      urls: "turn:global.relay.metered.ca:443",
-      username: "d156f70e60e74c734ec39dc8",
-      credential: "Z9zO5Kp3c5P/c6e0"
-    },
-    {
-      urls: "turns:global.relay.metered.ca:443?transport=tcp",
-      username: "d156f70e60e74c734ec39dc8",
-      credential: "Z9zO5Kp3c5P/c6e0"
-    }
-  ];
   let viewerIceServers = $state<RTCIceServer[]>(defaultViewerIceServers);
   let viewerStreamMbps = $state<number | null>(null);
   let viewerStreamFps = $state<number | null>(null);
@@ -749,23 +731,6 @@
    * backend (audit BD persistant), soit du dictionnaire in-memory pour les
    * transferts en cours (qui n'ont pas encore d'enregistrement complet).
    */
-  type RdFileRow = {
-    transferId: string;
-    fileName: string;
-    /** "upload" = ce PC a envoyé, "download" = ce PC a reçu */
-    type: "upload" | "download";
-    /** Identifiant lisible de l'autre PC */
-    peerLabel: string;
-    sizeBytes: number;
-    state: "active" | "complete" | "error" | "cancelled";
-    error: string | null;
-    /** Epoch ms pour le tri */
-    startedMs: number;
-    /** Pour les transferts en cours : progression */
-    doneBytes: number;
-    isLive: boolean;
-  };
-
   const rdFilteredFiles = $derived.by<RdFileRow[]>(() => {
     const search = rdFileSearch.trim().toLowerCase();
     const rows = new Map<string, RdFileRow>();
@@ -824,45 +789,6 @@
       })
       .sort((a, b) => b.startedMs - a.startedMs);
   });
-
-  function rdFormatDuration(ms: number | null): string {
-    if (!ms || ms <= 0) return "-";
-    const total = Math.floor(ms / 1000);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    if (h > 0) return `${h}h ${m}min`;
-    return `${m} min`;
-  }
-  function rdFormatTime(iso: string): string {
-    try {
-      return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    } catch {
-      return "-";
-    }
-  }
-  function rdFormatRelative(ms: number): string {
-    const diff = Date.now() - ms;
-    const m = Math.floor(diff / 60000);
-    if (m < 1) return "à l'instant";
-    if (m < 60) return `Il y a ${m} min`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `Il y a ${h}h`;
-    const d = Math.floor(h / 24);
-    return `Il y a ${d}j`;
-  }
-  function rdFormatBytes(b: number): string {
-    if (!b || b < 1024) return `${b} B`;
-    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-    if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
-    return `${(b / 1024 / 1024 / 1024).toFixed(1)} GB`;
-  }
-  function rdFileIconClass(name: string): string {
-    const lower = name.toLowerCase();
-    if (lower.endsWith(".pdf")) return "rd-file__icon--pdf";
-    if (lower.endsWith(".pptx") || lower.endsWith(".ppt")) return "rd-file__icon--ppt";
-    if (lower.endsWith(".zip") || lower.endsWith(".rar") || lower.endsWith(".7z")) return "rd-file__icon--zip";
-    return "rd-file__icon--pdf";
-  }
 
   async function refreshMetrics() {
     try {
@@ -1125,31 +1051,6 @@
   }
 
   // â”€â”€ Dedup helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-  /** Stable identity key. Prefers server id; falls back to content fingerprint. */
-  function msgKey(msg: ChatMessage): string {
-    if (msg.id !== undefined && msg.id !== null) {
-      return `id:${msg.id}`;
-    }
-    return `${msg.senderName}:${msg.timestamp}:${msg.content.slice(0, 64)}`;
-  }
-
-  /** Merge two message arrays without duplicates, keeping chronological order. */
-  function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-    if (incoming.length === 0) return existing;
-    const seen = new Set(existing.map(msgKey));
-    const merged = [...existing];
-    for (const msg of incoming) {
-      const k = msgKey(msg);
-      if (!seen.has(k)) {
-        merged.push(msg);
-        seen.add(k);
-      }
-    }
-    // Sort by timestamp (ISO strings sort lexicographically)
-    merged.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    return merged.slice(-200);
-  }
 
   // â”€â”€ Poll timer helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -1795,13 +1696,6 @@
     }
   }
 
-  /** Estimation grossiere de la taille decodee d'une chaine base64 (en KB). */
-  function formatBytesApprox(base64Len: number): string {
-    const approxBytes = Math.floor((base64Len * 3) / 4);
-    if (approxBytes < 1024) return `${approxBytes} B`;
-    if (approxBytes < 1024 * 1024) return `${(approxBytes / 1024).toFixed(1)} KB`;
-    return `${(approxBytes / 1024 / 1024).toFixed(2)} MB`;
-  }
 
   function handleAiActionEnvelope(env: AiActionEnvelope) {
     aiBusy = false;
@@ -2277,141 +2171,6 @@
     activeDownloadId = null;
   }
 
-  function formatFileSize(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  }
-
-  function transferProgress(t: FileTransfer): number {
-    if (t.totalSize === 0) return 100;
-    return Math.round((t.doneBytes / t.totalSize) * 100);
-  }
-
-  function transferSpeed(t: FileTransfer): string {
-    const elapsed = (Date.now() - t.startedAt) / 1000;
-    if (elapsed < 0.1) return "";
-    const bps = t.doneBytes / elapsed;
-    return `${formatFileSize(Math.round(bps))}/s`;
-  }
-
-  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-  function statusClass(status: string | undefined) {
-    switch ((status ?? "").toUpperCase()) {
-      case "ONLINE":
-        return "ok";
-      case "BUSY":
-        return "warn";
-      default:
-        return "muted";
-    }
-  }
-
-  function viewerStateClass(state: string) {
-    switch (state) {
-      case "connected":
-        return "ok";
-      case "failed":
-      case "disconnected":
-      case "closed":
-        return "error";
-      case "connecting":
-      case "new":
-        return "warn";
-      default:
-        return "muted";
-    }
-  }
-
-  function viewerStateLabel(state: string) {
-    switch (state) {
-      case "connected":
-        return "connecte";
-      case "connecting":
-        return "connexion";
-      case "disconnected":
-        return "deconnecte";
-      case "failed":
-        return "echec";
-      case "closed":
-        return "ferme";
-      case "new":
-        return "initialisation";
-      default:
-        return "attente";
-    }
-  }
-
-  function viewerQualityClass(mbps: number | null) {
-    if (mbps === null) {
-      return "muted";
-    }
-
-    if (mbps < 0.2) {
-      return "error";
-    }
-
-    if (mbps < 0.7) {
-      return "warn";
-    }
-
-    return "ok";
-  }
-
-  function viewerQualityLabel(mbps: number | null) {
-    if (mbps === null) {
-      return "qualite en attente";
-    }
-
-    if (mbps < 0.2) {
-      return "qualite faible";
-    }
-
-    if (mbps < 0.7) {
-      return "qualite moyenne";
-    }
-
-    if (mbps < 1.6) {
-      return "qualite bonne";
-    }
-
-    return "qualite excellente";
-  }
-
-  function resolveIceServers(): RTCIceServer[] {
-    const env = (import.meta as unknown as { env?: Record<string, unknown> }).env ?? {};
-    const raw = typeof env.VITE_ICE_SERVERS === "string" ? env.VITE_ICE_SERVERS.trim() : "";
-
-    if (!raw) {
-      return defaultViewerIceServers;
-    }
-
-    if (raw.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed)) {
-          return parsed as RTCIceServer[];
-        }
-      } catch {
-        // ignore parsing errors
-      }
-      return defaultViewerIceServers;
-    }
-
-    const urls = raw
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    if (urls.length === 0) {
-      return defaultViewerIceServers;
-    }
-
-    return [{ urls }];
-  }
-
   async function refreshViewerIceServers() {
     try {
       const servers = await invoke<Array<{ urls: string[] | string; username?: string; credential?: string }>>(
@@ -2456,43 +2215,6 @@
     } catch {
       viewerIceServers = resolveIceServers();
     }
-  }
-
-  function formatSignalPayload(type: SignalMessage["type"], payload: unknown) {
-    if (payload === undefined || payload === null) {
-      return "";
-    }
-
-    if (type === "OFFER" || type === "ANSWER") {
-      const record = payload as Record<string, unknown>;
-      const sdp = typeof record?.sdp === "string" ? record.sdp : "";
-      const label = typeof record?.type === "string" ? record.type : type.toLowerCase();
-      return `SDP ${label} â€¢ ${sdp.length} chars`;
-    }
-
-    if (type === "ICE") {
-      const record = payload as Record<string, unknown>;
-      const candidate = typeof record?.candidate === "string" ? record.candidate : "";
-      return candidate.length > 96 ? `${candidate.slice(0, 96)}...` : candidate || "ICE candidate";
-    }
-
-    if (type === "STREAM_STATS") {
-      const record = payload as Record<string, unknown>;
-      const mbps = Number(record?.mbps ?? 0);
-      const fps = Number(record?.fps ?? 0);
-      return `${mbps.toFixed(2)} Mbps â€¢ ${fps.toFixed(1)} FPS`;
-    }
-
-    if (type === "FILE_DATA") {
-      const record = payload as Record<string, unknown>;
-      if (typeof record?.chunkIndex === "number") {
-        return `File chunk ${record.chunkIndex}`;
-      }
-      return "File data";
-    }
-
-    const payloadText = JSON.stringify(payload);
-    return payloadText.length > 180 ? `${payloadText.slice(0, 180)}...` : payloadText;
   }
 
   function logSignal(direction: "in" | "out", msg: SignalMessage) {
@@ -2545,13 +2267,6 @@
       signalingReconnectTimer = null;
       void connectSignaling();
     }, delayMs);
-  }
-
-  function isRetryableSignalingCloseCode(code: number) {
-    // Retry only for transient network/server conditions.
-    // 1006: abnormal closure (network loss)
-    // 1011/1012/1013: server/internal temporary conditions
-    return code === 1006 || code === 1011 || code === 1012 || code === 1013;
   }
 
   function stopViewerOfferRetry() {
@@ -2977,18 +2692,6 @@
       type: "wheel",
       deltaY: event.deltaY
     });
-  }
-
-  function isEditableTarget(target: EventTarget | null) {
-    if (
-      target instanceof HTMLInputElement ||
-      target instanceof HTMLTextAreaElement ||
-      target instanceof HTMLSelectElement
-    ) {
-      return true;
-    }
-
-    return target instanceof HTMLElement && target.isContentEditable;
   }
 
   function handleViewerDocumentKeyDown(event: KeyboardEvent) {
@@ -3890,7 +3593,8 @@
             void leaveBackendSession();
           }
           return;
-        }        if (peerAlreadyConnected) {
+        }
+        if (peerAlreadyConnected) {
           diag("signaling close â†’ peer CONNECTED, keep media and reconnect signaling in background");
           signalingError = null;
           // Keep media alive AND keep signaling reconnecting in the background:
@@ -3908,7 +3612,8 @@
         diag("signaling close â†’ giving ICE a grace window to converge", {
           peerState,
           iceState
-        });        signalingError = "Signal perdu — tentative de reprise signaling et ICE...";
+        });
+        signalingError = "Signal perdu — tentative de reprise signaling et ICE...";
         // Always keep retrying — previous logic stopped after the first
         // signaling drop once the peer had ever been connected, leaving
         // the viewer stranded with no way to reach the agent again.
@@ -4204,11 +3909,7 @@
 </svelte:head>
 
 <main class="rd-page">
-  <!-- ═════════════════════════════════════════════════════════════════
-       Nouvelle UI "Bureau à Distance" (cf. maquette).
-       L'ancienne console technicien est conservée plus bas dans un
-       bloc {#if false}…{/if} (équivalent d'un commentaire de bloc Svelte).
-       ═════════════════════════════════════════════════════════════════ -->
+  <!-- UI "Bureau à Distance" (cf. maquette). -->
   <section class="rd-card">
     <header class="rd-header">
       <div class="rd-title">
@@ -4547,60 +4248,15 @@
           {/if}
 
           <!-- Barre flottante télémétrie : FPS, Mbps, RTT, perte, etc. -->
-          {#if viewerStatsBarVisible && viewerRemoteStream}
-            <div class="rd-viewer__stats-bar">
-              <div class="rd-stats__cell" title="Images par seconde décodées">
-                <span class="rd-stats__icon">🎞</span>
-                <span class="rd-stats__num">{viewerLocalFps !== null ? viewerLocalFps.toFixed(0) : "--"}</span>
-                <span class="rd-stats__unit">FPS</span>
-              </div>
-              <div class="rd-stats__cell" title="Débit vidéo entrant">
-                <span class="rd-stats__icon">📶</span>
-                <span class="rd-stats__num">{viewerLocalMbps !== null ? viewerLocalMbps.toFixed(2) : "--"}</span>
-                <span class="rd-stats__unit">Mb/s</span>
-              </div>
-              <div
-                class="rd-stats__cell"
-                class:rd-stats__cell--warn={viewerLocalRttMs !== null && viewerLocalRttMs > 150}
-                class:rd-stats__cell--bad={viewerLocalRttMs !== null && viewerLocalRttMs > 300}
-                title="Latence aller-retour (ICE candidate-pair nominée)">
-                <span class="rd-stats__icon">⏱</span>
-                <span class="rd-stats__num">{viewerLocalRttMs !== null ? viewerLocalRttMs.toFixed(0) : "--"}</span>
-                <span class="rd-stats__unit">ms</span>
-              </div>
-              <div
-                class="rd-stats__cell"
-                class:rd-stats__cell--warn={viewerLocalLossPct !== null && viewerLocalLossPct > 1}
-                class:rd-stats__cell--bad={viewerLocalLossPct !== null && viewerLocalLossPct > 5}
-                title="Paquets perdus sur la dernière seconde">
-                <span class="rd-stats__icon">📉</span>
-                <span class="rd-stats__num">{viewerLocalLossPct !== null ? viewerLocalLossPct.toFixed(1) : "--"}</span>
-                <span class="rd-stats__unit">%</span>
-              </div>
-              <div class="rd-stats__cell" title="Gigue (jitter)">
-                <span class="rd-stats__icon">📊</span>
-                <span class="rd-stats__num">{viewerLocalJitterMs !== null ? viewerLocalJitterMs.toFixed(0) : "--"}</span>
-                <span class="rd-stats__unit">ms</span>
-              </div>
-              {#if viewerLocalResolution}
-                <div class="rd-stats__cell" title="Résolution de la trame reçue">
-                  <span class="rd-stats__icon">🖼</span>
-                  <span class="rd-stats__num">{viewerLocalResolution}</span>
-                </div>
-              {/if}
-              <button
-                class="rd-stats__close"
-                type="button"
-                onclick={() => { viewerStatsBarVisible = false; }}
-                title="Masquer la barre de stats">×</button>
-            </div>
-          {:else if !viewerStatsBarVisible && viewerRemoteStream}
-            <button
-              class="rd-viewer__stats-restore"
-              type="button"
-              onclick={() => { viewerStatsBarVisible = true; }}
-              title="Afficher les stats">📊</button>
-          {/if}
+          <RdViewerStatsBar
+            bind:visible={viewerStatsBarVisible}
+            streamPresent={!!viewerRemoteStream}
+            fps={viewerLocalFps}
+            mbps={viewerLocalMbps}
+            rttMs={viewerLocalRttMs}
+            lossPct={viewerLocalLossPct}
+            jitterMs={viewerLocalJitterMs}
+            resolution={viewerLocalResolution} />
 
           <!-- Barre flottante d'actions (transparente, fade-in au survol) -->
           <div
@@ -4870,846 +4526,35 @@
     </section>
 
     <div class="rd-history-grid">
-      <section class="rd-panel rd-history">
-        <header class="rd-history__head">
-          <h2 class="rd-panel__title"><span class="rd-icon">⏱</span> Historique des sessions</h2>
-          <span class="rd-history__count">{rdFilteredSessions.length} session{rdFilteredSessions.length > 1 ? "s" : ""}</span>
-        </header>
-        <input
-          class="rd-history__search"
-          type="search"
-          placeholder="Rechercher par code machine..."
-          bind:value={rdSessionSearch} />
-        <div class="rd-history__filters">
-          <select class="rd-select" bind:value={rdSessionTypeFilter}>
-            <option value="all">Tous les types</option>
-            <option value="incoming">Entrantes</option>
-            <option value="outgoing">Sortantes</option>
-          </select>
-          <select class="rd-select" bind:value={rdSessionStatusFilter}>
-            <option value="all">Tous les statuts</option>
-            <option value="active">En cours</option>
-            <option value="ended">Terminées</option>
-          </select>
-        </div>
-        <div class="rd-history__list">
-          {#if rdSessionError}
-            <p class="rd-empty">Erreur API: {rdSessionError}</p>
-          {:else if rdSessionLoading && rdFilteredSessions.length === 0}
-            <p class="rd-empty">Chargement…</p>
-          {:else if rdFilteredSessions.length === 0}
-            <p class="rd-empty">Aucune session pour les filtres actuels.</p>
-          {:else}
-            {#each rdFilteredSessions as session (session.id)}
-              {@const isActive = session.status !== "TERMINATED"}
-              <article class="rd-session">
-                <div class="rd-session__top">
-                  <strong class="rd-session__code">{session.peerLabel}</strong>
-                  {#if isActive}
-                    <span class="rd-pill rd-pill--live">En cours</span>
-                  {:else}
-                    <span class="rd-pill rd-pill--done">Terminée</span>
-                  {/if}
-                </div>
-                <p class="rd-session__type">
-                  Connexion {session.direction === "incoming" ? "entrante" : "sortante"}
-                </p>
-                <p class="rd-session__meta">
-                  Début: {rdFormatTime(session.startedAt)}
-                  {#if !isActive && session.durationMs}
-                    &nbsp;&nbsp; Durée: {rdFormatDuration(session.durationMs)}
-                  {/if}
-                </p>
-              </article>
-            {/each}
-          {/if}
-        </div>
-      </section>
+      <RdSessionHistory
+        entries={rdFilteredSessions}
+        error={rdSessionError}
+        loading={rdSessionLoading}
+        bind:search={rdSessionSearch}
+        bind:typeFilter={rdSessionTypeFilter}
+        bind:statusFilter={rdSessionStatusFilter} />
 
-      <section class="rd-panel rd-history">
-        <header class="rd-history__head">
-          <h2 class="rd-panel__title"><span class="rd-icon">📄</span> Historique des fichiers</h2>
-          <span class="rd-history__count">{rdFilteredFiles.length} fichier{rdFilteredFiles.length > 1 ? "s" : ""}</span>
-        </header>
-        <input
-          class="rd-history__search"
-          type="search"
-          placeholder="Rechercher par nom de fichier ou code machine..."
-          bind:value={rdFileSearch} />
-        <div class="rd-history__filters">
-          <select class="rd-select" bind:value={rdFileFilter}>
-            <option value="all">Tous les transferts</option>
-            <option value="upload">Fichiers envoyés</option>
-            <option value="download">Fichiers reçus</option>
-          </select>
-        </div>
-        <div class="rd-history__list">
-          {#if rdFileHistoryError}
-            <p class="rd-empty" style="color:#fca5a5">Erreur historique : {rdFileHistoryError}</p>
-          {:else if rdFilteredFiles.length === 0}
-            <p class="rd-empty">{rdFileHistoryLoading ? "Chargement…" : "Aucun transfert pour les filtres actuels."}</p>
-          {:else}
-            {#each rdFilteredFiles as file (file.transferId)}
-              <article class="rd-file">
-                <span class="rd-file__icon {rdFileIconClass(file.fileName)}">📄</span>
-                <div class="rd-file__body">
-                  <strong class="rd-file__name">{file.fileName}</strong>
-                  <p class="rd-file__sub">
-                    {file.type === "upload" ? "Envoyé vers" : "Reçu de"}
-                    <strong>{file.peerLabel}</strong>
-                  </p>
-                  <p class="rd-file__meta">
-                    {rdFormatBytes(file.sizeBytes)} &nbsp;•&nbsp; {rdFormatRelative(file.startedMs)}
-                    {#if file.state !== "complete"}
-                      &nbsp;•&nbsp; <span class="rd-file__state">{file.state}</span>
-                    {/if}
-                    {#if file.error}
-                      &nbsp;•&nbsp; <span class="rd-file__state" style="color:#fca5a5">{file.error}</span>
-                    {/if}
-                  </p>
-                </div>
-              </article>
-            {/each}
-          {/if}
-        </div>
-      </section>
+      <RdFileHistory
+        entries={rdFilteredFiles}
+        error={rdFileHistoryError}
+        loading={rdFileHistoryLoading}
+        bind:search={rdFileSearch}
+        bind:filter={rdFileFilter} />
     </div>
   </section>
 
-  <!-- ── Modal d'approbation : popup côté ordinateur DISTANT (cible) ── -->
-  {#if showApprovalModal && pendingApprovalSession}
-    <div
-      class="rd-approval-overlay"
-      role="dialog"
-      tabindex="-1"
-      onkeydown={(e) => { if (e.key === "Escape" && !approvalLoading) showApprovalModal = false; }}
-      onmousedown={(e) => { if (!approvalLoading && e.target === e.currentTarget) showApprovalModal = false; }}>
-      <div class="rd-approval-modal">
-        <h2>Demande d'accès distant</h2>
-        <p class="rd-approval-desc">
-          <strong>{pendingApprovalSession.technicianUsername || "Un technicien"}</strong>
-          demande l'accès à ce PC.
-        </p>
+  <!-- Modal d'approbation : popup côté ordinateur DISTANT (cible) -->
+  <RdApprovalModal
+    open={showApprovalModal}
+    session={pendingApprovalSession}
+    errorMessage={approvalError}
+    loading={approvalLoading}
+    bind:allowRemoteInput={approvalAllowRemoteInput}
+    bind:allowFileTransfer={approvalAllowFileTransfer}
+    onApprove={approvePendingSession}
+    onReject={rejectPendingSession}
+    onClose={() => { showApprovalModal = false; }} />
 
-        {#if approvalError}
-          <p class="rd-approval-error">{approvalError}</p>
-        {/if}
-
-        <div class="rd-approval-options">
-          <label>
-            <input type="checkbox" bind:checked={approvalAllowRemoteInput} disabled={approvalLoading} />
-            Autoriser clavier / souris
-          </label>
-          <label>
-            <input type="checkbox" bind:checked={approvalAllowFileTransfer} disabled={approvalLoading} />
-            Autoriser transfert de fichiers
-          </label>
-        </div>
-
-        <div class="rd-approval-actions">
-          <button
-            class="rd-approval-btn rd-approval-btn--reject"
-            onclick={rejectPendingSession}
-            disabled={approvalLoading}>
-            {approvalLoading ? "Traitement…" : "Refuser"}
-          </button>
-          <button
-            class="rd-approval-btn rd-approval-btn--approve"
-            onclick={approvePendingSession}
-            disabled={approvalLoading}>
-            {approvalLoading ? "Traitement…" : "Autoriser"}
-          </button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  <!-- ╔══════════════════════════════════════════════════════════════╗
-       ║  ANCIEN UI — bloc commenté (HTML comment, ignoré par Svelte).║
-       ║  Aucun backend Rust touché.                                   ║
-       ╚══════════════════════════════════════════════════════════════╝
-  <header class="hero">
-    <div class="hero-copy">
-      <p class="eyebrow">Support distant</p>
-      <h1>Lumiere IT</h1>
-      <p class="hero-text">
-        Console technicien pour lancer une session, voir l'etat de la machine cible et prendre la main a distance.
-      </p>
-    </div>
-    <div class="badges status-strip">
-      <span class="badge" class:ok={!metricsError && !metricsLoading} class:error={!!metricsError}>
-        Mesures locales: {metricsLoading ? "chargement" : metricsError ? "erreur" : "ok"}
-      </span>
-      <span class="badge" class:ok={agentRunning} class:error={!agentRunning}>
-        Agent local: {agentRunning ? "actif" : "arret"}
-      </span>
-      <span class="badge" class:ok={!agentsError && !agentsLoading} class:error={!!agentsError}>
-        API: {agentsLoading ? "chargement" : agentsError ? "erreur" : "ok"}
-      </span>
-      <span class="badge" class:ok={signalingConnected} class:error={!signalingConnected}>
-        Signal: {signalingConnected ? "connecte" : "hors ligne"}
-      </span>
-      <span class="badge" class:ok={chatConnected} class:error={!chatConnected}>
-        Chat: {chatConnected ? "connecte" : "attente"}
-      </span>
-    </div>
-  </header>
-
-  <section class="card metrics-panel">
-    <button class="metrics-summary" type="button" onclick={toggleMetricsPanel}>
-      <div>
-        <h2>Mesures de cet agent</h2>
-        <p class="hint top-gap">
-          {metricsPanelOpen ? "Cliquez pour masquer le detail." : "Cliquez pour afficher CPU, RAM et disque."}
-        </p>
-      </div>
-      <div class="row">
-        <span class={`pill ${metrics && !metricsError ? "ok" : "muted"}`}>
-          {metricsLoading ? "chargement" : metricsError ? "indisponible" : "mesures recues"}
-        </span>
-        <span class="pill muted">{metricsPanelOpen ? "masquer" : "ouvrir"}</span>
-      </div>
-    </button>
-
-    {#if metricsPanelOpen}
-      <div class="grid metrics top-gap">
-        <article class="metric-card metric-tile">
-          <h3>CPU</h3>
-          <p class="big">{metrics ? `${metrics.cpuUsage.toFixed(1)}%` : "-"}</p>
-        </article>
-        <article class="metric-card metric-tile">
-          <h3>RAM</h3>
-          <p class="big">{metrics ? `${metrics.ramUsage.toFixed(1)}%` : "-"}</p>
-        </article>
-        <article class="metric-card metric-tile">
-          <h3>Disque</h3>
-          <p class="big">{metrics ? `${metrics.diskUsage.toFixed(1)}%` : "-"}</p>
-        </article>
-      </div>
-      <p class="hint top-gap">
-        {metrics
-          ? `Derniere mesure: ${new Date(metrics.timestamp).toLocaleTimeString()}`
-          : metricsError || "Aucune mesure disponible pour le moment."}
-      </p>
-    {/if}
-  </section>
-
-  <section class="card">
-    {#if agentLifecycleError}
-      <p class="error top-gap">{agentLifecycleError}</p>
-    {/if}
-
-    <div class="row between">
-      <h2>Agents en ligne</h2>
-      <button onclick={refreshOnlineAgents} disabled={agentsLoading || actionLoading}>Rafraichir</button>
-    </div>
-    <p class="hint">Derniere synchro: {agentsUpdatedAt}</p>
-
-    {#if agentsError}
-      <p class="error">{agentsError}</p>
-    {:else if onlineAgents.length === 0}
-      <p class="hint">Aucun agent online.</p>
-    {:else}
-      <div class="list">
-        {#each onlineAgents as agent (agent.id)}
-          <div class="item agent-item">
-            <div class="agent-meta">
-              <strong>{agent.machineId}</strong>
-              <p class="hint">{agent.hostname} - {agent.osInfo}</p>
-            </div>
-            <div class="row">
-              <span class={`pill ${statusClass(agent.status)}`}>{agent.status}</span>
-              <button onclick={() => startSession(agent.machineId)} disabled={actionLoading}>Se connecter</button>
-            </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </section>
-
-  <section class="grid actions">
-    <article class="card">
-      <h2>Code de connexion de cet agent</h2>
-      <p class="hint top-gap">Partagez ce code au technicien pour un demarrage rapide.</p>
-      <div class="connection-code-card top-gap">
-        <div>
-          <span class="session-kv-label">Machine locale</span>
-          <strong>{localMachineId || "indisponible"}</strong>
-        </div>
-        <div class="connection-code-row">
-          <span class="connection-code-value">
-            {localConnectionCodeLoading ? "Chargement..." : localConnectionCode || "Code indisponible"}
-          </span>
-          <button onclick={copyLocalConnectionCode} disabled={!localConnectionCode}>Copier</button>
-        </div>
-        {#if connectionCodeCopied}
-          <p class="hint ok">Code copie.</p>
-        {/if}
-        {#if localConnectionCodeError}
-          <p class="error top-gap">{localConnectionCodeError}</p>
-        {/if}
-      </div>
-    </article>
-
-    <article class="card">
-      <h2>Connexion par code</h2>
-      <div class="row">
-        <input bind:value={connectionCode} placeholder="Code de connexion" />
-        <button onclick={startSessionWithCode} disabled={actionLoading}>Lancer</button>
-      </div>
-    </article>
-  </section>
-
-  <section class="card session-card">
-    <div class="row between">
-      <div>
-        <h2>Session courante</h2>
-        <p class="hint top-gap">Suivi de la machine cible et acces aux fonctions de support.</p>
-      </div>
-      {#if queriedSession}
-        <div class="row">
-          <span class={`pill ${statusClass(queriedSession.status)}`}>{queriedSession.status}</span>
-          <span class={`pill ${shouldBridgeSessionToLocalAgent(queriedSession) ? "warn" : "ok"}`}>
-            {shouldBridgeSessionToLocalAgent(queriedSession) ? "machine locale" : "machine distante"}
-          </span>
-        </div>
-      {/if}
-    </div>
-
-    {#if queriedSession}
-      <div class="session-grid top-gap">
-        <div class="session-kv">
-          <span class="session-kv-label">Machine cible</span>
-          <strong>{queriedSession.agentMachineId}</strong>
-        </div>
-        <div class="session-kv">
-          <span class="session-kv-label">Technicien</span>
-          <strong>{queriedSession.technicianUsername || "viewer"}</strong>
-        </div>
-        <div class="session-kv">
-          <span class="session-kv-label">Identifiant</span>
-          <strong>#{queriedSession.id}</strong>
-        </div>
-        <div class="session-kv">
-          <span class="session-kv-label">Token</span>
-          <code>{queriedSession.signalingToken}</code>
-        </div>
-      </div>
-
-      {#if waitingForApproval || queriedSession.status === "PENDING_APPROVAL"}
-        <p class="hint top-gap waiting-msg">
-          Demande envoyee. En attente de confirmation sur le PC distant...
-        </p>
-      {/if}
-
-      {#if queriedSession.status === "ACTIVE"}
-        <div class="row top-gap feature-actions session-toolbar">
-          <button
-            class:selected={selectedFeature === "screen"}
-            onclick={() => chooseFeature("screen")}
-          >
-            Ecran distant
-          </button>
-          <button
-            class:selected={selectedFeature === "chat"}
-            onclick={() => chooseFeature("chat")}
-          >
-            Chat
-          </button>
-          <button
-            class:selected={selectedFeature === "files"}
-            onclick={() => chooseFeature("files")}
-          >
-            Fichiers
-          </button>
-        </div>
-      {/if}
-    {:else}
-      <p class="hint">Aucune session chargee.</p>
-    {/if}
-
-    {#if actionError}
-      <p class="error top-gap">{actionError}</p>
-    {/if}
-  </section>
-
-  {#if queriedSession?.status === "ACTIVE" && selectedFeature === "screen"}
-  <section class:expanded={viewerExpanded} class="card remote-session-card">
-    <div class="row between">
-      <div class="remote-session-heading">
-        <h2>Controle distant</h2>
-        <p class="hint top-gap">Acces visuel temps reel avec commandes souris et clavier sur la machine distante.</p>
-      </div>
-      <div class="row remote-session-actions">
-        <button onclick={toggleViewerExpanded}>
-          {viewerExpanded ? "Taille normale" : "Agrandir"}
-        </button>
-        <button onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream}>
-          {viewerFullscreenActive ? "Quitter plein ecran" : "Plein ecran"}
-        </button>
-        <button onclick={() => void connectSignaling()} disabled={actionLoading || signalingConnected}>Reconnecter</button>
-        <button class="danger-ghost" onclick={() => void disconnectSignaling({ sendLeave: true })} disabled={!signalingConnected}>Deconnecter</button>
-      </div>
-    </div>
-
-    {#if signalingError}
-      <p class="error top-gap">{signalingError}</p>
-    {/if}
-
-    {#if backendSyncError}
-      <p class="error top-gap">{backendSyncError}</p>
-    {/if}
-
-    <div class="top-gap viewer-status-bar">
-      <div class="viewer-status-summary">
-        <div class="viewer-summary-tile">
-          <span class="session-kv-label">Etat</span>
-          <div class="viewer-status-stack">
-            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
-            <span class={`pill ${viewerRemoteStream ? "ok" : "muted"}`}>
-              {viewerRemoteStream ? "flux live" : "en attente"}
-            </span>
-          </div>
-        </div>
-        <div class="viewer-summary-tile">
-          <span class="session-kv-label">Controle</span>
-          <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
-            {queriedSession?.allowRemoteInput === false
-              ? "lecture seule"
-              : viewerDataChannelOpen
-                ? viewerKeyboardCaptured
-                  ? "clavier + souris actifs"
-                  : "souris active - cliquez la video pour le clavier"
-                : "input en attente"}
-          </span>
-        </div>
-        <div class="viewer-summary-tile">
-          <span class="session-kv-label">Qualite</span>
-          <div class="viewer-status-stack">
-            <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
-            <span class="pill muted">preset: {viewerPreset}</span>
-            {#if viewerStreamMbps !== null}
-              <span class="pill ok">{viewerStreamMbps.toFixed(2)} Mbps</span>
-            {/if}
-            {#if viewerStreamFps !== null}
-              <span class="pill muted">{viewerStreamFps.toFixed(1)} FPS</span>
-            {/if}
-          </div>
-        </div>
-        <div class="viewer-summary-tile">
-          <span class="session-kv-label">Affichage</span>
-          <div class="viewer-status-stack">
-            {#if viewerRemoteStream}
-              <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
-            {/if}
-            <span class="pill muted">{viewerFullscreenActive ? "plein ecran" : viewerExpanded ? "agrandi" : "standard"}</span>
-          </div>
-        </div>
-      </div>
-      <p class="hint control-hint">
-        Bougez la souris dans la video pour afficher les commandes. Cliquez dans la video pour activer le clavier distant.
-      </p>
-    </div>
-
-    <div class="top-gap screen-frame-panel">
-      <div bind:this={viewerShellEl} class="video-shell" role="presentation" onmousemove={revealViewerControls}>
-        <div class:visible={viewerControlsVisible || viewerConnectionState !== "connected"} class="remote-toolbar">
-          <div class="viewer-toolbar-group viewer-toolbar-status">
-            <span class={`pill ${viewerStateClass(viewerConnectionState)}`}>{viewerStateLabel(viewerConnectionState)}</span>
-            <span class={`pill ${queriedSession?.allowRemoteInput === false ? "warn" : viewerDataChannelOpen ? "ok" : "muted"}`}>
-              {queriedSession?.allowRemoteInput === false
-                ? "lecture seule"
-                : viewerDataChannelOpen
-                  ? "controle actif"
-                  : "input en attente"}
-            </span>
-            <span class={`pill ${viewerQualityClass(viewerStreamMbps)}`}>{viewerQualityLabel(viewerStreamMbps)}</span>
-            <span class="telemetry-pill">
-              <span class="telemetry-label">LIVE</span>
-              <span class={`telemetry-dot ${viewerStreamMbps !== null || viewerStreamFps !== null ? "ok" : "muted"}`}></span>
-            </span>
-            <span class="telemetry-pill">
-              <span class="telemetry-label">FPS</span>
-              <strong>{viewerStreamFps !== null ? viewerStreamFps.toFixed(1) : "--"}</strong>
-            </span>
-            <span class="telemetry-pill">
-              <span class="telemetry-label">Mbps</span>
-              <strong>{viewerStreamMbps !== null ? viewerStreamMbps.toFixed(2) : "--"}</strong>
-            </span>
-            {#if viewerRemoteStream}
-              <span class="pill muted">{viewerRemoteWidth}x{viewerRemoteHeight}</span>
-            {/if}
-          </div>
-          <div class="viewer-toolbar-group viewer-toolbar-actions">
-            <select class="toolbar-btn" bind:value={viewerFpsTier} onchange={applyViewerStreamTuning}>
-              <option value="auto">FPS auto</option>
-              <option value="idle">FPS 15 (idle)</option>
-              <option value="normal">FPS 30 (normal)</option>
-              <option value="active">FPS 60 (active)</option>
-            </select>
-            <select class="toolbar-btn" bind:value={viewerBitrateTier} onchange={applyViewerStreamTuning}>
-              <option value="auto">Bitrate auto</option>
-              <option value="poor">1.5 Mbps</option>
-              <option value="medium">4 Mbps</option>
-              <option value="good">8 Mbps</option>
-            </select>
-            <button
-              class="toolbar-btn"
-              class:selected={viewerPreset === "low-latency"}
-              onclick={() => applyViewerPreset("low-latency")}
-            >
-              Low latency
-            </button>
-            <button
-              class="toolbar-btn"
-              class:selected={viewerPreset === "balanced"}
-              onclick={() => applyViewerPreset("balanced")}
-            >
-              Balanced
-            </button>
-            <button
-              class="toolbar-btn"
-              class:selected={viewerPreset === "quality"}
-              onclick={() => applyViewerPreset("quality")}
-            >
-              Quality
-            </button>
-            <button class="toolbar-btn" onclick={toggleViewerPlaybackProfile}>
-              {viewerPlaybackProfile === "quality" ? "Mode qualite" : "Mode reactif"}
-            </button>
-            <button class="toolbar-btn" onclick={toggleViewerExpanded}>
-              {viewerExpanded ? "Normal" : "Agrandir"}
-            </button>
-            <button class="toolbar-btn" onclick={() => void toggleViewerFullscreen()} disabled={!viewerRemoteStream}>
-              {viewerFullscreenActive ? "Quitter" : "Plein ecran"}
-            </button>
-            <button class="toolbar-btn danger-ghost" onclick={() => void disconnectSignaling({ sendLeave: true })} disabled={!signalingConnected}>
-              Deconnecter
-            </button>
-          </div>
-        </div>
-
-        {#if viewerRemoteStream}
-          <video
-            class="viewer-video"
-            class:active={canSendViewerInput()}
-            bind:this={viewerVideoEl}
-            autoplay
-            playsinline
-            muted
-            tabindex="0"
-            onfocus={handleViewerVideoFocus}
-            onblur={handleViewerVideoBlur}
-            onmousemove={handleViewerMouseMove}
-            onmousedown={handleViewerMouseDown}
-            onmouseup={handleViewerMouseUp}
-            onwheel={handleViewerWheel}
-            oncontextmenu={(event) => event.preventDefault()}
-          ></video>
-        {:else}
-          <div class="video-placeholder">
-            <p>Aucune image reÃ§ue pour le moment.</p>
-            <p class="hint">Lance la session puis attends la premiere frame WebRTC de l'agent.</p>
-          </div>
-        {/if}
-      </div>
-
-      {#if screenFrameError}
-        <p class="error top-gap">{screenFrameError}</p>
-      {/if}
-    </div>
-
-    {#if uiDebugEnabled}
-      <details class="debug-panel top-gap">
-        <summary>Diagnostic signaling ({signalLogs.length})</summary>
-
-        {#if signalLogs.length === 0}
-          <p class="hint debug-empty">Aucun evenement signaling pour le moment.</p>
-        {:else}
-          {#each signalLogs as log, i (`${log.timestamp}-${i}`)}
-            <div class="signal-log">
-              <div class="signal-log-head">
-                <p class="mono">
-                  [{log.timestamp}] {log.direction.toUpperCase()} {log.type} {log.from} -&gt; {log.to}
-                </p>
-              </div>
-              <p class="hint mono signal-log-payload">{log.payload || "(no payload)"}</p>
-            </div>
-          {/each}
-        {/if}
-      </details>
-    {/if}
-  </section>
-  {/if}
-
-  {#if queriedSession?.status === "ACTIVE" && selectedFeature === "chat"}
-  <section class="card">
-    <div class="row between">
-      <div>
-        <h2>Chat</h2>
-        <p class="hint top-gap">Messagerie temps rÃ©el de la session.</p>
-      </div>
-      <div class="row">
-        <span class={`pill ${chatConnected ? "ok" : "warn"}`}>
-          {chatConnected ? "connectÃ©" : "hors ligne"}
-        </span>
-        {#if !chatConnected}
-          <button onclick={() => void connectChat()}>Reconnecter</button>
-        {/if}
-      </div>
-    </div>
-
-    {#if chatError}
-      <p class="error top-gap">{chatError}</p>
-    {/if}
-
-    {#if chatMessages.length === 0}
-      <p class="hint top-gap">Aucun message pour l'instant.</p>
-    {:else}
-      <div class="list top-gap chat-list">
-        {#each chatMessages as msg (msgKey(msg))}
-          <div class="item chat-item" class:chat-self={msg.senderName === "viewer"}>
-            <p class="chat-bubble"><strong>{msg.senderName}</strong>: {msg.content}</p>
-            <p class="hint mono chat-ts">{new Date(msg.timestamp).toLocaleTimeString()}</p>
-          </div>
-        {/each}
-      </div>
-    {/if}
-
-    {#if typingInfo}
-      <p class="hint top-gap chat-typing">{typingInfo.senderName} est en train d'Ã©crireâ€¦</p>
-    {/if}
-
-    <div class="row top-gap">
-      <input
-        bind:value={chatInput}
-        placeholder="Votre messageâ€¦"
-        class="chat-input"
-        onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendChatMessage(); } }}
-        oninput={() => {
-          const roomId = chatRoomId || resolveRoomId();
-          if (roomId) chatClient.sendTyping(roomId, "viewer", "viewer", true);
-        }}
-      />
-      <button onclick={() => void sendChatMessage()} disabled={!chatInput.trim()}>Envoyer</button>
-    </div>
-  </section>
-  {/if}
-
-  {#if queriedSession?.status === "ACTIVE" && selectedFeature === "files"}
-    <section class="card">
-      <div class="row between">
-        <div>
-          <h2>Transfert de fichiers</h2>
-          <p class="hint top-gap">Navigation et transfert P2P via DataChannel WebRTC.</p>
-        </div>
-        <span class={`pill ${fileChannelOpen ? "ok" : "warn"}`}>
-          {fileChannelOpen ? "canal pret" : "canal en attente"}
-        </span>
-      </div>
-
-      {#if queriedSession.allowFileTransfer === false}
-        <p class="error top-gap">Transfert de fichiers non autorise pour cette session.</p>
-      {:else}
-        <div class="top-gap">
-          <h3>Envoyer un fichier vers l'agent</h3>
-          <div class="row top-gap">
-            <input
-              type="file"
-              disabled={!fileChannelOpen}
-              onchange={async (e) => {
-                const input = e.currentTarget as HTMLInputElement;
-                const file = input.files?.[0];
-                if (file) {
-                  input.value = "";
-                  await uploadLocalFile(file);
-                }
-              }}
-              class="file-input"
-            />
-          </div>
-        </div>
-
-        <div class="top-gap">
-          <div class="row between">
-            <h3>Explorateur distant</h3>
-            <div class="row">
-              <button
-                disabled={!fileChannelOpen || fileListLoading}
-                onclick={() => requestFileList(fileCurrentPath)}
-              >
-                {fileListLoading ? "Chargement..." : "Actualiser"}
-              </button>
-              {#if fileCurrentPath}
-                <button
-                  disabled={!fileChannelOpen}
-                  onclick={() => {
-                    const parent = fileCurrentPath.replace(/[/\\][^/\\]*$/, "") || "";
-                    requestFileList(parent);
-                  }}
-                >
-                  Dossier parent
-                </button>
-              {/if}
-            </div>
-          </div>
-
-          {#if !fileChannelOpen}
-            <p class="hint top-gap">En attente du canal fichier WebRTC...</p>
-          {:else if fileListing.length === 0 && !fileListLoading && !fileListError && !fileCurrentPath}
-            <div class="top-gap">
-              <button onclick={() => requestFileList("")}>
-                Parcourir les fichiers distants
-              </button>
-            </div>
-          {:else}
-            {#if fileListError}
-              <p class="error top-gap">{fileListError}</p>
-            {/if}
-
-            {#if fileCurrentPath}
-              <p class="hint top-gap mono">{fileCurrentPath}</p>
-            {/if}
-
-            <div class="list top-gap">
-              {#each fileListing as entry (entry.path)}
-                <div class="item file-item">
-                  <div class="file-meta">
-                    <span class="file-icon">{entry.isDirectory ? "ðŸ“" : "ðŸ“„"}</span>
-                    <span class="file-name">{entry.name}</span>
-                    {#if !entry.isDirectory && entry.size > 0}
-                      <span class="hint">{formatFileSize(entry.size)}</span>
-                    {/if}
-                  </div>
-                  <div class="row">
-                    {#if entry.isDirectory}
-                      <button
-                        class="btn-sm"
-                        onclick={() => requestFileList(entry.path)}
-                      >
-                        Ouvrir
-                      </button>
-                    {:else}
-                      <button
-                        class="btn-sm"
-                        disabled={!fileChannelOpen}
-                        onclick={() => downloadRemoteFile(entry.path, entry.name)}
-                      >
-                        TÃ©lÃ©charger
-                      </button>
-                    {/if}
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        {#if Object.keys(fileTransfers).length > 0}
-          <div class="top-gap">
-            <div class="row between">
-              <h3>Transferts</h3>
-              <button
-                class="btn-sm"
-                onclick={() => {
-                  const cleaned: Record<string, FileTransfer> = {};
-                  for (const [k, v] of Object.entries(fileTransfers)) {
-                    if (v.state === "active") cleaned[k] = v;
-                  }
-                  fileTransfers = cleaned;
-                }}
-              >
-                Effacer terminÃ©s
-              </button>
-            </div>
-            <div class="list top-gap">
-              {#each Object.values(fileTransfers).slice().reverse() as t (t.transferId)}
-                <div class="item transfer-item">
-                  <div class="transfer-meta">
-                    <span class="transfer-direction">
-                      {t.type === "upload" ? "â¬† Upload" : "â¬‡ Download"}
-                    </span>
-                    <span class="file-name">{t.fileName}</span>
-                    <span class={`pill ${t.state === "complete" ? "ok" : t.state === "error" ? "error" : "warn"}`}>
-                      {t.state === "active"
-                        ? `${transferProgress(t)}%`
-                        : t.state === "complete"
-                          ? "terminÃ©"
-                          : "erreur"}
-                    </span>
-                  </div>
-                  {#if t.state === "active"}
-                    <div class="progress-bar-wrap">
-                      <div
-                        class="progress-bar-fill"
-                        style="width: {transferProgress(t)}%"
-                      ></div>
-                    </div>
-                    <p class="hint">
-                      {formatFileSize(t.doneBytes)} / {formatFileSize(t.totalSize)}
-                      {#if transferSpeed(t)}Â· {transferSpeed(t)}{/if}
-                    </p>
-                  {:else if t.state === "error"}
-                    <p class="error">{t.error ?? "Erreur inconnue"}</p>
-                  {:else}
-                    <p class="hint">{formatFileSize(t.totalSize)} â€” terminÃ©</p>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      {/if}
-    </section>
-  {/if}
-
-  {#if showApprovalModal && pendingApprovalSession}
-    <div
-      class="approval-overlay"
-      role="dialog"
-      tabindex="-1"
-      onkeydown={(e) => e.key === "Escape" && !approvalLoading && (showApprovalModal = false)}
-      onmousedown={(e) => !approvalLoading && e.target === e.currentTarget && (showApprovalModal = false)}
-    >
-      <div class="approval-modal">
-        <h2>Demande d'accÃ¨s distant</h2>
-        <p class="approval-desc">
-          <strong>{pendingApprovalSession.technicianUsername || "Technicien"}</strong> demande l'accÃ¨s Ã  ce PC.
-        </p>
-
-        {#if approvalError}
-          <p class="error top-gap">{approvalError}</p>
-        {/if}
-
-        <div class="approval-options">
-          <label>
-            <input type="checkbox" bind:checked={approvalAllowRemoteInput} disabled={approvalLoading} />
-            Autoriser clavier / souris
-          </label>
-          <label>
-            <input type="checkbox" bind:checked={approvalAllowFileTransfer} disabled={approvalLoading} />
-            Autoriser transfert de fichiers
-          </label>
-        </div>
-
-        <div class="approval-actions">
-          <button 
-            class="btn-reject" 
-            onclick={rejectPendingSession} 
-            disabled={approvalLoading}>
-            {approvalLoading ? "Traitement..." : "Refuser"}
-          </button>
-          <button 
-            class="btn-approve" 
-            onclick={approvePendingSession} 
-            disabled={approvalLoading}>
-            {approvalLoading ? "Traitement..." : "Autoriser"}
-          </button>
-        </div>
-      </div>
-    </div>
-  {/if}
-  /fin du bloc ancien UI commenté -->
 </main>
 
 <style>
@@ -5740,9 +4585,10 @@
     gap: 20px;
   }
 
-  /* Chaque sous-bloc devient sa propre carte pleine largeur (cf. maquette) */
-  .rd-card > .rd-panel,
-  .rd-card > .rd-history-grid > .rd-panel {
+  /* Chaque sous-bloc devient sa propre carte pleine largeur (cf. maquette).
+     :global pour atteindre les .rd-panel rendus par les composants enfants. */
+  :global(.rd-card > .rd-panel),
+  :global(.rd-card > .rd-history-grid > .rd-panel) {
     background: #11181f;
     border: 1px solid #1f2a36;
     border-radius: 16px;
@@ -5795,13 +4641,13 @@
     letter-spacing: 0.5px;
   }
 
-  .rd-panel {
+  :global(.rd-panel) {
     background: #0f1620;
     border: 1px solid #1f2a36;
     border-radius: 12px;
     padding: 18px 20px;
   }
-  .rd-panel__title {
+  :global(.rd-panel__title) {
     margin: 0 0 14px 0;
     font-size: 15px;
     font-weight: 600;
@@ -5810,7 +4656,7 @@
     align-items: center;
     gap: 8px;
   }
-  .rd-icon {
+  :global(.rd-icon) {
     color: #38bdf8;
   }
 
@@ -5902,17 +4748,17 @@
   @media (max-width: 900px) {
     .rd-history-grid { grid-template-columns: 1fr; }
   }
-  .rd-history__head {
+  :global(.rd-history__head) {
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 12px;
   }
-  .rd-history__count {
+  :global(.rd-history__count) {
     font-size: 12px;
     color: #94a3b8;
   }
-  .rd-history__search {
+  :global(.rd-history__search) {
     width: 100%;
     box-sizing: border-box;
     background: #0a0f15;
@@ -5923,13 +4769,13 @@
     font-size: 13px;
     margin-bottom: 10px;
   }
-  .rd-history__search::placeholder { color: #475569; }
-  .rd-history__filters {
+  :global(.rd-history__search::placeholder) { color: #475569; }
+  :global(.rd-history__filters) {
     display: flex;
     gap: 10px;
     margin-bottom: 12px;
   }
-  .rd-select {
+  :global(.rd-select) {
     flex: 1;
     background: #0a0f15;
     border: 1px solid #1f2a36;
@@ -5938,7 +4784,7 @@
     color: #cbd5e1;
     font-size: 13px;
   }
-  .rd-history__list {
+  :global(.rd-history__list) {
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -5947,97 +4793,9 @@
     padding-right: 4px;
   }
 
-  /* ── Carte session ────────────────────────────────────────────── */
-  .rd-session {
-    background: #0a0f15;
-    border: 1px solid #1f2a36;
-    border-radius: 10px;
-    padding: 12px 14px;
-  }
-  .rd-session__top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-  }
-  .rd-session__code {
-    color: #38bdf8;
-    font-family: "Consolas", monospace;
-    font-size: 14px;
-  }
-  .rd-session__type {
-    margin: 0 0 4px 0;
-    font-size: 13px;
-    color: #cbd5e1;
-  }
-  .rd-session__meta {
-    margin: 0;
-    font-size: 12px;
-    color: #64748b;
-  }
-  .rd-pill {
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1px solid transparent;
-  }
-  .rd-pill--done {
-    background: rgba(148,163,184,0.12);
-    color: #cbd5e1;
-    border-color: rgba(148,163,184,0.2);
-  }
-  .rd-pill--live {
-    background: rgba(74,222,128,0.15);
-    color: #4ade80;
-    border-color: rgba(74,222,128,0.3);
-  }
+  /* Carte session/fichier → cf. RdSessionHistory.svelte / RdFileHistory.svelte */
 
-  /* ── Carte fichier ────────────────────────────────────────────── */
-  .rd-file {
-    display: flex;
-    gap: 12px;
-    background: #0a0f15;
-    border: 1px solid #1f2a36;
-    border-radius: 10px;
-    padding: 12px 14px;
-  }
-  .rd-file__icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 18px;
-    flex-shrink: 0;
-  }
-  .rd-file__icon--pdf { background: rgba(56,189,248,0.15); color: #38bdf8; }
-  .rd-file__icon--ppt { background: rgba(74,222,128,0.15); color: #4ade80; }
-  .rd-file__icon--zip { background: rgba(56,189,248,0.15); color: #38bdf8; }
-  .rd-file__body { flex: 1; min-width: 0; }
-  .rd-file__name {
-    display: block;
-    color: #e2e8f0;
-    font-size: 14px;
-    margin-bottom: 2px;
-  }
-  .rd-file__sub {
-    margin: 0 0 2px 0;
-    font-size: 12px;
-    color: #94a3b8;
-  }
-  .rd-file__meta {
-    margin: 0;
-    font-size: 11px;
-    color: #64748b;
-  }
-  .rd-file__state {
-    color: #38bdf8;
-    text-transform: uppercase;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-  }
-  .rd-empty {
+  :global(.rd-empty) {
     margin: 0;
     padding: 18px 8px;
     color: #64748b;
@@ -6081,100 +4839,6 @@
     flex-shrink: 0;
   }
   @keyframes rd-spin { to { transform: rotate(360deg); } }
-
-  /* ── Modal d'approbation (popup côté machine cible) ────────────── */
-  .rd-approval-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.65);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(2px);
-  }
-  .rd-approval-modal {
-    background: #11181f;
-    border: 1px solid #1f2a36;
-    border-radius: 14px;
-    padding: 26px 28px;
-    width: min(92vw, 460px);
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
-  }
-  .rd-approval-modal h2 {
-    margin: 0 0 8px 0;
-    font-size: 18px;
-    color: #fff;
-  }
-  .rd-approval-desc {
-    margin: 0 0 18px 0;
-    font-size: 14px;
-    color: #cbd5e1;
-  }
-  .rd-approval-desc strong { color: #38bdf8; }
-  .rd-approval-error {
-    margin: 0 0 14px 0;
-    padding: 8px 12px;
-    border-radius: 8px;
-    background: rgba(239, 68, 68, 0.12);
-    border: 1px solid rgba(239, 68, 68, 0.3);
-    color: #fca5a5;
-    font-size: 13px;
-  }
-  .rd-approval-options {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin-bottom: 22px;
-  }
-  .rd-approval-options label {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    background: #0a0f15;
-    border: 1px solid #1f2a36;
-    border-radius: 8px;
-    cursor: pointer;
-    font-size: 14px;
-    color: #e2e8f0;
-  }
-  .rd-approval-options label:hover { background: #0f1620; }
-  .rd-approval-options input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    accent-color: #38bdf8;
-  }
-  .rd-approval-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-  }
-  .rd-approval-btn {
-    padding: 10px 20px;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    border: 1px solid transparent;
-    transition: background 0.15s;
-  }
-  .rd-approval-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .rd-approval-btn--reject {
-    background: transparent;
-    border-color: #1f2a36;
-    color: #cbd5e1;
-  }
-  .rd-approval-btn--reject:hover:not(:disabled) {
-    background: rgba(239, 68, 68, 0.1);
-    border-color: rgba(239, 68, 68, 0.4);
-    color: #fca5a5;
-  }
-  .rd-approval-btn--approve {
-    background: #38bdf8;
-    color: #0d1117;
-  }
-  .rd-approval-btn--approve:hover:not(:disabled) { background: #7dd3fc; }
 
   /* ── Viewer vidéo (panneau visible pendant une session ACTIVE) ──── */
   .rd-viewer__head {
@@ -6714,12 +5378,6 @@
     padding: 16px;
   }
 
-  .metric-tile h3 {
-    margin: 0;
-    font-size: 1rem;
-    color: #cbd5e1;
-  }
-
   .agent-item {
     background: linear-gradient(180deg, rgba(15, 23, 42, 0.48), rgba(15, 23, 42, 0.24));
   }
@@ -6832,12 +5490,6 @@
     font-weight: 600;
   }
 
-  .feature-actions button.selected {
-    background: rgba(37, 99, 235, 0.8);
-    border: 1px solid rgba(147, 197, 253, 0.9);
-    color: #dbeafe;
-  }
-
   .remote-session-card {
     display: grid;
     gap: 14px;
@@ -6907,21 +5559,11 @@
     min-height: 320px;
   }
 
-  .remote-session-card.expanded .video-shell {
-    min-height: 72vh;
-  }
-
   .video-shell:fullscreen {
     border-radius: 0;
     border: 0;
     min-height: 100vh;
     background: #020617;
-  }
-
-  .video-shell:fullscreen .viewer-video,
-  .video-shell:fullscreen .screen-preview {
-    max-height: 100vh;
-    height: 100vh;
   }
 
   .remote-toolbar {
@@ -7052,18 +5694,6 @@
     overflow: hidden;
   }
 
-  .debug-panel summary {
-    cursor: pointer;
-    padding: 12px 14px;
-    color: #cbd5e1;
-    font-weight: 600;
-    list-style: none;
-  }
-
-  .debug-panel summary::-webkit-details-marker {
-    display: none;
-  }
-
   .debug-empty {
     padding: 0 14px 14px;
   }
@@ -7112,12 +5742,6 @@
     box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
   }
 
-  .approval-modal h2 {
-    margin: 0 0 16px 0;
-    font-size: 1.5rem;
-    color: #f1f5f9;
-  }
-
   .approval-desc {
     margin: 0 0 24px 0;
     color: #cbd5e1;
@@ -7129,32 +5753,6 @@
     flex-direction: column;
     gap: 12px;
     margin: 24px 0;
-  }
-
-  .approval-options label {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    cursor: pointer;
-    padding: 8px;
-    border-radius: 8px;
-    transition: background 0.2s;
-  }
-
-  .approval-options label:hover {
-    background: rgba(148, 163, 184, 0.1);
-  }
-
-  .approval-options input[type="checkbox"] {
-    width: 18px;
-    height: 18px;
-    cursor: pointer;
-    accent-color: #3b82f6;
-  }
-
-  .approval-options input[type="checkbox"]:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
   }
 
   .approval-actions {
@@ -7235,14 +5833,7 @@
     }
   }
 
-  /* â”€â”€ File transfer UI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
-  h3 {
-    margin: 0;
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: #cbd5e1;
-  }
-
+  /* ── File transfer UI ─────────────────────────────────────────── */
   .file-input {
     flex: 1;
     font-size: 0.85rem;
@@ -7621,100 +6212,10 @@
   }
   .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* ── Barre flottante télémétrie (top-left du stage) ─────────────── */
-  .rd-viewer__stats-bar {
-    position: absolute;
-    top: 12px;
-    left: 12px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 8px;
-    background: rgba(13, 17, 23, 0.7);
-    border: 1px solid rgba(56, 189, 248, 0.2);
-    border-radius: 999px;
-    backdrop-filter: blur(10px) saturate(1.2);
-    -webkit-backdrop-filter: blur(10px) saturate(1.2);
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
-    color: #e2e8f0;
-    font-size: 12px;
-    font-family: "Consolas", monospace;
-    z-index: 11;
-    flex-wrap: wrap;
-    max-width: calc(100% - 24px);
-  }
-  .rd-stats__cell {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 9px;
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-  }
-  .rd-stats__cell--warn {
-    background: rgba(250, 204, 21, 0.12);
-    border-color: rgba(250, 204, 21, 0.4);
-    color: #facc15;
-  }
-  .rd-stats__cell--bad {
-    background: rgba(239, 68, 68, 0.15);
-    border-color: rgba(239, 68, 68, 0.45);
-    color: #fca5a5;
-  }
-  .rd-stats__icon { font-size: 13px; line-height: 1; opacity: 0.9; }
-  .rd-stats__num {
-    color: #fff;
-    font-weight: 600;
-    min-width: 1ch;
-  }
-  .rd-stats__cell--warn .rd-stats__num { color: #facc15; }
-  .rd-stats__cell--bad .rd-stats__num { color: #fca5a5; }
-  .rd-stats__unit { color: #94a3b8; font-size: 11px; }
-  .rd-stats__close {
-    background: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    color: #cbd5e1;
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    padding: 0;
-    margin-left: 2px;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
-  }
-  .rd-stats__close:hover {
-    background: rgba(239, 68, 68, 0.15);
-    color: #fff;
-    border-color: rgba(239, 68, 68, 0.4);
-  }
-
-  .rd-viewer__stats-restore {
-    position: absolute;
-    top: 12px;
-    left: 12px;
-    width: 32px; height: 32px;
-    border-radius: 50%;
-    background: rgba(13, 17, 23, 0.7);
-    border: 1px solid rgba(56, 189, 248, 0.25);
-    color: #cbd5e1;
-    cursor: pointer;
-    font-size: 14px;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    z-index: 11;
-    transition: background 0.15s, color 0.15s;
-  }
-  .rd-viewer__stats-restore:hover {
-    background: rgba(56, 189, 248, 0.18);
-    color: #fff;
-  }
-
-  /* En plein écran on garde la barre stats à la même place */
-  .rd-viewer__stage:fullscreen .rd-viewer__stats-bar,
-  .rd-viewer__stage:-webkit-full-screen .rd-viewer__stats-bar { top: 18px; left: 18px; }
+  /* Barre télémétrie → cf. RdViewerStatsBar.svelte. En plein écran on garde
+     sa position de coin via :global pour atteindre le composant enfant. */
+  :global(.rd-viewer__stage:fullscreen .rd-viewer__stats-bar),
+  :global(.rd-viewer__stage:-webkit-full-screen .rd-viewer__stats-bar) { top: 18px; left: 18px; }
 
   /* ── Chat sidebar par-dessus la vidéo ───────────────────────────── */
   .rd-viewer__chat-side {
