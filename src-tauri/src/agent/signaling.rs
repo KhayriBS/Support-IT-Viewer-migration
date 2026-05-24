@@ -135,13 +135,13 @@ impl SignalingClient {
             self.server_url, signaling_token, session_id
         );
 
-        println!("🔌 Connexion à {}…", ws_url);
+        tracing::info!("🔌 Connexion à {}…", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url)
             .await
             .map_err(|e| format!("WebSocket connect error: {e}"))?;
 
-        println!("✅ Connecté au serveur signaling");
+        tracing::info!("✅ Connecté au serveur signaling");
 
         let (mut sink, mut stream) = ws_stream.split();
 
@@ -167,15 +167,15 @@ impl SignalingClient {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<SignalMessage>(&text) {
                             Ok(msg) => {
-                                println!("📨 Reçu {:?} de {}", msg.signal_type, msg.from);
+                                tracing::info!("📨 Reçu {:?} de {}", msg.signal_type, msg.from);
                                 let _ = event_tx_clone.send(msg);
                             }
-                            Err(e) => eprintln!("⚠️ Parse signal error: {e} — {text}"),
+                            Err(e) => tracing::warn!("⚠️ Parse signal error: {e} — {text}"),
                         }
                     }
                     Ok(Message::Close(frame)) => {
                         if let Some(frame) = frame {
-                            println!(
+                            tracing::info!(
                                 "🔌 Serveur a fermé la connexion (code: {}, reason: {})",
                                 frame.code,
                                 frame.reason
@@ -194,7 +194,7 @@ impl SignalingClient {
                                 payload: Some(payload),
                             });
                         } else {
-                            println!("🔌 Serveur a fermé la connexion (sans détail)");
+                            tracing::info!("🔌 Serveur a fermé la connexion (sans détail)");
 
                             let payload = serde_json::json!({
                                 "kind": "socket-close",
@@ -214,14 +214,14 @@ impl SignalingClient {
                         break;
                     }
                     Err(e) => {
-                        eprintln!("🔌 WebSocket error: {e}");
+                        tracing::warn!("🔌 WebSocket error: {e}");
                         break;
                     }
                     _ => {}
                 }
             }
             *tx_slot.lock().await = None;
-            println!("🔌 Receive loop terminée");
+            tracing::info!("🔌 Receive loop terminée");
         });
 
         Ok(())
@@ -234,7 +234,7 @@ impl SignalingClient {
         msg.session_id = self.session_id.lock().await.clone();
 
         let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-        println!("📤 Envoi {:?} → {} (session: {:?})", msg.signal_type, msg.to, msg.session_id);
+        tracing::info!("📤 Envoi {:?} → {} (session: {:?})", msg.signal_type, msg.to, msg.session_id);
 
         let guard = self.tx.lock().await;
         if let Some(tx) = guard.as_ref() {
@@ -301,6 +301,6 @@ impl SignalingClient {
     /// Closes the outbound channel (the receive task will exit on its own).
     pub async fn disconnect(&self) {
         *self.tx.lock().await = None;
-        println!("🔌 Client déconnecté");
+        tracing::info!("🔌 Client déconnecté");
     }
 }

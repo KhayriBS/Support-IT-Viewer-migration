@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use sysinfo::{Disks, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
 /// System metrics snapshot sent to the signaling server via `POST /agents/metrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +27,15 @@ pub struct MetricsCollector {
 impl MetricsCollector {
 
     pub fn new() -> Self {
-        let mut sys = System::new_all();
+        // On n'a besoin que de CPU + RAM (le disque est interroge via Disks
+        // a chaque collect). Eviter `new_all()` qui scanne aussi processus
+        // et reseau pour rien — 30-100ms gagnees au startup et un Mutex
+        // beaucoup moins lourd a refresher.
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
         sys.refresh_cpu_usage();
         Self {
             system: Mutex::new(sys),
@@ -145,7 +153,7 @@ mod tests {
         let collector = MetricsCollector::new();
         // Should not panic
         let metrics = collector.collect();
-        println!(
+        tracing::info!(
             "CPU: {}%, RAM: {}%, Disk: {}%, Timestamp: {}",
             metrics.cpu_usage, metrics.ram_usage, metrics.disk_usage, metrics.timestamp
         );

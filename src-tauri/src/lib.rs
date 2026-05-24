@@ -23,6 +23,11 @@ use agent::auth::PendingSession;
 /// Global shared state — stored in Tauri's managed state store.
 pub struct AppState {
     pub agent: Arc<SharedState>,
+    /// Reuse the same MetricsCollector across invocations so we don't spin up
+    /// a fresh sysinfo `System` on every `get_metrics` call from the frontend
+    /// (the UI typically polls every 1-5s, and `System` re-initialisation is
+    /// non-trivial on Windows).
+    pub metrics: Arc<MetricsCollector>,
 }
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
@@ -30,8 +35,8 @@ pub struct AppState {
 /// Returns a real-time system metrics snapshot.
 /// Called from Svelte: `invoke("get_metrics")`
 #[tauri::command]
-fn get_metrics() -> AgentMetrics {
-    MetricsCollector::new().collect()
+fn get_metrics(state: State<'_, AppState>) -> AgentMetrics {
+    state.metrics.collect()
 }
 
 // ─── Agent lifecycle ──────────────────────────────────────────────────────────
@@ -142,12 +147,26 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialise le subscriber `tracing` une seule fois au demarrage.
+    // Niveau par defaut : info. Override via RUST_LOG.
+    // En production, ENABLED_INFO laisse passer assez de logs pour le debug
+    // utilisateur sans noyer la console (les hot paths emettent en debug/trace).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
+
     let shared_state = SharedState::new();
+    let metrics = Arc::new(MetricsCollector::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             agent: shared_state,
+            metrics,
         })
         .invoke_handler(tauri::generate_handler![
             // metrics

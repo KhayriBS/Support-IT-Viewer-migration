@@ -18,25 +18,25 @@ pub fn create_default_capturer() -> Result<Box<dyn ScreenCapturer + Send>, Strin
 
     match backend.as_str() {
         "dxgi" => {
-            println!("Capture backend selected: DXGI");
+            tracing::info!("Capture backend selected: DXGI");
             Ok(Box::new(dxgi::DxgiCapturer::new()?))
         }
         "wgc" => {
-            println!("Capture backend selected: WGC");
+            tracing::info!("Capture backend selected: WGC");
             Ok(Box::new(wgc::WgcCapturer::new()?))
         }
         "auto" | "" => {
             // Prefer DXGI when available for lower copy overhead, fall back to WGC path.
             match dxgi::DxgiCapturer::new() {
                 Ok(capturer) => {
-                    println!("Capture backend auto-selected: DXGI");
+                    tracing::info!("Capture backend auto-selected: DXGI");
                     Ok(Box::new(capturer))
                 }
                 Err(dxgi_err) => {
-                    eprintln!("DXGI unavailable in auto mode: {dxgi_err}; trying WGC backend");
+                    tracing::warn!("DXGI unavailable in auto mode: {dxgi_err}; trying WGC backend");
                     match wgc::WgcCapturer::new() {
                         Ok(capturer) => {
-                            println!("Capture backend auto-selected: WGC");
+                            tracing::info!("Capture backend auto-selected: WGC");
                             Ok(Box::new(capturer))
                         }
                         Err(wgc_err) => Err(format!(
@@ -47,17 +47,17 @@ pub fn create_default_capturer() -> Result<Box<dyn ScreenCapturer + Send>, Strin
             }
         }
         other => {
-            eprintln!("Unknown capture backend '{other}', falling back to auto");
+            tracing::warn!("Unknown capture backend '{other}', falling back to auto");
             match dxgi::DxgiCapturer::new() {
                 Ok(capturer) => {
-                    println!("Capture backend auto-selected: DXGI");
+                    tracing::info!("Capture backend auto-selected: DXGI");
                     Ok(Box::new(capturer))
                 }
                 Err(dxgi_err) => {
-                    eprintln!("DXGI unavailable in auto fallback: {dxgi_err}; trying WGC backend");
+                    tracing::warn!("DXGI unavailable in auto fallback: {dxgi_err}; trying WGC backend");
                     match wgc::WgcCapturer::new() {
                         Ok(capturer) => {
-                            println!("Capture backend auto-selected: WGC");
+                            tracing::info!("Capture backend auto-selected: WGC");
                             Ok(Box::new(capturer))
                         }
                         Err(wgc_err) => Err(format!(

@@ -121,8 +121,11 @@ impl FileTransferService {
                 return response;
             }
             Ok(entries) => {
-                let mut dirs: Vec<FileEntry> = Vec::new();
-                let mut files: Vec<FileEntry> = Vec::new();
+                // Plupart des dossiers Windows contiennent < 64 entrees ; on
+                // pre-alloue raisonnablement pour eviter 6-7 reallocs sur les
+                // dossiers chargés (Downloads, Bureau).
+                let mut dirs: Vec<FileEntry> = Vec::with_capacity(32);
+                let mut files: Vec<FileEntry> = Vec::with_capacity(32);
 
                 for entry in entries.flatten() {
                     let meta = match entry.metadata() {

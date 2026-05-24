@@ -25,11 +25,32 @@ serde_json = "1"
 sysinfo = "0.33"
 chrono = { version = "0.4", features = ["serde"] }
 
+# ── Structured logging (remplace println!/eprintln! par des logs filtrables) ─
+# Tous les modules de l'agent emettent via les macros `tracing::*`. Filtrage
+# par niveau ou cible via la variable d'env RUST_LOG, ex :
+#   RUST_LOG=lumiere_tech_it_lib=debug
+#   RUST_LOG=lumiere_tech_it_lib::agent::webrtc=trace
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 # ── HTTP client (remplace HttpClient C#) ──────────────────────────
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # ── Async runtime (remplace Task/async-await C#) ──────────────────
-tokio = { version = "1", features = ["full"] }
+# Features explicites (au lieu de "full" qui en active 64+) :
+#  - rt-multi-thread : runtime multi-threadé (tauri::run en a besoin)
+#  - macros          : tokio::spawn, tokio::select, #[tokio::main]
+#  - time            : sleep, timeout, Instant
+#  - sync            : Mutex, RwLock, broadcast, watch, oneshot
+#  - io-util         : AsyncReadExt, AsyncWriteExt
+#  - fs              : tokio::fs::{File, OpenOptions, canonicalize, read_dir, metadata}
+#  - process         : tokio::process::Command (utilisé par ai_executor::do_shell)
+#  - net             : TcpStream sous-jacent à tokio-tungstenite + reqwest
+#  - signal          : graceful shutdown (ctrl-c handler côté Tauri)
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "time", "sync",
+    "io-util", "fs", "process", "net", "signal",
+] }
 
 # ── WebSocket client (remplace ClientWebSocket C#) ────────────────
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

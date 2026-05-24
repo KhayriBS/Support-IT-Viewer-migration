@@ -46,7 +46,7 @@ mod win {
 
             let event_type = root["type"].as_str().unwrap_or("");
             if input_debug_enabled() || !matches!(event_type, "mousemove" | "mouse-move" | "wheel") {
-                println!("🖱️ Input reçu: {event_type}");
+                tracing::info!("🖱️ Input reçu: {event_type}");
             }
 
             match event_type {

@@ -1,0 +1,1202 @@
+/* ═══════════════════════════════════════════════════════════════
+     Styles "Bureau à Distance" (nouvelle UI — voir maquette).
+     Tout est préfixé .rd-* pour ne pas entrer en conflit avec les
+     styles legacy plus bas.
+     ═══════════════════════════════════════════════════════════════ */
+  .rd-page {
+    min-height: 100vh;
+    padding: 24px 32px;
+    background: #0d1117;
+    color: #e2e8f0;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    box-sizing: border-box;
+  }
+
+  .rd-card {
+    width: 100%;
+    max-width: 1800px;
+    margin: 0 auto;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* Chaque sous-bloc devient sa propre carte pleine largeur (cf. maquette).
+     :global pour atteindre les .rd-panel rendus par les composants enfants. */
+  .rd-card > .rd-panel,
+  .rd-card > .rd-history-grid > .rd-panel {
+    background: #11181f;
+    border: 1px solid #1f2a36;
+    border-radius: 16px;
+    padding: 22px 24px;
+  }
+  .rd-header {
+    background: transparent;
+    border: none;
+    padding: 0 4px;
+  }
+
+  .rd-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .rd-title h1 {
+    margin: 0 0 6px 0;
+    font-size: 28px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .rd-title p {
+    margin: 0;
+    color: #94a3b8;
+    font-size: 14px;
+  }
+  .rd-machine-code {
+    background: #0f1620;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 12px 18px;
+    text-align: right;
+    min-width: 220px;
+  }
+  .rd-machine-code__label {
+    display: block;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .rd-machine-code__value {
+    display: block;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-weight: 700;
+    font-size: 18px;
+    color: #38bdf8;
+    letter-spacing: 0.5px;
+  }
+
+  .rd-panel {
+    background: #0f1620;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .rd-panel__title {
+    margin: 0 0 14px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #e2e8f0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rd-icon {
+    color: #38bdf8;
+  }
+
+  /* ── Connexion par code ───────────────────────────────────────── */
+  .rd-connect {
+    display: flex;
+    gap: 12px;
+  }
+  .rd-connect__input {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 12px 14px;
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  .rd-connect__input::placeholder {
+    color: #475569;
+  }
+  .rd-connect__input:focus {
+    outline: none;
+    border-color: #38bdf8;
+  }
+  .rd-connect__btn {
+    background: #1f2a36;
+    border: 1px solid #2a3a4a;
+    color: #cbd5e1;
+    padding: 12px 22px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .rd-connect__btn:hover {
+    background: #2a3a4a;
+  }
+
+  /* ── Métriques ────────────────────────────────────────────────── */
+  .rd-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 720px) {
+    .rd-metrics { grid-template-columns: repeat(2, 1fr); }
+  }
+  .rd-metric {
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .rd-metric__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #94a3b8;
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .rd-metric__icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+  }
+  .rd-metric__icon--cpu { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .rd-metric__icon--ram { background: rgba(167,139,250,0.15); color: #a78bfa; }
+  .rd-metric__icon--disk { background: rgba(192,132,252,0.15); color: #c084fc; }
+  .rd-metric__icon--net { background: rgba(74,222,128,0.15); color: #4ade80; }
+  .rd-metric__value {
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .rd-metric__value--ok { color: #4ade80; }
+
+  /* ── Historique grille ────────────────────────────────────────── */
+  .rd-history-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 900px) {
+    .rd-history-grid { grid-template-columns: 1fr; }
+  }
+  .rd-history__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .rd-history__count {
+    font-size: 12px;
+    color: #94a3b8;
+  }
+  .rd-history__search {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #e2e8f0;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .rd-history__search::placeholder { color: #475569; }
+  .rd-history__filters {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .rd-select {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: #cbd5e1;
+    font-size: 13px;
+  }
+  .rd-history__list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+
+  /* Carte session/fichier → cf. RdSessionHistory.svelte / RdFileHistory.svelte */
+
+  .rd-empty {
+    margin: 0;
+    padding: 18px 8px;
+    color: #64748b;
+    font-size: 13px;
+    text-align: center;
+  }
+
+  /* ── Bandeau de statut sous Connexion par code ─────────────────── */
+  .rd-connect__status {
+    margin-top: 14px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .rd-connect__status--waiting {
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    color: #cbd5e1;
+  }
+  .rd-connect__status--waiting strong { color: #38bdf8; }
+  .rd-connect__status--waiting p { margin: 4px 0 0 0; color: #94a3b8; font-size: 12px; }
+  .rd-connect__status--error {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+  }
+  .rd-connect__btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .rd-spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(56, 189, 248, 0.25);
+    border-top-color: #38bdf8;
+    border-radius: 50%;
+    animation: rd-spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes rd-spin { to { transform: rotate(360deg); } }
+
+  /* ── Viewer vidéo (panneau visible pendant une session ACTIVE) ──── */
+  .rd-viewer__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .rd-viewer__peer {
+    color: #38bdf8;
+    font-family: "Consolas", monospace;
+    margin-left: 4px;
+  }
+  .rd-viewer__sub {
+    margin: 4px 0 0 0;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+  /* ── Barre flottante d'actions sur la vidéo ─────────────────────── */
+  .rd-viewer__floating-actions {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%) translateY(8px);
+    display: flex;
+    gap: 8px;
+    padding: 8px;
+    background: rgba(15, 22, 32, 0.65);
+    border: 1px solid rgba(56, 189, 248, 0.18);
+    border-radius: 999px;
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    z-index: 10;
+  }
+  .rd-viewer__floating-actions.visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
+  .rd-viewer__fab {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e2e8f0;
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .rd-viewer__fab:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: rgba(56, 189, 248, 0.4);
+    color: #fff;
+  }
+  .rd-viewer__fab:disabled { opacity: 0.35; cursor: not-allowed; }
+  .rd-viewer__fab-icon { font-size: 15px; line-height: 1; }
+  .rd-viewer__fab--danger { color: #fca5a5; }
+  .rd-viewer__fab--danger:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.45);
+    color: #fff;
+  }
+
+  /* En plein écran, la barre se positionne par rapport au viewport */ .rd-viewer__stage:fullscreen .rd-viewer__floating-actions, .rd-viewer__stage:-webkit-full-screen .rd-viewer__floating-actions {
+    bottom: 28px;
+  }
+
+  /* Overlay "vidéo en pause pour transfert" */
+  .rd-viewer__transfer-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(13, 17, 23, 0.85);
+    backdrop-filter: blur(4px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    color: #cbd5e1;
+    font-size: 14px;
+    text-align: center;
+    padding: 24px;
+    z-index: 5;
+  }
+  .rd-viewer__transfer-overlay p { margin: 0; max-width: 420px; line-height: 1.5; }
+
+  /* Panneau de transferts (sous la vidéo) */
+  .rd-transfers {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .rd-transfers__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: #cbd5e1;
+    font-size: 13px;
+  }
+  .rd-transfers__hint { color: #64748b; font-size: 12px; }
+  .rd-transfer {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 10px 14px;
+    position: relative;
+  }
+  .rd-transfer--complete { border-color: rgba(74, 222, 128, 0.35); }
+  .rd-transfer--error { border-color: rgba(239, 68, 68, 0.4); }
+  .rd-transfer__icon {
+    width: 32px; height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    border-radius: 8px;
+    background: rgba(56, 189, 248, 0.12);
+    flex-shrink: 0;
+  }
+  .rd-transfer__body { flex: 1; min-width: 0; }
+  .rd-transfer__line {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .rd-transfer__name { color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rd-transfer__meta { color: #94a3b8; font-size: 12px; flex-shrink: 0; }
+  .rd-transfer__bar {
+    height: 4px;
+    background: rgba(56, 189, 248, 0.12);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .rd-transfer__bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #38bdf8, #4ade80);
+    transition: width 0.2s ease;
+  }
+  .rd-transfer--complete .rd-transfer__bar-fill { background: #4ade80; }
+  .rd-transfer--error .rd-transfer__bar-fill { background: #ef4444; }
+  .rd-transfer__error { margin: 6px 0 0 0; font-size: 12px; color: #fca5a5; }
+  .rd-transfer__done { margin: 6px 0 0 0; font-size: 12px; color: #4ade80; }
+  .rd-transfer__done--warn { color: #fbbf24; }
+  .rd-transfer__where {
+    margin: 6px 0 0 0;
+    padding: 8px 10px;
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    border-radius: 6px;
+    font-size: 12px;
+    color: #cbd5e1;
+    line-height: 1.5;
+  }
+  .rd-transfer__where code {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 4px 8px;
+    background: #0a0f15;
+    border-radius: 4px;
+    color: #38bdf8;
+    font-size: 11px;
+  }
+  .rd-transfer__copy {
+    margin-left: 8px;
+    background: transparent;
+    border: 1px solid #1f2a36;
+    color: #94a3b8;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .rd-transfer__copy:hover {
+    background: #1f2a36;
+    color: #fff;
+  }
+  .rd-transfer__close {
+    position: absolute;
+    top: 6px; right: 8px;
+    width: 22px; height: 22px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    font-size: 18px;
+    cursor: pointer;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .rd-transfer__close:hover { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+
+  /* Responsive : sur petit écran on cache le label, on garde l'icône */
+  @media (max-width: 600px) {
+    .rd-viewer__fab-label { display: none; }
+    .rd-viewer__fab { padding: 8px 10px; }
+  }
+
+  /* En plein écran natif, le stage prend tout l'écran et la vidéo s'étire */ .rd-viewer__stage:fullscreen, .rd-viewer__stage:-webkit-full-screen {
+    aspect-ratio: auto;
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+    border: none;
+    background: #000;
+  }
+  .rd-viewer__stage:fullscreen .rd-viewer__video, .rd-viewer__stage:-webkit-full-screen .rd-viewer__video {
+    width: 100%;
+    height: 100%;
+  }
+
+  .rd-viewer__stage {
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .rd-viewer__video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+    outline: none;
+    cursor: default;
+  }
+  .rd-viewer__video.active {
+    cursor: crosshair;
+    outline: 2px solid rgba(56, 189, 248, 0.45);
+    outline-offset: -2px;
+  }
+  .rd-viewer__placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    color: #94a3b8;
+    font-size: 13px;
+  }
+
+  /* ── Menu post-connexion (3 cartes) ─────────────────────────────── */
+  .rd-session-menu__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .rd-features {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  .rd-features--single {
+    grid-template-columns: 1fr;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+  @media (max-width: 720px) {
+    .rd-features { grid-template-columns: 1fr; }
+  }
+  .rd-feature {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    padding: 22px 20px;
+    cursor: pointer;
+    text-align: left;
+    color: #e2e8f0;
+    transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  }
+  .rd-feature:hover {
+    background: #0f1620;
+    border-color: rgba(56, 189, 248, 0.4);
+    transform: translateY(-1px);
+  }
+  .rd-feature__icon {
+    font-size: 28px;
+    line-height: 1;
+    width: 48px; height: 48px;
+    border-radius: 10px;
+    background: rgba(56, 189, 248, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 4px;
+  }
+  .rd-feature strong { font-size: 16px; color: #fff; }
+  .rd-feature__hint { font-size: 12px; color: #94a3b8; }
+
+  /* ── Bouton Play central (overlay quand pas encore Play) ────────── */
+  .rd-viewer__big-play {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    background: rgba(56, 189, 248, 0.15);
+    border: 1px solid rgba(56, 189, 248, 0.5);
+    border-radius: 16px;
+    padding: 22px 36px;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.15s;
+  }
+  .rd-viewer__big-play:hover {
+    background: rgba(56, 189, 248, 0.25);
+    transform: scale(1.03);
+  }
+  .rd-viewer__big-play-icon { font-size: 36px; line-height: 1; }
+
+  .rd-viewer__fab--accent {
+    background: rgba(56, 189, 248, 0.18);
+    border-color: rgba(56, 189, 248, 0.5);
+    color: #38bdf8;
+  }
+  .rd-viewer__fab--accent:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.3);
+    color: #fff;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     Styles legacy (utilisés uniquement par le bloc {#if false}) —
+     conservés pour ne pas casser le code commenté.
+     ═══════════════════════════════════════════════════════════════ */
+  body {
+    margin: 0;
+    font-family: "Segoe UI", sans-serif;
+    background: linear-gradient(160deg, #0f172a, #111827 45%, #1e293b);
+    color: #e2e8f0;
+  }
+
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px;
+    display: grid;
+    gap: 16px;
+  }
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  /* Approval Modal Styles */
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  @media (max-width: 700px) {
+    main {
+      padding: 14px;
+    }
+  }
+
+  /* ── File transfer UI ─────────────────────────────────────────── */
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  /* â”€â”€ Chat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  /* ── Sous-panneau Chat (rd-chat) ───────────────────────────────── */
+  .rd-chat {
+    display: flex;
+    flex-direction: column;
+    min-height: 480px;
+  }
+  .rd-chat__pill {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 10px;
+    border: 1px solid transparent;
+  }
+  .rd-chat__pill--ok {
+    background: rgba(34, 197, 94, 0.12);
+    border-color: rgba(34, 197, 94, 0.4);
+    color: #4ade80;
+  }
+  .rd-chat__pill--warn {
+    background: rgba(250, 204, 21, 0.12);
+    border-color: rgba(250, 204, 21, 0.4);
+    color: #facc15;
+  }
+  .rd-chat__role { color: #94a3b8; font-size: 12px; }
+  .rd-chat__role strong { color: #e2e8f0; }
+
+  .rd-chat__error {
+    margin: 0 0 12px 0;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+    font-size: 13px;
+  }
+
+  /* Bannière d'erreur IA — visible en permanence tant que aiPipeline.aiError != null. */
+  .rd-ai-error {
+    margin: 0 0 10px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fecaca;
+    font-size: 13px;
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .rd-ai-error__icon {
+    flex: 0 0 auto;
+    font-size: 16px;
+  }
+  .rd-ai-error__text {
+    flex: 1 1 auto;
+    word-break: break-word;
+  }
+  .rd-ai-error__close {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: #fecaca;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .rd-ai-error__close:hover {
+    color: #fff;
+  }
+
+  /* Screenshot de verification renvoye par l'agent Rust apres une action IA. */
+  .rd-ai-verif {
+    margin: 0 0 12px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid rgba(99, 102, 241, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .rd-ai-verif__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: #c7d2fe;
+  }
+  .rd-ai-verif__img {
+    width: 100%;
+    height: auto;
+    max-height: 320px;
+    object-fit: contain;
+    border-radius: 6px;
+    background: #000;
+  }
+
+  .rd-chat__list {
+    flex: 1;
+    min-height: 320px;
+    max-height: 520px;
+    overflow-y: auto;
+    padding: 14px;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    scroll-behavior: smooth;
+  }
+  .rd-chat__list::-webkit-scrollbar { width: 8px; }
+  .rd-chat__list::-webkit-scrollbar-thumb {
+    background: rgba(56, 189, 248, 0.25);
+    border-radius: 4px;
+  }
+
+  .rd-chat__row {
+    display: flex;
+    justify-content: flex-start;
+  }
+  .rd-chat__row--mine { justify-content: flex-end; }
+
+  .rd-chat__bubble {
+    max-width: 72%;
+    background: #111a25;
+    border: 1px solid #1f2a36;
+    border-radius: 14px 14px 14px 4px;
+    padding: 8px 12px;
+    color: #e2e8f0;
+  }
+  .rd-chat__bubble--mine {
+    background: rgba(56, 189, 248, 0.18);
+    border-color: rgba(56, 189, 248, 0.4);
+    border-radius: 14px 14px 4px 14px;
+  }
+  /* Bulles IA — fond violet pour bien distinguer du chat humain. */
+  .rd-chat__bubble--ai {
+    background: rgba(167, 139, 250, 0.14);
+    border-color: rgba(167, 139, 250, 0.4);
+  }
+  .rd-chat__bubble--ai.rd-chat__bubble--mine {
+    background: rgba(167, 139, 250, 0.22);
+    border-color: rgba(167, 139, 250, 0.5);
+  }
+  .rd-chat__bubble--ai .rd-chat__sender { color: #a78bfa; }
+  .rd-chat__meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .rd-chat__sender { font-weight: 600; color: #cbd5e1; }
+  .rd-chat__bubble--mine .rd-chat__sender { color: #38bdf8; }
+  .rd-chat__ts { font-family: "Consolas", monospace; }
+  .rd-chat__text {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .rd-chat__typing {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 4px 0 4px;
+    font-size: 12px;
+    color: #94a3b8;
+    font-style: italic;
+  }
+  .rd-chat__typing-dot {
+    width: 5px; height: 5px;
+    background: #38bdf8;
+    border-radius: 50%;
+    display: inline-block;
+    animation: rd-chat-typing-bounce 1.2s infinite ease-in-out;
+  }
+  .rd-chat__typing-dot:nth-child(2) { animation-delay: 0.15s; }
+  .rd-chat__typing-dot:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes rd-chat-typing-bounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+    40% { transform: translateY(-3px); opacity: 1; }
+  }
+
+  .rd-chat__compose {
+    display: flex;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .rd-chat__input {
+    flex: 1;
+    background: #0a0f15;
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: #e2e8f0;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .rd-chat__input:focus {
+    border-color: rgba(56, 189, 248, 0.55);
+  }
+  .rd-chat__input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .rd-chat__send {
+    background: #38bdf8;
+    border: none;
+    color: #0d1117;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .rd-chat__send:hover:not(:disabled) { background: #7dd3fc; }
+  .rd-chat__send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* Variante "IA" du bouton envoi — distincte visuellement pour que le user
+     ne se demande pas si son message va au technicien ou à l'IA. */
+  .rd-chat__send-ai {
+    background: linear-gradient(135deg, #a78bfa 0%, #818cf8 100%);
+    color: #fff;
+    font-size: 16px;
+  }
+  .rd-chat__send-ai:hover:not(:disabled) {
+    background: linear-gradient(135deg, #c4b5fd 0%, #a5b4fc 100%);
+  }
+  .rd-chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Barre télémétrie → cf. RdViewerStatsBar.svelte. En plein écran on garde
+     sa position de coin via :global pour atteindre le composant enfant. */
+  .rd-viewer__stage:fullscreen .rd-viewer__stats-bar,
+  .rd-viewer__stage:-webkit-full-screen .rd-viewer__stats-bar { top: 18px; left: 18px; }
+
+  /* ── Chat sidebar par-dessus la vidéo ───────────────────────────── */
+  .rd-viewer__chat-side {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: 340px;
+    max-width: calc(100% - 24px);
+    background: rgba(13, 17, 23, 0.92);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    display: flex;
+    flex-direction: column;
+    z-index: 12;
+    overflow: hidden;
+    animation: rd-chat-slide-in 0.18s ease-out;
+  }
+  @keyframes rd-chat-slide-in {
+    from { transform: translateX(20px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+  .rd-viewer__chat-side-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  .rd-viewer__chat-side-head strong { flex: 0 0 auto; }
+  .rd-viewer__chat-side-head .rd-chat__pill { margin: 0 auto 0 0; }
+  .rd-viewer__chat-side-close {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #cbd5e1;
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    padding: 0;
+    transition: background 0.15s, color 0.15s;
+  }
+  .rd-viewer__chat-side-close:hover {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fff;
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  .rd-viewer__chat-side-list {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    padding: 12px;
+  }
+  .rd-viewer__chat-side-compose {
+    margin: 0;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(56, 189, 248, 0.18);
+    gap: 8px;
+  }
+  .rd-viewer__chat-side-compose .rd-chat__send { padding: 8px 14px; font-size: 16px; }
+
+  /* En plein écran, la sidebar reste collée à droite */ .rd-viewer__stage:fullscreen .rd-viewer__chat-side, .rd-viewer__stage:-webkit-full-screen .rd-viewer__chat-side {
+    top: 20px;
+    right: 20px;
+    bottom: 20px;
+    width: 360px;
+  }
+
+  @media (max-width: 720px) {
+    .rd-viewer__chat-side {
+      width: auto;
+      left: 12px;
+      right: 12px;
+      top: auto;
+      height: 60%;
+    }
+  }

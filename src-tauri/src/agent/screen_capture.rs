@@ -38,7 +38,9 @@ pub fn capture_primary_jpeg_base64(quality: u8) -> Result<String, String> {
     let rgba = RgbaImage::from_raw(frame_width as u32, frame_height as u32, rgba_bytes)
         .ok_or_else(|| "Invalid preview frame buffer".to_string())?;
 
-    let mut out = Vec::new();
+    // Une capture JPEG q=50 (1280px) ≈ 60-100 KB. On pre-alloue 96 KB pour
+    // limiter les reallocs pendant l'encodage (l'image crate grossit en x2).
+    let mut out = Vec::with_capacity(96 * 1024);
     let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
     encoder
         .encode_image(&DynamicImage::ImageRgba8(rgba))
@@ -115,7 +117,9 @@ pub fn capture_primary_jpeg_base64_scaled(
     let final_w = img.width();
     let final_h = img.height();
 
-    let mut out = Vec::new();
+    // Une capture JPEG q=50 (1280px) ≈ 60-100 KB. On pre-alloue 96 KB pour
+    // limiter les reallocs pendant l'encodage (l'image crate grossit en x2).
+    let mut out = Vec::with_capacity(96 * 1024);
     JpegEncoder::new_with_quality(&mut out, quality)
         .encode_image(&img)
         .map_err(|e| format!("JPEG encode failed: {e}"))?;

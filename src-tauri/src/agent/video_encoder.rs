@@ -81,7 +81,7 @@ impl VideoEncoderSelection {
                 VideoEncoderBackend::MediaFoundationH264 => backend,
                 _ if ffmpeg_supports_backend(backend) => backend,
                 _ => {
-                    eprintln!(
+                    tracing::warn!(
                         "⚠️ Requested encoder backend '{}' not available. Falling back to auto.",
                         backend.label()
                     );

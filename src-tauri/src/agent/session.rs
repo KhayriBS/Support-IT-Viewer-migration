@@ -187,7 +187,7 @@ fn log_session_event(event: &str, payload: serde_json::Value) {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "payload": payload,
     });
-    println!("{envelope}");
+    tracing::info!("{envelope}");
 }
 
 /// Spawn an async grace-period task. Keeps the session ALIVE for `grace_secs`
@@ -205,7 +205,7 @@ fn schedule_viewer_grace_period(
     // Idempotent: if a grace task is already running, don't stack another.
     // The existing one will be cancelled by activity / shutdown anyway.
     if state.grace_active.swap(true, Ordering::AcqRel) {
-        println!("ℹ️ Grâce déjà active ({reason}) — pas de nouveau timer");
+        tracing::info!("ℹ️ Grâce déjà active ({reason}) — pas de nouveau timer");
         return;
     }
 
@@ -214,7 +214,7 @@ fn schedule_viewer_grace_period(
     // Reset counter for this fresh grace window.
     state.consecutive_1003.store(0, Ordering::Release);
 
-    println!(
+    tracing::info!(
         "⏳ Viewer parti ({reason}) — fenêtre de grâce {grace_secs}s avant fermeture définitive"
     );
     log_session_event(
@@ -240,14 +240,14 @@ fn schedule_viewer_grace_period(
             // (leave_session/stop_agent fire the same Notify)?
             let in_session = state.status.lock().await.in_session;
             if !in_session {
-                println!("ℹ️ Grâce annulée — session déjà fermée (shutdown)");
+                tracing::info!("ℹ️ Grâce annulée — session déjà fermée (shutdown)");
                 log_session_event(
                     "viewer_grace_cancelled",
                     serde_json::json!({ "reason": "shutdown" }),
                 );
             } else {
                 let activity_now = state.viewer_activity_epoch.load(Ordering::Relaxed);
-                println!(
+                tracing::info!(
                     "✅ Viewer revenu avant expiration ({activity_at_start} → {activity_now}) — fermeture annulée"
                 );
                 log_session_event(
@@ -265,13 +265,13 @@ fn schedule_viewer_grace_period(
         // Sleep elapsed without cancel. Race-safe re-check before teardown.
         let in_session = state.status.lock().await.in_session;
         if !in_session {
-            println!("ℹ️ Grâce expirée mais session déjà fermée — no-op");
+            tracing::info!("ℹ️ Grâce expirée mais session déjà fermée — no-op");
             return;
         }
 
         let activity_now = state.viewer_activity_epoch.load(Ordering::Relaxed);
         if activity_now != activity_at_start {
-            println!(
+            tracing::info!(
                 "✅ Activité viewer détectée pendant la grâce ({activity_at_start} → {activity_now}) — session conservée"
             );
             log_session_event(
@@ -295,7 +295,7 @@ fn schedule_viewer_grace_period(
             guard.as_ref().map(|pc| pc.is_peer_connected()).unwrap_or(false)
         };
         if webrtc_alive {
-            println!(
+            tracing::info!(
                 "🛡️ Grâce expirée mais peer WebRTC toujours Connected — session maintenue, nouvelle fenêtre de grâce armée"
             );
             log_session_event(
@@ -309,7 +309,7 @@ fn schedule_viewer_grace_period(
             return;
         }
 
-        println!("⛔ Délai de grâce expiré sans retour viewer — fermeture session");
+        tracing::info!("⛔ Délai de grâce expiré sans retour viewer — fermeture session");
         log_session_event(
             "viewer_grace_expired",
             serde_json::json!({
@@ -343,8 +343,8 @@ pub async fn start_agent(
 
     let os = std::env::consts::OS.to_string();
 
-    println!("MachineId : {machine_id}");
-    println!("OS        : {os}");
+    tracing::info!("MachineId : {machine_id}");
+    tracing::info!("OS        : {os}");
 
     {
         let mut s = state.status.lock().await;
@@ -356,7 +356,7 @@ pub async fn start_agent(
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(e) = agent_loop(state_clone, server_url, machine_id, os).await {
-            eprintln!("❌ Agent loop error: {e}");
+            tracing::warn!("❌ Agent loop error: {e}");
         }
     });
 
@@ -388,11 +388,11 @@ async fn agent_loop(
 
     // ── Register ──────────────────────────────────────────────────────────────
     let agent = auth.register_or_update(&machine_id, &machine_id, &os).await?;
-    println!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
+    tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
 
     // ── Login → JWT ───────────────────────────────────────────────────────────
     let token = auth.login(&machine_id, &os).await?;
-    println!("✅ Agent authenticated (JWT received)");
+    tracing::info!("✅ Agent authenticated (JWT received)");
 
     {
         *state.jwt_token.lock().await = Some(token.clone());
@@ -405,15 +405,15 @@ async fn agent_loop(
     let mut metrics_tick   = interval(Duration::from_secs(10));
     let mut session_tick   = interval(Duration::from_secs(1));
 
-    println!("\n🔄 Agent en attente de sessions de contrôle à distance…\n");
+    tracing::info!("\n🔄 Agent en attente de sessions de contrôle à distance…\n");
 
     loop {
         tokio::select! {
             // ── Stop signal ───────────────────────────────────────────────────
             _ = state.stop_notify.notified() => {
-                println!("🛑 Stop signal reçu");
+                tracing::info!("🛑 Stop signal reçu");
                 let _ = auth.mark_offline(&machine_id, &token).await;
-                println!("🔴 Agent marked OFFLINE");
+                tracing::info!("🔴 Agent marked OFFLINE");
 
                 // Leave active session if any
                 if state.status.lock().await.in_session {
@@ -425,18 +425,18 @@ async fn agent_loop(
             // ── Heartbeat ─────────────────────────────────────────────────────
             _ = heartbeat_tick.tick() => {
                 match auth.send_heartbeat(&machine_id, &token).await {
-                    Ok(_)  => println!("💓 Heartbeat @ {}", chrono::Local::now().format("%H:%M:%S")),
-                    Err(e) => eprintln!("⚠️ Heartbeat error: {e}"),
+                    Ok(_)  => tracing::info!("💓 Heartbeat @ {}", chrono::Local::now().format("%H:%M:%S")),
+                    Err(e) => tracing::warn!("⚠️ Heartbeat error: {e}"),
                 }
             }
 
             // ── Metrics ───────────────────────────────────────────────────────
             _ = metrics_tick.tick() => {
                 let m = metrics_collector.collect();
-                println!("📊 CPU={:.1}% RAM={:.1}% DISK={:.1}%",
+                tracing::info!("📊 CPU={:.1}% RAM={:.1}% DISK={:.1}%",
                     m.cpu_usage, m.ram_usage, m.disk_usage);
                 if let Err(e) = auth.send_metrics(&m, &token).await {
-                    eprintln!("⚠️ Metrics error: {e}");
+                    tracing::warn!("⚠️ Metrics error: {e}");
                 }
             }
 
@@ -446,13 +446,13 @@ async fn agent_loop(
                 if !in_session {
                     match auth.get_pending_session(&machine_id, &token).await {
                         Ok(Some(pending)) => {
-                            println!("\n🔔 Nouvelle session! Technicien: {}", pending.technician_username);
+                            tracing::info!("\n🔔 Nouvelle session! Technicien: {}", pending.technician_username);
                             if let Err(e) = join_session(Arc::clone(&state), &server_url, &pending).await {
-                                eprintln!("❌ join_session error: {e}");
+                                tracing::warn!("❌ join_session error: {e}");
                             }
                         }
                         Ok(None) => {} // no pending session, normal
-                        Err(e)   => eprintln!("⚠️ Session poll error: {e}"),
+                        Err(e)   => tracing::warn!("⚠️ Session poll error: {e}"),
                     }
                 }
             }
@@ -482,7 +482,7 @@ pub async fn join_session(
     client.set_session_id(pending.id.to_string()).await;
     *state.signaling.lock().await = Some(Arc::clone(&client));
 
-    println!("🎯 Session démarrée (token: {}…)", &pending.signaling_token[..8.min(pending.signaling_token.len())]);
+    tracing::info!("🎯 Session démarrée (token: {}…)", &pending.signaling_token[..8.min(pending.signaling_token.len())]);
     log_session_event(
         "session_start",
         serde_json::json!({
@@ -523,7 +523,7 @@ pub async fn join_session(
 
             match client.connect(&token_clone, event_tx).await {
                 Ok(_) => {
-                    println!("⏳ En attente de l'OFFER du viewer…");
+                    tracing::info!("⏳ En attente de l'OFFER du viewer…");
                     let connected_at = std::time::Instant::now();
 
                     let dispatch_outcome = dispatch_signals(
@@ -561,7 +561,7 @@ pub async fn join_session(
                         last_reconnect_log = std::time::Instant::now();
                     }
 
-                    println!("🔄 Tentative de reconnexion et attente {:.1}s…", reconnect_delay.as_secs_f64());
+                    tracing::info!("🔄 Tentative de reconnexion et attente {:.1}s…", reconnect_delay.as_secs_f64());
                     tokio::time::sleep(reconnect_delay).await;
 
                     if !state_for_signals.status.lock().await.in_session {
@@ -575,7 +575,7 @@ pub async fn join_session(
                     }
                 }
                 Err(e) => {
-                    eprintln!("❌ Reconnexion échouée: {e}");
+                    tracing::warn!("❌ Reconnexion échouée: {e}");
 
                     if !state_for_signals.status.lock().await.in_session {
                         break;
@@ -595,7 +595,7 @@ pub async fn join_session(
                         last_reconnect_log = std::time::Instant::now();
                     }
 
-                    println!("🔄 Nouvelle tentative en {:.1}s…", reconnect_delay.as_secs_f64());
+                    tracing::info!("🔄 Nouvelle tentative en {:.1}s…", reconnect_delay.as_secs_f64());
                     tokio::time::sleep(reconnect_delay).await;
 
                     if !state_for_signals.status.lock().await.in_session {
@@ -651,7 +651,7 @@ async fn dispatch_signals(
                 // Real viewer activity → reset 1003 counter, cancel grace.
                 state.consecutive_1003.store(0, Ordering::Release);
                 state.grace_cancel.notify_waiters();
-                println!("👋 Viewer rejoint la session — attente de l'OFFER SDP");
+                tracing::info!("👋 Viewer rejoint la session — attente de l'OFFER SDP");
 
                 // Si on a une ANSWER pendante (signaling était tombée juste
                 // avant son envoi sur la dispatch précédente), on la renvoie
@@ -660,20 +660,20 @@ async fn dispatch_signals(
                 // signaling de Render.
                 let pending = state.pending_answer.lock().await.clone();
                 if let Some(answer) = pending {
-                    println!("🔁 Renvoi de l'ANSWER pendante au viewer (reconnect signaling)");
+                    tracing::info!("🔁 Renvoi de l'ANSWER pendante au viewer (reconnect signaling)");
                     match sig.send_answer(answer).await {
                         Ok(()) => {
                             *state.pending_answer.lock().await = None;
-                            println!("📤 Answer SDP renvoyé avec succès");
+                            tracing::info!("📤 Answer SDP renvoyé avec succès");
                             if !h264_sender_started {
                                 if let Some(pc) = webrtc.as_ref() {
-                                    println!("🎥 Démarrage stream WebRTC H.264 (screen)");
+                                    tracing::info!("🎥 Démarrage stream WebRTC H.264 (screen)");
                                     pc.start_h264_screen_sender();
                                     h264_sender_started = true;
                                 }
                             }
                         }
-                        Err(e) => eprintln!("⚠️ Renvoi ANSWER pendante échoué: {e}"),
+                        Err(e) => tracing::warn!("⚠️ Renvoi ANSWER pendante échoué: {e}"),
                     }
                 }
             }
@@ -683,7 +683,7 @@ async fn dispatch_signals(
                 state.viewer_activity_epoch.fetch_add(1, Ordering::Relaxed);
                 state.consecutive_1003.store(0, Ordering::Release);
                 state.grace_cancel.notify_waiters();
-                println!("📥 Offer SDP reçu du viewer");
+                tracing::info!("📥 Offer SDP reçu du viewer");
 
                 let current_offer_fingerprint = msg
                     .payload
@@ -699,7 +699,7 @@ async fn dispatch_signals(
                 if current_offer_fingerprint.is_some()
                     && current_offer_fingerprint == last_offer_fingerprint
                 {
-                    println!("⚠️ OFFER dupliqué ignoré (même SDP)");
+                    tracing::info!("⚠️ OFFER dupliqué ignoré (même SDP)");
                     continue;
                 }
 
@@ -711,14 +711,14 @@ async fn dispatch_signals(
                         allow_file_xfer,
                     ).await {
                         Ok(pc) => {
-                            println!("🔧 WebRTC initialisé");
+                            tracing::info!("🔧 WebRTC initialisé");
                             let arc_pc = Arc::new(pc);
                             // Persist so it survives signaling reconnects / grace.
                             *state.webrtc.lock().await = Some(Arc::clone(&arc_pc));
                             webrtc = Some(arc_pc);
                         }
                         Err(e) => {
-                            eprintln!("❌ Init WebRTC échouée: {e}");
+                            tracing::warn!("❌ Init WebRTC échouée: {e}");
                             continue;
                         }
                     }
@@ -734,27 +734,27 @@ async fn dispatch_signals(
                             *state.pending_answer.lock().await = Some(answer_payload.clone());
                             match sig.send_answer(answer_payload).await {
                                 Ok(()) => {
-                                    println!("📤 Answer SDP envoyé");
+                                    tracing::info!("📤 Answer SDP envoyé");
                                     *state.pending_answer.lock().await = None;
                                     if !h264_sender_started {
                                         if let Some(pc) = webrtc.as_ref() {
-                                            println!("🎥 Démarrage stream WebRTC H.264 (screen)");
+                                            tracing::info!("🎥 Démarrage stream WebRTC H.264 (screen)");
                                             pc.start_h264_screen_sender();
                                             h264_sender_started = true;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "❌ Envoi ANSWER échoué: {e} — gardé pour retry au prochain reconnect signaling"
                                     );
                                 }
                             }
                         }
-                        Err(e) => eprintln!("❌ Erreur WebRTC OFFER->ANSWER: {e}"),
+                        Err(e) => tracing::warn!("❌ Erreur WebRTC OFFER->ANSWER: {e}"),
                     }
                 } else {
-                    eprintln!("❌ Offer sans payload");
+                    tracing::warn!("❌ Offer sans payload");
                 }
             }
 
@@ -763,10 +763,10 @@ async fn dispatch_signals(
                 state.viewer_activity_epoch.fetch_add(1, Ordering::Relaxed);
                 state.consecutive_1003.store(0, Ordering::Release);
                 state.grace_cancel.notify_waiters();
-                println!("🧊 ICE candidate reçu");
+                tracing::info!("🧊 ICE candidate reçu");
                 if let (Some(pc), Some(payload)) = (webrtc.as_ref(), msg.payload.as_ref()) {
                     if let Err(e) = pc.add_ice_candidate(payload).await {
-                        eprintln!("⚠️ ICE candidate rejeté: {e}");
+                        tracing::warn!("⚠️ ICE candidate rejeté: {e}");
                     }
                 }
             }
@@ -776,7 +776,7 @@ async fn dispatch_signals(
                 if let Some(payload) = &msg.payload {
                     let content     = payload["content"].as_str().unwrap_or("").to_string();
                     let sender_name = payload["senderName"].as_str().unwrap_or("?").to_string();
-                    println!("💬 [{sender_name}]: {content}");
+                    tracing::info!("💬 [{sender_name}]: {content}");
 
                     // Forward to frontend via chat channel
                     if let Some(tx) = state.chat_tx.lock().await.as_ref() {
@@ -828,7 +828,7 @@ async fn dispatch_signals(
                         pc.set_fps_tier(fps_tier);
                     }
                 }
-                println!("🎛️ Stream profile reçu: {:?}", profile);
+                tracing::info!("🎛️ Stream profile reçu: {:?}", profile);
             }
             // ── LEAVE ─────────────────────────────────────────────────
             SignalType::Leave => {
@@ -845,7 +845,7 @@ async fn dispatch_signals(
                     "manual_disconnect" | "manual" | "user" | "explicit"
                 );
 
-                println!(
+                tracing::info!(
                     "🚪 Signal LEAVE reçu de '{}' (reason='{}', manual={})",
                     msg.from, leave_reason, explicit_manual_leave
                 );
@@ -907,7 +907,7 @@ async fn dispatch_signals(
                                 None => false,
                             };
                             if peer_connected {
-                                println!(
+                                tracing::info!(
                                     "🛡️ 1003 ignoré — peer WebRTC déjà Connected, signaling devenu optionnel"
                                 );
                                 schedule_viewer_grace_period(
@@ -932,7 +932,7 @@ async fn dispatch_signals(
                                     + 1;
 
                                 if count > MAX_1003_DURING_GRACE {
-                                    println!(
+                                    tracing::info!(
                                         "⛔ {count} × 1003 pendant la grâce — verdict serveur définitif, fermeture session"
                                     );
                                     log_session_event(
@@ -946,7 +946,7 @@ async fn dispatch_signals(
                                     return DispatchOutcome::Stop;
                                 }
 
-                                println!(
+                                tracing::info!(
                                     "🛡️ Signal fermé (1003 #{count}) pendant la grâce — un dernier essai puis abandon"
                                 );
                                 log_session_event(
@@ -959,7 +959,7 @@ async fn dispatch_signals(
                                 break; // exit dispatch; outer loop retries once
                             }
 
-                            println!(
+                            tracing::info!(
                                 "⛔ Signal fermé par serveur (1003), fin de session locale"
                             );
                             log_session_event(
@@ -977,7 +977,7 @@ async fn dispatch_signals(
                             .unwrap_or(true);
 
                         if !is_retryable {
-                            println!(
+                            tracing::info!(
                                 "⛔ Signal fermé (code {:?}), pas de reconnexion automatique",
                                 close_code
                             );
@@ -996,7 +996,7 @@ async fn dispatch_signals(
                         // session alive, let the outer loop reconnect signaling,
                         // and arm a grace timer so we don't leak a session if the
                         // viewer never reappears. JOIN/OFFER/ICE will cancel it.
-                        println!(
+                        tracing::info!(
                             "🔌 Signal fermé (code {:?}), reconnexion autorisée + grâce armée",
                             close_code
                         );
@@ -1014,14 +1014,14 @@ async fn dispatch_signals(
                         .unwrap_or(false);
 
                     if is_peer_not_connected {
-                        println!(
+                        tracing::info!(
                             "ℹ️ Viewer pas encore connecté (signal normal pendant l'initialisation)"
                         );
                     } else {
-                        eprintln!("⚠️ Signal ERROR serveur: {payload}");
+                        tracing::warn!("⚠️ Signal ERROR serveur: {payload}");
                     }
                 } else {
-                    eprintln!("⚠️ Signal ERROR serveur sans payload");
+                    tracing::warn!("⚠️ Signal ERROR serveur sans payload");
                 }
             }
 
@@ -1036,7 +1036,7 @@ async fn dispatch_signals(
                     .and_then(|p| p["path"].as_str())
                     .unwrap_or("");
 
-                println!("📂 Demande liste fichiers: {path}");
+                tracing::info!("📂 Demande liste fichiers: {path}");
                 let listing = file_service.get_directory_listing(path);
                 let json = serde_json::to_value(&listing).unwrap_or_default();
                 let _ = sig.send_file_list(json).await;
@@ -1049,7 +1049,7 @@ async fn dispatch_signals(
                     continue;
                 }
                 if let Some(path) = msg.payload.as_ref().and_then(|p| p["path"].as_str()) {
-                    println!("📥 Téléchargement demandé: {path}");
+                    tracing::info!("📥 Téléchargement demandé: {path}");
                     let chunks = file_service.read_file_chunks(path);
                     if chunks.is_empty() {
                         let _ = sig.send_file_error("File not found or unreadable").await;
@@ -1061,7 +1061,7 @@ async fn dispatch_signals(
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         let _ = sig.send_file_complete(&file_name).await;
-                        println!("✅ Fichier envoyé: {path}");
+                        tracing::info!("✅ Fichier envoyé: {path}");
                     }
                 }
             }
@@ -1083,7 +1083,7 @@ async fn dispatch_signals(
                     let downloads = FileTransferService::get_downloads_path();
                     uploading_path   = Some(downloads.join(safe_name).to_string_lossy().to_string());
                     uploading_append = false;
-                    println!("📤 Upload démarré: {:?}", uploading_path);
+                    tracing::info!("📤 Upload démarré: {:?}", uploading_path);
                 }
             }
 
@@ -1097,15 +1097,15 @@ async fn dispatch_signals(
                     match file_service.save_file_async(dest, data, uploading_append).await {
                         Ok(_) => {
                             uploading_append = true;
-                            println!("📦 Chunk {}/{} reçu", chunk_index + 1, total_chunks);
+                            tracing::info!("📦 Chunk {}/{} reçu", chunk_index + 1, total_chunks);
                             if chunk_index + 1 >= total_chunks {
-                                println!("✅ Fichier reçu: {dest}");
+                                tracing::info!("✅ Fichier reçu: {dest}");
                                 uploading_path   = None;
                                 uploading_append = false;
                             }
                         }
                         Err(e) => {
-                            eprintln!("❌ Erreur sauvegarde: {e}");
+                            tracing::warn!("❌ Erreur sauvegarde: {e}");
                             let _ = sig.send_file_error(&e).await;
                         }
                     }
@@ -1115,7 +1115,7 @@ async fn dispatch_signals(
             // ── Input from DataChannel (sent via WebRTC, not signaling) ──
             // Handled in the WebRTC layer; here for completeness / future use
             _ => {
-                println!("📨 Signal ignoré: {:?}", msg.signal_type);
+                tracing::info!("📨 Signal ignoré: {:?}", msg.signal_type);
             }
         }
 
@@ -1159,7 +1159,7 @@ pub async fn leave_session(state: Arc<SharedState>) {
         sig.disconnect().await;
     }
 
-    println!("🚪 Session terminée");
+    tracing::info!("🚪 Session terminée");
     log_session_event(
         "session_closed",
         serde_json::json!({

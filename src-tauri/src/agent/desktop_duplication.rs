@@ -203,7 +203,7 @@ mod imp {
                         };
 
                         if !output_desc.AttachedToDesktop.as_bool() {
-                            println!(
+                            tracing::info!(
                                 "DXGI skip output #{output_index} on adapter #{adapter_index} ({adapter_name}): not attached to desktop"
                             );
                             continue;
@@ -234,7 +234,7 @@ mod imp {
                                 let height = (output_desc.DesktopCoordinates.bottom
                                     - output_desc.DesktopCoordinates.top)
                                     .max(0) as u32;
-                                println!(
+                                tracing::info!(
                                     "DXGI selected adapter #{adapter_index} ({adapter_name}) output #{output_index} (monitor ordinal {}): {}x{}",
                                     attached_output_ordinal,
                                     width,
@@ -255,7 +255,7 @@ mod imp {
                                 last_error = format!(
                                     "DuplicateOutput failed on adapter #{adapter_index} ({adapter_name}) output #{output_index}: {err}"
                                 );
-                                println!("{last_error}");
+                                tracing::info!("{last_error}");
                             }
                         }
 
@@ -289,7 +289,7 @@ mod imp {
                     .position(|candidate| candidate.display_info.id == fallback_screen.display_info.id)
                     .unwrap_or(0);
 
-                println!(
+                tracing::info!(
                     "DXGI indisponible, fallback screenshots activé sur display index {} id {} ({}x{})",
                     fallback_index,
                     fallback_screen.display_info.id,

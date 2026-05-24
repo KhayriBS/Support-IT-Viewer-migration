@@ -80,7 +80,22 @@ struct ActionResult<'a> {
 /// La fonction ne panique jamais — chaque erreur est convertie en un
 /// AI_ACTION_RESULT `ok=false` que le viewer affiche.
 pub async fn dispatch(channel: Arc<RTCDataChannel>, raw_json: &str) {
-    let executor = AiExecutor::new(channel);
+    let executor = match AiExecutor::new(Arc::clone(&channel)) {
+        Ok(e) => e,
+        Err(err) => {
+            // Enigo init can fail when the input subsystem is locked (UAC,
+            // group policy, session 0 isolation). Fail gracefully instead of
+            // crashing the whole agent process.
+            tracing::warn!("❌ AiExecutor init failed: {err}");
+            let payload = serde_json::json!({
+                "type": "AI_ACTION_RESULT",
+                "ok": false,
+                "message": format!("AI input subsystem unavailable: {err}"),
+            });
+            let _ = channel.send_text(payload.to_string()).await;
+            return;
+        }
+    };
 
     let value: Value = match serde_json::from_str(raw_json) {
         Ok(v) => v,
@@ -141,7 +156,7 @@ pub async fn dispatch(channel: Arc<RTCDataChannel>, raw_json: &str) {
         return;
     }
 
-    println!("🤖 AI executing {} action(s)", actions.len());
+    tracing::info!("🤖 AI executing {} action(s)", actions.len());
     for action in actions {
         executor.execute(action).await;
     }
@@ -160,29 +175,29 @@ struct AiExecutor {
 }
 
 impl AiExecutor {
-    fn new(channel: Arc<RTCDataChannel>) -> Self {
+    fn new(channel: Arc<RTCDataChannel>) -> Result<Self, String> {
         #[cfg(windows)]
         {
             let settings = enigo::Settings::default();
             let enigo = enigo::Enigo::new(&settings)
-                .expect("Enigo init failed (vibration with input subsystem?)");
-            Self {
+                .map_err(|e| format!("Enigo init failed: {e}"))?;
+            Ok(Self {
                 channel,
                 enigo: Mutex::new(enigo),
-            }
+            })
         }
         #[cfg(not(windows))]
         {
-            Self {
+            Ok(Self {
                 channel,
                 enigo: Mutex::new(()),
-            }
+            })
         }
     }
 
     async fn execute(&self, action: AiAction) {
         let kind = action.action_type.clone();
-        println!("🤖 AI action: {kind}");
+        tracing::info!("🤖 AI action: {kind}");
 
         let result: Result<Option<String>, String> = match kind.as_str() {
             "click" | "double_click" | "move" => self.do_pointer(&action).await,
@@ -211,8 +226,7 @@ impl AiExecutor {
         let x_norm = action.x.ok_or("missing x")?;
         let y_norm = action.y.ok_or("missing y")?;
         let (screen_w, screen_h) = primary_screen_size()?;
-        let x = (x_norm.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
-        let y = (y_norm.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+        let (x, y) = denormalize_coords(x_norm, y_norm, screen_w, screen_h);
 
         let button = match action.button.as_deref().unwrap_or("left") {
             "right" => Button::Right,
@@ -280,8 +294,8 @@ impl AiExecutor {
         let key = map_key_name(key_name)
             .ok_or_else(|| format!("Unknown key name: {key_name}"))?;
 
-        // Resolve modifiers
-        let mut mod_keys: Vec<Key> = Vec::new();
+        // Resolve modifiers (rarement plus de 3 — ctrl/shift/alt/meta)
+        let mut mod_keys: Vec<Key> = Vec::with_capacity(action.modifiers.len().min(4));
         for m in &action.modifiers {
             let mk = match m.to_lowercase().as_str() {
                 "ctrl" | "control" => Key::Control,
@@ -446,10 +460,8 @@ impl AiExecutor {
         let to_y = action.dest_y.ok_or("drag missing destY")?;
         let (screen_w, screen_h) = primary_screen_size()?;
 
-        let sx = (from_x.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
-        let sy = (from_y.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
-        let ex = (to_x.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
-        let ey = (to_y.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+        let (sx, sy) = denormalize_coords(from_x, from_y, screen_w, screen_h);
+        let (ex, ey) = denormalize_coords(to_x, to_y, screen_w, screen_h);
 
         let button = match action.button.as_deref().unwrap_or("left") {
             "right" => Button::Right,
@@ -520,12 +532,12 @@ impl AiExecutor {
         let json = match serde_json::to_string(&payload) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[ai] failed to serialize AI_ACTION_RESULT: {e}");
+                tracing::warn!("[ai] failed to serialize AI_ACTION_RESULT: {e}");
                 return;
             }
         };
         if let Err(e) = self.channel.send_text(json).await {
-            eprintln!("[ai] failed to send AI_ACTION_RESULT: {e}");
+            tracing::warn!("[ai] failed to send AI_ACTION_RESULT: {e}");
         }
     }
 
@@ -540,12 +552,12 @@ impl AiExecutor {
         let json = match serde_json::to_string(&payload) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[ai] failed to serialize error AI_ACTION_RESULT: {e}");
+                tracing::warn!("[ai] failed to serialize error AI_ACTION_RESULT: {e}");
                 return;
             }
         };
         if let Err(e) = self.channel.send_text(json).await {
-            eprintln!("[ai] failed to send error AI_ACTION_RESULT: {e}");
+            tracing::warn!("[ai] failed to send error AI_ACTION_RESULT: {e}");
         }
     }
 }
@@ -626,5 +638,193 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out.trim().to_string()
+    }
+}
+
+/// Convertit des coordonnées normalisées (0.0 → 1.0) en pixels écran absolus.
+/// Clampe l'entrée car Gemini renvoie parfois des valeurs légèrement hors borne
+/// (1.0001) après analyse — on ne veut surtout pas une coord négative ou hors
+/// écran qui ferait sortir le curseur du desktop.
+fn denormalize_coords(x_norm: f64, y_norm: f64, screen_w: i32, screen_h: i32) -> (i32, i32) {
+    let x = (x_norm.clamp(0.0, 1.0) * screen_w as f64).round() as i32;
+    let y = (y_norm.clamp(0.0, 1.0) * screen_h as f64).round() as i32;
+    (x, y)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── denormalize_coords ──────────────────────────────────────────────────
+
+    #[test]
+    fn denormalize_origin_maps_to_zero() {
+        assert_eq!(denormalize_coords(0.0, 0.0, 1920, 1080), (0, 0));
+    }
+
+    #[test]
+    fn denormalize_one_maps_to_screen_extent() {
+        assert_eq!(denormalize_coords(1.0, 1.0, 1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn denormalize_center() {
+        assert_eq!(denormalize_coords(0.5, 0.5, 1920, 1080), (960, 540));
+    }
+
+    #[test]
+    fn denormalize_clamps_negative() {
+        // Out-of-range negative input must clamp to (0, 0), not produce a
+        // negative pixel coordinate.
+        assert_eq!(denormalize_coords(-0.5, -0.2, 1920, 1080), (0, 0));
+    }
+
+    #[test]
+    fn denormalize_clamps_above_one() {
+        // Out-of-range > 1.0 must clamp to screen extent — Gemini sometimes
+        // returns 1.0001 after rounding errors in its analysis.
+        assert_eq!(denormalize_coords(1.5, 2.0, 1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn denormalize_works_for_different_aspect_ratios() {
+        // Portrait monitor 1080x1920
+        assert_eq!(denormalize_coords(0.25, 0.75, 1080, 1920), (270, 1440));
+    }
+
+    #[test]
+    fn denormalize_rounds_to_nearest_pixel() {
+        // 0.33333 * 1920 = 639.99... → rounds to 640
+        assert_eq!(denormalize_coords(0.333333, 0.0, 1920, 1080).0, 640);
+    }
+
+    // ── truncate ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        let out = truncate("hello world", 5);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 6); // 5 chars + ellipsis
+    }
+
+    #[test]
+    fn truncate_trims_whitespace() {
+        assert_eq!(truncate("  hello  ", 20), "hello");
+    }
+
+    #[test]
+    fn truncate_handles_unicode_correctly() {
+        // chars().count() is grapheme-aware enough for our shell output use case.
+        let out = truncate("café espresso", 5);
+        assert!(out.starts_with("café "));
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    // ── map_key_name (Windows-only enigo::Key) ──────────────────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_handles_named_keys_case_insensitively() {
+        assert!(matches!(map_key_name("Enter"), Some(_)));
+        assert!(matches!(map_key_name("enter"), Some(_)));
+        assert!(matches!(map_key_name("ESC"), Some(_)));
+        assert!(matches!(map_key_name("escape"), Some(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_handles_arrow_aliases() {
+        assert!(map_key_name("ArrowLeft").is_some());
+        assert!(map_key_name("left").is_some());
+        assert!(map_key_name("ArrowRight").is_some());
+        assert!(map_key_name("right").is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_handles_function_keys() {
+        for n in 1..=12 {
+            let name = format!("f{n}");
+            assert!(map_key_name(&name).is_some(), "f{n} missing");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_handles_media_aliases() {
+        // Snake-case, kebab-case, camelCase all accepted.
+        assert!(map_key_name("volume_up").is_some());
+        assert!(map_key_name("volume-up").is_some());
+        assert!(map_key_name("VolumeUp").is_some());
+        assert!(map_key_name("mediaplaypause").is_some());
+        assert!(map_key_name("play-pause").is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_returns_unicode_for_single_char() {
+        assert!(map_key_name("a").is_some());
+        assert!(map_key_name("é").is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_key_returns_none_for_unknown() {
+        assert!(map_key_name("unknown_key_blah").is_none());
+        assert!(map_key_name("xx").is_none()); // 2 chars, not a single Unicode and not in table
+    }
+
+    // ── AiAction deserialization (smoke tests) ─────────────────────────────
+
+    #[test]
+    fn ai_action_deserializes_click() {
+        let json = r#"{"type":"click","x":0.5,"y":0.5,"button":"left"}"#;
+        let action: AiAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.action_type, "click");
+        assert_eq!(action.x, Some(0.5));
+        assert_eq!(action.button.as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn ai_action_deserializes_drag_with_dest() {
+        let json = r#"{"type":"drag","x":0.1,"y":0.2,"destX":0.8,"destY":0.9}"#;
+        let action: AiAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.dest_x, Some(0.8));
+        assert_eq!(action.dest_y, Some(0.9));
+    }
+
+    #[test]
+    fn ai_action_deserializes_key_with_modifiers() {
+        let json = r#"{"type":"key","key":"a","modifiers":["ctrl","shift"]}"#;
+        let action: AiAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.modifiers, vec!["ctrl", "shift"]);
+    }
+
+    #[test]
+    fn ai_action_deserializes_shell() {
+        let json = r#"{"type":"shell","cmd":"echo hello","shell":"powershell"}"#;
+        let action: AiAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.cmd.as_deref(), Some("echo hello"));
+        assert_eq!(action.shell.as_deref(), Some("powershell"));
+    }
+
+    #[test]
+    fn ai_action_unknown_fields_ignored() {
+        // serde forward-compat: an unexpected key shouldn't break parsing.
+        let json = r#"{"type":"click","x":0.5,"y":0.5,"futureField":42}"#;
+        let action: AiAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.action_type, "click");
     }
 }

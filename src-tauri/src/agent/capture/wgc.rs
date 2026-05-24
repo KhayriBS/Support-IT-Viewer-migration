@@ -272,18 +272,18 @@ impl WgcCapturer {
             if monitor_index.unwrap_or(0) == 0 {
                 match winrt::NativeWgcCapturer::new() {
                     Ok(native) => {
-                        println!("WGC native WinRT capture initialized (monitor index: 0)");
+                        tracing::info!("WGC native WinRT capture initialized (monitor index: 0)");
                         return Ok(Self {
                             native: Some(native),
                             fallback: None,
                         });
                     }
                     Err(err) => {
-                        eprintln!("WGC native initialization failed: {err}; falling back to screenshots path");
+                        tracing::warn!("WGC native initialization failed: {err}; falling back to screenshots path");
                     }
                 }
             } else {
-                println!(
+                tracing::info!(
                     "WGC monitor index {} requested; using screenshots fallback for explicit monitor targeting",
                     monitor_index.unwrap_or(0)
                 );
@@ -298,7 +298,7 @@ impl WgcCapturer {
             .position(|candidate| candidate.display_info.id == screen.display_info.id)
             .unwrap_or(0);
 
-        println!(
+        tracing::info!(
             "WGC fallback using display index {} id {} ({}x{})",
             selected_index,
             screen.display_info.id,

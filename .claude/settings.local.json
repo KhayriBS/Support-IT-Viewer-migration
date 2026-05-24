@@ -5,7 +5,24 @@
       "PowerShell(npm run check 2>&1)",
       "PowerShell($lines = [System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\); Write-Output \"+page.svelte: $\\($lines.Length\\) lines\")",
       "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; $sess = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdSessionHistory.svelte\"\\)\\).Length; $file = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdFileHistory.svelte\"\\)\\).Length; $modal = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\\\\RdApprovalModal.svelte\"\\)\\).Length; Write-Output \"+page.svelte: $page\"; Write-Output \"RdApprovalModal: $modal\"; Write-Output \"RdSessionHistory: $sess\"; Write-Output \"RdFileHistory: $file\")",
-      "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; Write-Output \"+page.svelte: $page lines\"; Get-ChildItem \"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\" | ForEach-Object { $l = \\([System.IO.File]::ReadAllLines\\($_.FullName\\)\\).Length; Write-Output \"$\\($_.Name\\): $l\" })"
+      "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; Write-Output \"+page.svelte: $page lines\"; Get-ChildItem \"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\components\" | ForEach-Object { $l = \\([System.IO.File]::ReadAllLines\\($_.FullName\\)\\).Length; Write-Output \"$\\($_.Name\\): $l\" })",
+      "PowerShell($path = \"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"; $text = [System.IO.File]::ReadAllText\\($path\\); $pats = @\\(\"\\\\bmetricsError\\\\b\",\"\\\\bmetricsLoading\\\\b\",\"\\\\bmetricsPanelOpen\\\\b\",\"\\\\bconnectionCodeCopied\\\\b\",\"\\\\bagentLifecycleError\\\\b\",\"\\\\bagentRunning\\\\b\",\"\\\\bcopyLocalConnectionCode\\\\b\",\"\\\\btoggleMetricsPanel\\\\b\",\"\\\\brefreshLocalConnectionCode\\\\b\",\"\\\\blocalConnectionCodeError\\\\b\"\\); foreach \\($p in $pats\\) { $matches = [regex]::Matches\\($text, $p\\); Write-Output \"$p : $\\($matches.Count\\)\" })",
+      "PowerShell($page = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte\"\\)\\).Length; $mgr = \\([System.IO.File]::ReadAllLines\\(\"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\managers\\\\agent-manager.svelte.ts\"\\)\\).Length; Write-Output \"+page.svelte: $page lines\"; Write-Output \"agent-manager.svelte.ts: $mgr lines\")",
+      "PowerShell(Write-Output \"+page.svelte: $\\(\\([System.IO.File]::ReadAllLines\\('c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte'\\)\\).Length\\) lines\")",
+      "PowerShell(Write-Output \"+page.svelte: $\\(\\([System.IO.File]::ReadAllLines\\('c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\routes\\\\+page.svelte'\\)\\).Length\\) lines\"; Get-ChildItem \"c:\\\\Users\\\\NTS\\\\Desktop\\\\lumiere\\\\lumiere-tech-it\\\\src\\\\lib\\\\managers\" | ForEach-Object { $l = \\([System.IO.File]::ReadAllLines\\($_.FullName\\)\\).Length; Write-Output \"  $\\($_.Name\\): $l\" })",
+      "Bash(grep -v \"^[0-9]*:\\\\s*//\")",
+      "Bash(npm run *)",
+      "Bash(grep -n \"signalBus\\\\.[a-zA-Z]*,$\\\\|signalBus\\\\.[a-zA-Z]*$\" \"c:/Users/NTS/Desktop/lumiere/lumiere-tech-it/src/routes/+page.svelte\")",
+      "Bash(awk '/^<\\\\/script>/{found=1; print \"Script ends at line\", NR; next} found' \"c:/Users/NTS/Desktop/lumiere/lumiere-tech-it/src/routes/+page.svelte\")",
+      "Bash(awk 'NR>=3576' \"c:/Users/NTS/Desktop/lumiere/lumiere-tech-it/src/routes/+page.svelte\")",
+      "Bash(awk 'NR==413 || NR==414 || NR==415' \"c:/Users/NTS/Desktop/lumiere/lumiere-tech-it/src/routes/+page.svelte\")",
+      "Bash(python rename.py)",
+      "Bash(python extract.py)",
+      "Bash(python rename2.py)",
+      "Bash(python extract2.py)",
+      "Bash(python rename3.py)",
+      "Bash(awk 'NR>=$\\(grep -n \"^</script>\" src/routes/+page.svelte | cut -d: -f1\\)' src/routes/+page.svelte)",
+      "Bash(grep -nE \"^  \\\\.rd-\\(header|title|machine-code|connect|spinner|session-menu|features|feature|metrics|metric\\)[a-zA-Z_-]*[ ,{:]\" \"src/routes/+page.svelte\")"
     ]
   }
 }
