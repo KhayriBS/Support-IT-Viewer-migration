@@ -368,24 +368,23 @@ class AiPipeline {
     const action = result.action ?? "?";
     const ok = !!result.ok;
     const message = (result.message ?? "").trim();
-    const icon = ok ? "✅" : "❌";
 
+    // Screenshot de vérif : on garde l'image (utile pour Gemini multi-tour)
+    // mais on n'écrit rien dans le chat — l'image suffit.
     if (action === "screenshot" && result.screenshot) {
       this.aiLastVerificationImage = `data:image/jpeg;base64,${result.screenshot}`;
-      this.appendAiChatMessage(`${icon} screenshot de verification recu (${formatBytesApprox(result.screenshot.length)})`, "ai-system");
       return;
     }
 
+    // Seules les erreurs sont remontées dans le chat. Les succès des
+    // actions individuelles (✅ click OK, etc.) ne sont plus affichés —
+    // le technicien voit déjà le résultat visuel sur le flux écran et
+    // l'historique d'actions verbeux polluait l'UI.
     if (!ok) {
-      this.appendAiChatMessage(`${icon} ${action} a echoue : ${message || "erreur inconnue"}`, "ai-system");
-      return;
-    }
-
-    if (action === "move" || action === "wait") return;
-    if (message) {
-      this.appendAiChatMessage(`${icon} ${action} : ${message}`, "ai-system");
-    } else {
-      this.appendAiChatMessage(`${icon} ${action} OK`, "ai-system");
+      this.appendAiChatMessage(
+        `❌ ${action} a echoue : ${message || "erreur inconnue"}`,
+        "ai-system"
+      );
     }
   };
 
@@ -410,11 +409,17 @@ class AiPipeline {
       this.appendAiChatMessage(`🧠 ${env.rationale}`, "ai-system");
     }
 
+    // On ne logue plus chaque action dans le chat : seule la rationale
+    // (🧠 ci-dessus) reste visible côté technicien. Les échecs d'envoi
+    // (DataChannel fermé) sont toujours signalés car ils bloquent la
+    // suite du plan.
     for (const action of env.actions ?? []) {
-      this.appendAiChatMessage(this.formatAiActionForChat(action), "ai-action");
       const ok = this.forwardAiActionToAgent(action);
       if (!ok) {
-        this.appendAiChatMessage(`⚠️ Impossible d'envoyer cette action a l'agent (DataChannel indisponible).`, "ai-system");
+        this.appendAiChatMessage(
+          `⚠️ Impossible d'envoyer cette action a l'agent (DataChannel indisponible).`,
+          "ai-system"
+        );
         break;
       }
     }
