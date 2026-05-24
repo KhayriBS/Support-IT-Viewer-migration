@@ -3,6 +3,7 @@ use std::env;
 use super::desktop_duplication::DesktopFrame;
 
 mod dxgi;
+mod gdi;
 mod wgc;
 
 pub trait ScreenCapturer {
@@ -18,50 +19,57 @@ pub fn create_default_capturer() -> Result<Box<dyn ScreenCapturer + Send>, Strin
 
     match backend.as_str() {
         "dxgi" => {
-            tracing::info!("Capture backend selected: DXGI");
+            tracing::info!("🎥 Capture backend forced: DXGI Desktop Duplication");
             Ok(Box::new(dxgi::DxgiCapturer::new()?))
         }
         "wgc" => {
-            tracing::info!("Capture backend selected: WGC");
+            tracing::info!("🎥 Capture backend forced: WGC (Windows Graphics Capture)");
             Ok(Box::new(wgc::WgcCapturer::new()?))
         }
-        "auto" | "" => {
-            // Prefer DXGI when available for lower copy overhead, fall back to WGC path.
-            match dxgi::DxgiCapturer::new() {
-                Ok(capturer) => {
-                    tracing::info!("Capture backend auto-selected: DXGI");
-                    Ok(Box::new(capturer))
-                }
-                Err(dxgi_err) => {
-                    tracing::warn!("DXGI unavailable in auto mode: {dxgi_err}; trying WGC backend");
-                    match wgc::WgcCapturer::new() {
-                        Ok(capturer) => {
-                            tracing::info!("Capture backend auto-selected: WGC");
-                            Ok(Box::new(capturer))
-                        }
-                        Err(wgc_err) => Err(format!(
-                            "No capture backend available (DXGI error: {dxgi_err}; WGC error: {wgc_err})"
-                        )),
-                    }
-                }
-            }
+        "gdi" => {
+            tracing::info!("🎥 Capture backend forced: GDI BitBlt");
+            Ok(Box::new(gdi::GdiBacked::new()?))
         }
+        "auto" | "" => auto_select_capturer(),
         other => {
-            tracing::warn!("Unknown capture backend '{other}', falling back to auto");
-            match dxgi::DxgiCapturer::new() {
+            tracing::warn!("🎥 Unknown LUMIERE_CAPTURE_BACKEND='{other}', falling back to auto");
+            auto_select_capturer()
+        }
+    }
+}
+
+/// Chaîne automatique de fallback : DXGI (GPU, le plus rapide) → WGC
+/// (compat Win10+, fonctionne aussi en lockscreen sur récents) → GDI
+/// (compat universelle, lent mais marche sur 100% des PCs).
+
+fn auto_select_capturer() -> Result<Box<dyn ScreenCapturer + Send>, String> {
+    match dxgi::DxgiCapturer::new() {
+        Ok(capturer) => {
+            tracing::info!("🎥 Capture backend auto-selected: DXGI Desktop Duplication");
+            return Ok(Box::new(capturer));
+        }
+        Err(dxgi_err) => {
+            tracing::warn!(
+                "🎥 DXGI unavailable in auto mode: {dxgi_err} — trying WGC"
+            );
+            match wgc::WgcCapturer::new() {
                 Ok(capturer) => {
-                    tracing::info!("Capture backend auto-selected: DXGI");
-                    Ok(Box::new(capturer))
+                    tracing::info!("🎥 Capture backend auto-selected: WGC");
+                    return Ok(Box::new(capturer));
                 }
-                Err(dxgi_err) => {
-                    tracing::warn!("DXGI unavailable in auto fallback: {dxgi_err}; trying WGC backend");
-                    match wgc::WgcCapturer::new() {
+                Err(wgc_err) => {
+                    tracing::warn!(
+                        "🎥 WGC unavailable: {wgc_err} — falling back to GDI BitBlt"
+                    );
+                    match gdi::GdiBacked::new() {
                         Ok(capturer) => {
-                            tracing::info!("Capture backend auto-selected: WGC");
+                            tracing::info!(
+                                "🎥 Capture backend auto-selected: GDI BitBlt (universal fallback)"
+                            );
                             Ok(Box::new(capturer))
                         }
-                        Err(wgc_err) => Err(format!(
-                            "No capture backend available (DXGI error: {dxgi_err}; WGC error: {wgc_err})"
+                        Err(gdi_err) => Err(format!(
+                            "No capture backend available (DXGI: {dxgi_err}; WGC: {wgc_err}; GDI: {gdi_err})"
                         )),
                     }
                 }

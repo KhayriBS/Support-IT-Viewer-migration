@@ -1,9 +1,11 @@
 #[cfg(windows)]
 mod imp {
     use std::env;
-    use std::time::Instant;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use windows::core::Interface;
+    use windows::Win32::Foundation::{HWND};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_11_1,
@@ -20,7 +22,28 @@ mod imp {
         IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
         DXGI_OUTPUT_DESC,
     };
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+        DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, ROP_CODE, SRCCOPY,
+    };
+    use windows::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
     use screenshots::Screen;
+
+
+    const BLACK_FRAME_THRESHOLD: u32 = 3;
+
+    /// Nombre maximum de retries en cas de DXGI_ERROR_WAIT_TIMEOUT avant
+    /// de basculer sur GDI. 5 × 10ms = jusqu'à 50ms supplémentaires
+    /// pour laisser à l'Intel UHD le temps de produire une frame.
+    const DXGI_TIMEOUT_RETRIES: u32 = 5;
+    const DXGI_TIMEOUT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
     #[derive(Clone, Debug)]
     pub struct DesktopFrame {
@@ -103,6 +126,15 @@ mod imp {
         }
     }
 
+    /// Identifie le chemin de capture actuellement utilisé. Logué au
+    /// démarrage de chaque session et chaque fois qu'on bascule.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CaptureBackend {
+        Dxgi,
+        Screenshots,
+        Gdi,
+    }
+
     pub struct DxgiDesktopDuplicator {
         device: Option<ID3D11Device>,
         context: Option<ID3D11DeviceContext>,
@@ -111,6 +143,17 @@ mod imp {
         staging_texture: Option<ID3D11Texture2D>,
         cached_width: u32,
         cached_height: u32,
+        /// GDI fallback — initialisé lazy lorsqu'on bascule.
+        gdi: Option<GdiCapturer>,
+        /// Quand `true`, on ne tente même plus DXGI : un échec définitif
+        /// a été constaté (frames noires répétées ou timeouts).
+        force_gdi: bool,
+        /// Compteur de frames noires consécutives renvoyées par DXGI.
+        /// Quand ≥ BLACK_FRAME_THRESHOLD, on bascule en GDI.
+        consecutive_black_frames: u32,
+        /// Description humaine de l'adaptateur sélectionné (ex: "Intel(R)
+        /// UHD Graphics 730"). Loguée au démarrage et lors des fallbacks.
+        adapter_name: String,
     }
 
     fn utf16_fixed_to_string(input: &[u16]) -> String {
@@ -235,11 +278,21 @@ mod imp {
                                     - output_desc.DesktopCoordinates.top)
                                     .max(0) as u32;
                                 tracing::info!(
-                                    "DXGI selected adapter #{adapter_index} ({adapter_name}) output #{output_index} (monitor ordinal {}): {}x{}",
+                                    "🎥 Capture backend: DXGI Desktop Duplication on adapter #{adapter_index} ({adapter_name}) output #{output_index} (monitor ordinal {}): {}x{}",
                                     attached_output_ordinal,
                                     width,
                                     height
                                 );
+
+                              
+                                let force_gdi_env = env::var("LUMIERE_CAPTURE_BACKEND")
+                                    .map(|v| v.trim().eq_ignore_ascii_case("gdi"))
+                                    .unwrap_or(false);
+                                if force_gdi_env {
+                                    tracing::info!(
+                                        "🎥 LUMIERE_CAPTURE_BACKEND=gdi → DXGI ignoré au démarrage"
+                                    );
+                                }
 
                                 return Ok(Self {
                                     device: Some(device),
@@ -249,6 +302,10 @@ mod imp {
                                     staging_texture: None,
                                     cached_width: 0,
                                     cached_height: 0,
+                                    gdi: None,
+                                    force_gdi: force_gdi_env,
+                                    consecutive_black_frames: 0,
+                                    adapter_name: adapter_name.clone(),
                                 });
                             }
                             Err(err) => {
@@ -290,7 +347,7 @@ mod imp {
                     .unwrap_or(0);
 
                 tracing::info!(
-                    "DXGI indisponible, fallback screenshots activé sur display index {} id {} ({}x{})",
+                    "🎥 Capture backend: screenshots crate (DXGI indisponible) on display index {} id {} ({}x{})",
                     fallback_index,
                     fallback_screen.display_info.id,
                     fallback_screen.display_info.width,
@@ -305,7 +362,22 @@ mod imp {
                     staging_texture: None,
                     cached_width: 0,
                     cached_height: 0,
+                    gdi: None,
+                    force_gdi: false,
+                    consecutive_black_frames: 0,
+                    adapter_name: String::new(),
                 })
+            }
+        }
+
+     
+        pub fn current_backend(&self) -> CaptureBackend {
+            if self.force_gdi || self.duplication.is_none() && self.gdi.is_some() {
+                CaptureBackend::Gdi
+            } else if self.fallback_screen.is_some() {
+                CaptureBackend::Screenshots
+            } else {
+                CaptureBackend::Dxgi
             }
         }
 
@@ -313,6 +385,12 @@ mod imp {
             &mut self,
             timeout_ms: u32,
         ) -> Result<Option<DesktopFrame>, String> {
+            // ── Chemin GDI explicite (fallback définitif ou opt-in) ────────
+            if self.force_gdi {
+                return self.capture_via_gdi().map(Some);
+            }
+
+            // ── Chemin screenshots (DXGI complètement indispo au démarrage) ──
             if let Some(screen) = self.fallback_screen {
                 if timeout_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(
@@ -339,89 +417,188 @@ mod imp {
                 }));
             }
 
-            unsafe {
-                let duplication = self
-                    .duplication
-                    .as_ref()
-                    .ok_or_else(|| "DXGI duplication unavailable".to_string())?
-                    .clone();
-                let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-                let mut desktop_resource: Option<IDXGIResource> = None;
-                match duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
-                {
-                    Ok(()) => {}
-                    Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                        return Ok(None);
+        
+            let mut acquired_frame: Option<DesktopFrame> = None;
+            let mut last_dxgi_err: Option<String> = None;
+            for retry in 0..DXGI_TIMEOUT_RETRIES {
+                match unsafe { self.try_capture_dxgi(timeout_ms) } {
+                    Ok(Some(frame)) => {
+                        acquired_frame = Some(frame);
+                        break;
+                    }
+                    Ok(None) => {
+                        
+                        if retry + 1 < DXGI_TIMEOUT_RETRIES {
+                            thread::sleep(DXGI_TIMEOUT_RETRY_DELAY);
+                        }
                     }
                     Err(err) => {
-                        return Err(format!("AcquireNextFrame failed: {err}"));
+      
+                        last_dxgi_err = Some(err);
+                        break;
                     }
                 }
-                let capture_result = (|| -> Result<Option<DesktopFrame>, String> {
-                    let resource = desktop_resource
-                        .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
-                    let texture: ID3D11Texture2D = resource
-                        .cast()
-                        .map_err(|err| format!("IDXGIResource->ID3D11Texture2D cast failed: {err}"))?;
-
-                    let mut desc = D3D11_TEXTURE2D_DESC::default();
-                    texture.GetDesc(&mut desc);
-                    self.ensure_staging_texture(&desc)?;
-
-                    let staging = self
-                        .staging_texture
-                        .as_ref()
-                        .ok_or_else(|| "Staging texture unavailable".to_string())?;
-
-                    let source_resource: ID3D11Resource = texture
-                        .cast()
-                        .map_err(|err| format!("Texture->Resource cast failed: {err}"))?;
-                    let staging_resource: ID3D11Resource = staging
-                        .cast()
-                        .map_err(|err| format!("Staging->Resource cast failed: {err}"))?;
-
-                    let context = self
-                        .context
-                        .as_ref()
-                        .ok_or_else(|| "D3D11 context unavailable".to_string())?;
-                    context.CopyResource(&staging_resource, &source_resource);
-
-                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                    context
-                        .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                        .map_err(|err| format!("Map staging texture failed: {err}"))?;
-
-                    let width = desc.Width as usize;
-                    let height = desc.Height as usize;
-                    let row_pitch = mapped.RowPitch as usize;
-                    let byte_len = row_pitch.saturating_mul(height);
-                    let src = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), byte_len);
-                    let row_bytes = width * 4;
-                    let total_bytes = row_bytes * height;
-                    let bgra = if row_pitch == row_bytes {
-                        src[..total_bytes].to_vec()
-                    } else {
-                        let mut buf = Vec::with_capacity(total_bytes);
-                        for y in 0..height {
-                            buf.extend_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
-                        }
-                        buf
-                    };
-
-                    context.Unmap(staging, 0);
-
-                    Ok(Some(DesktopFrame {
-                        width,
-                        height,
-                        stride: width * 4,
-                        captured_at: Instant::now(),
-                        bgra,
-                    }))
-                })();
-
-                let _ = duplication.ReleaseFrame();
-                capture_result
             }
+
+            // Erreur DXGI dure → activer GDI définitivement.
+            if let Some(err) = last_dxgi_err {
+                tracing::warn!(
+                    "🎥 DXGI capture error on '{}': {err} — basculement permanent vers GDI BitBlt",
+                    self.adapter_name
+                );
+                return self.activate_gdi_fallback_and_capture();
+            }
+
+            let Some(frame) = acquired_frame else {
+      
+                tracing::warn!(
+                    "🎥 DXGI: {} timeouts consécutifs sur '{}' — capture GDI ponctuelle",
+                    DXGI_TIMEOUT_RETRIES,
+                    self.adapter_name
+                );
+                return self.capture_via_gdi().map(Some);
+            };
+
+
+            if is_black_frame(&frame.bgra) {
+                self.consecutive_black_frames =
+                    self.consecutive_black_frames.saturating_add(1);
+                if self.consecutive_black_frames >= BLACK_FRAME_THRESHOLD {
+                    tracing::warn!(
+                        "🎥 DXGI a produit {} frames noires consécutives sur '{}' — \
+                         basculement permanent vers GDI BitBlt (typique d'Intel UHD intégré)",
+                        self.consecutive_black_frames,
+                        self.adapter_name
+                    );
+                    return self.activate_gdi_fallback_and_capture();
+                }
+                // Sous le seuil : renvoie la frame quand même, l'encodeur
+                // saura quoi en faire (et c'est peut-être légitime).
+            } else if self.consecutive_black_frames > 0 {
+                self.consecutive_black_frames = 0;
+            }
+
+            Ok(Some(frame))
+        }
+
+        /// Une seule tentative DXGI. `Ok(None)` = WAIT_TIMEOUT (retentable),
+        /// `Err(_)` = erreur dure (device lost, etc., non retentable).
+        unsafe fn try_capture_dxgi(
+            &mut self,
+            timeout_ms: u32,
+        ) -> Result<Option<DesktopFrame>, String> {
+            let duplication = self
+                .duplication
+                .as_ref()
+                .ok_or_else(|| "DXGI duplication unavailable".to_string())?
+                .clone();
+            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut desktop_resource: Option<IDXGIResource> = None;
+            match duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
+            {
+                Ok(()) => {}
+                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    return Ok(None);
+                }
+                Err(err) => {
+                    return Err(format!("AcquireNextFrame failed: {err}"));
+                }
+            }
+            let capture_result = (|| -> Result<Option<DesktopFrame>, String> {
+                let resource = desktop_resource
+                    .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())?;
+                let texture: ID3D11Texture2D = resource
+                    .cast()
+                    .map_err(|err| format!("IDXGIResource->ID3D11Texture2D cast failed: {err}"))?;
+
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desc);
+                self.ensure_staging_texture(&desc)?;
+
+                let staging = self
+                    .staging_texture
+                    .as_ref()
+                    .ok_or_else(|| "Staging texture unavailable".to_string())?;
+
+                let source_resource: ID3D11Resource = texture
+                    .cast()
+                    .map_err(|err| format!("Texture->Resource cast failed: {err}"))?;
+                let staging_resource: ID3D11Resource = staging
+                    .cast()
+                    .map_err(|err| format!("Staging->Resource cast failed: {err}"))?;
+
+                let context = self
+                    .context
+                    .as_ref()
+                    .ok_or_else(|| "D3D11 context unavailable".to_string())?;
+                context.CopyResource(&staging_resource, &source_resource);
+
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context
+                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(|err| format!("Map staging texture failed: {err}"))?;
+
+                let width = desc.Width as usize;
+                let height = desc.Height as usize;
+                let row_pitch = mapped.RowPitch as usize;
+                let byte_len = row_pitch.saturating_mul(height);
+                let src = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), byte_len);
+                let row_bytes = width * 4;
+                let total_bytes = row_bytes * height;
+                let bgra = if row_pitch == row_bytes {
+                    src[..total_bytes].to_vec()
+                } else {
+                    let mut buf = Vec::with_capacity(total_bytes);
+                    for y in 0..height {
+                        buf.extend_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
+                    }
+                    buf
+                };
+
+                context.Unmap(staging, 0);
+
+                Ok(Some(DesktopFrame {
+                    width,
+                    height,
+                    stride: width * 4,
+                    captured_at: Instant::now(),
+                    bgra,
+                }))
+            })();
+
+            let _ = duplication.ReleaseFrame();
+            capture_result
+        }
+
+        /// Active le GDI fallback permanent et capture une première frame
+        /// pour ne pas faire perdre un cycle à l'appelant.
+        fn activate_gdi_fallback_and_capture(
+            &mut self,
+        ) -> Result<Option<DesktopFrame>, String> {
+            self.force_gdi = true;
+            // Libère les ressources DXGI qu'on n'utilisera plus.
+            self.duplication = None;
+            self.staging_texture = None;
+            self.capture_via_gdi().map(Some)
+        }
+
+        /// Initialise (lazy) le GdiCapturer puis capture une frame.
+        fn capture_via_gdi(&mut self) -> Result<DesktopFrame, String> {
+            if self.gdi.is_none() {
+                let gdi = GdiCapturer::new()?;
+                tracing::info!(
+                    "🎥 Capture backend: GDI BitBlt fallback ({}x{}) on '{}'",
+                    gdi.width,
+                    gdi.height,
+                    if self.adapter_name.is_empty() { "<unknown adapter>" } else { &self.adapter_name }
+                );
+                self.gdi = Some(gdi);
+            }
+            // unwrap safe : on vient de l'initialiser au-dessus si nécessaire
+            self.gdi
+                .as_mut()
+                .ok_or_else(|| "GDI capturer unavailable".to_string())?
+                .capture_frame()
         }
 
         unsafe fn ensure_staging_texture(
@@ -461,6 +638,245 @@ mod imp {
             self.cached_width = source_desc.Width;
             self.cached_height = source_desc.Height;
             Ok(())
+        }
+    }
+
+    // ─── Détection de frame noire ──────────────────────────────────────
+ 
+    pub(super) fn is_black_frame(bgra: &[u8]) -> bool {
+        if bgra.is_empty() {
+            return true;
+        }
+        let pixel_count = bgra.len() / 4;
+        if pixel_count == 0 {
+            return true;
+        }
+        // Step = pixel_count / 256, mais au moins 1 et au plus pixel_count
+        // pour éviter de tout sauter sur les petites images.
+        let step = (pixel_count / 256).max(1);
+        let mut sample_count = 0usize;
+        for px_index in (0..pixel_count).step_by(step) {
+            let byte_index = px_index * 4;
+            if byte_index + 3 >= bgra.len() {
+                break;
+            }
+            // BGRA : B, G, R, A. Le canal alpha peut être 255 sur certaines
+            // surfaces opaques même si l'image est "noire" — on ignore A.
+            let b = bgra[byte_index];
+            let g = bgra[byte_index + 1];
+            let r = bgra[byte_index + 2];
+            if b != 0 || g != 0 || r != 0 {
+                return false;
+            }
+            sample_count += 1;
+            if sample_count >= 256 {
+                break;
+            }
+        }
+        true
+    }
+
+    // ─── GDI BitBlt capturer ───────────────────────────────────────────
+
+    pub struct GdiCapturer {
+        screen_dc: HDC,
+        mem_dc: HDC,
+        bitmap: HBITMAP,
+        previous_bitmap: HGDIOBJ,
+        /// Origine du virtual screen (peut être négatif sur multi-écran
+        /// quand un moniteur est positionné à gauche/au-dessus du primary).
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+        /// Buffer réutilisé entre frames pour éviter une grosse alloc
+        /// à chaque capture (1920×1080×4 = 8 MB).
+        scratch: Vec<u8>,
+        consecutive_black_frames: u32,
+    }
+
+    impl GdiCapturer {
+        pub fn new() -> Result<Self, String> {
+            unsafe {
+                // ── DPI awareness ──────────────────────────────────────
+                let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+                // ── Choix de la zone capturée ──────────────────────────
+
+                let use_virtual_screen = env::var("LUMIERE_GDI_VIRTUAL_SCREEN")
+                    .map(|v| matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    ))
+                    .unwrap_or(false);
+
+                let (origin_x, origin_y, width, height) = if use_virtual_screen {
+                    let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                    let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                    let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                    (x, y, w, h)
+                } else {
+                    (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+                };
+
+                if width <= 0 || height <= 0 {
+                    return Err(format!(
+                        "GetSystemMetrics returned invalid dimensions: {width}x{height} (virtual={use_virtual_screen})"
+                    ));
+                }
+
+                // GetDC(None) = DC du desktop (couvre tous les moniteurs).
+                let screen_dc = GetDC(HWND::default());
+                if screen_dc.is_invalid() {
+                    return Err("GetDC(desktop) returned invalid HDC".to_string());
+                }
+
+                let mem_dc = CreateCompatibleDC(screen_dc);
+                if mem_dc.is_invalid() {
+                    ReleaseDC(HWND::default(), screen_dc);
+                    return Err("CreateCompatibleDC failed".to_string());
+                }
+
+                let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+                if bitmap.is_invalid() {
+                    let _ = DeleteDC(mem_dc);
+                    ReleaseDC(HWND::default(), screen_dc);
+                    return Err("CreateCompatibleBitmap failed".to_string());
+                }
+
+                let previous_bitmap = SelectObject(mem_dc, bitmap);
+                if previous_bitmap.is_invalid() {
+                    let _ = DeleteObject(bitmap);
+                    let _ = DeleteDC(mem_dc);
+                    ReleaseDC(HWND::default(), screen_dc);
+                    return Err("SelectObject(mem_dc, bitmap) failed".to_string());
+                }
+
+                Ok(Self {
+                    screen_dc,
+                    mem_dc,
+                    bitmap,
+                    previous_bitmap,
+                    origin_x,
+                    origin_y,
+                    width,
+                    height,
+                    scratch: vec![0u8; (width * height * 4) as usize],
+                    consecutive_black_frames: 0,
+                })
+            }
+        }
+
+        pub fn capture_frame(&mut self) -> Result<DesktopFrame, String> {
+            unsafe {
+
+                let rop = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
+                BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    self.screen_dc,
+                    self.origin_x,
+                    self.origin_y,
+                    rop,
+                )
+                .map_err(|err| format!("BitBlt failed: {err}"))?;
+
+                // BITMAPINFOHEADER avec biHeight NÉGATIF = top-down DIB.
+                // Sinon GetDIBits remplit en bottom-up et il faut flipper
+                // les lignes — perte de temps inutile.
+                let mut info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: self.width,
+                        biHeight: -self.height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        biSizeImage: (self.width * self.height * 4) as u32,
+                        biXPelsPerMeter: 0,
+                        biYPelsPerMeter: 0,
+                        biClrUsed: 0,
+                        biClrImportant: 0,
+                    },
+                    bmiColors: [Default::default(); 1],
+                };
+
+                // Resize du scratch buffer si la résolution a changé
+                // (changement de display mode en cours de session).
+                let expected = (self.width * self.height * 4) as usize;
+                if self.scratch.len() != expected {
+                    self.scratch.resize(expected, 0);
+                }
+
+                let rows_copied = GetDIBits(
+                    self.mem_dc,
+                    self.bitmap,
+                    0,
+                    self.height as u32,
+                    Some(self.scratch.as_mut_ptr().cast()),
+                    &mut info,
+                    DIB_RGB_COLORS,
+                );
+                if rows_copied == 0 {
+                    return Err("GetDIBits returned 0 rows".to_string());
+                }
+
+
+                if is_black_frame(&self.scratch) {
+                    self.consecutive_black_frames =
+                        self.consecutive_black_frames.saturating_add(1);
+                    if self.consecutive_black_frames % BLACK_FRAME_THRESHOLD == 0 {
+                        tracing::warn!(
+                            "🎥 GDI BitBlt renvoie une frame noire ({} consécutives) — \
+                             session verrouillée, secure desktop UAC, ou capture bloquée par GPO ?",
+                            self.consecutive_black_frames
+                        );
+                    }
+                } else if self.consecutive_black_frames > 0 {
+                    tracing::info!(
+                        "🎥 GDI BitBlt: récupération après {} frames noires",
+                        self.consecutive_black_frames
+                    );
+                    self.consecutive_black_frames = 0;
+                }
+
+                Ok(DesktopFrame {
+                    width: self.width as usize,
+                    height: self.height as usize,
+                    stride: (self.width * 4) as usize,
+                    captured_at: Instant::now(),
+                    bgra: self.scratch.clone(),
+                })
+            }
+        }
+    }
+
+
+    unsafe impl Send for GdiCapturer {}
+    unsafe impl Sync for GdiCapturer {}
+
+    impl Drop for GdiCapturer {
+        fn drop(&mut self) {
+            unsafe {
+                // Restaure l'ancien bitmap dans le DC mémoire avant de
+                // delete le nôtre (sinon DeleteObject échoue).
+                if !self.previous_bitmap.is_invalid() {
+                    SelectObject(self.mem_dc, self.previous_bitmap);
+                }
+                if !self.bitmap.is_invalid() {
+                    let _ = DeleteObject(self.bitmap);
+                }
+                if !self.mem_dc.is_invalid() {
+                    let _ = DeleteDC(self.mem_dc);
+                }
+                if !self.screen_dc.is_invalid() {
+                    ReleaseDC(HWND::default(), self.screen_dc);
+                }
+            }
         }
     }
 
@@ -531,6 +947,89 @@ mod imp {
                 uv_plane[uv_index] = (((u_acc + 512) >> 10) + 128).clamp(0, 255) as u8;
                 uv_plane[uv_index + 1] = (((v_acc + 512) >> 10) + 128).clamp(0, 255) as u8;
             }
+        }
+    }
+
+    // ─── Tests ────────────────────────────────────────────────────────────
+    #[cfg(test)]
+    mod tests {
+        use super::is_black_frame;
+
+        #[test]
+        fn detects_all_zero_buffer_as_black() {
+            // 4×4 BGRA tout à zéro = noir total.
+            let buf = vec![0u8; 4 * 4 * 4];
+            assert!(is_black_frame(&buf));
+        }
+
+        #[test]
+        fn detects_all_zero_with_alpha_255_as_black() {
+            // Certaines surfaces D3D11 produisent un alpha=255 même quand
+            // RGB est à zéro. On doit quand même classer ça comme noir.
+            let mut buf = vec![0u8; 4 * 4 * 4];
+            for px in buf.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            assert!(is_black_frame(&buf));
+        }
+
+        #[test]
+        fn rejects_single_white_pixel() {
+            // Un seul pixel blanc dans un buffer noir doit suffire à
+            // disqualifier (sinon on raterait des contenus quasi-noirs
+            // mais bien réels — écran de jeu sombre, terminal noir).
+            let mut buf = vec![0u8; 128 * 128 * 4];
+            // Pixel au centre, R=G=B=255
+            let center = (64 * 128 + 64) * 4;
+            buf[center] = 255;
+            buf[center + 1] = 255;
+            buf[center + 2] = 255;
+            // Le sampling pourrait rater ce pixel précis selon le step.
+            // Pour le test on prend une image plus grande dont le step
+            // tombe sur le pixel — donc on met plusieurs pixels blancs
+            // pour garantir qu'au moins un est échantillonné.
+            for i in 0..1024 {
+                let idx = i * 64 * 4;
+                if idx + 2 < buf.len() {
+                    buf[idx + 2] = 200; // R non-zéro
+                }
+            }
+            assert!(!is_black_frame(&buf));
+        }
+
+        #[test]
+        fn rejects_buffer_with_low_intensity_pixels() {
+            // Image très sombre mais pas totalement noire (R=5).
+            let buf = vec![5u8; 64 * 64 * 4];
+            assert!(!is_black_frame(&buf));
+        }
+
+        #[test]
+        fn handles_empty_buffer() {
+            assert!(is_black_frame(&[]));
+        }
+
+        #[test]
+        fn handles_undersized_buffer() {
+            // Moins d'un pixel complet → considéré noir (pas de données utiles).
+            assert!(is_black_frame(&[0u8, 0u8, 0u8]));
+        }
+
+        #[test]
+        fn realistic_1080p_black_frame() {
+            // Buffer Full HD entièrement noir — le cas exact d'Intel UHD.
+            let buf = vec![0u8; 1920 * 1080 * 4];
+            assert!(is_black_frame(&buf));
+        }
+
+        #[test]
+        fn realistic_1080p_with_content() {
+            // Buffer Full HD avec un dégradé → pas noir.
+            let mut buf = vec![0u8; 1920 * 1080 * 4];
+            for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+                px[2] = ((i / 1920) & 0xff) as u8; // R varie par ligne
+            }
+            assert!(!is_black_frame(&buf));
         }
     }
 }

@@ -243,16 +243,34 @@ fn parse_requested_backend(raw: &str) -> Option<VideoEncoderBackend> {
 fn detect_best_backend() -> VideoEncoderBackend {
     #[cfg(windows)]
     {
-        // Production stability-first default on Windows:
-        // Media Foundation can stall on some Intel/driver combinations
-        // (first frame then freeze). Keep it opt-in via env when needed.
+        // Détection Intel UHD bas de gamme.
+        let adapter = detect_primary_adapter_name();
+        if let Some(name) = adapter.as_deref() {
+            if is_low_power_intel_gpu(name) {
+                tracing::info!(
+                    "🎬 Encoder: OpenH264 (software) — adapter '{name}' détecté comme Intel intégré bas de gamme (MediaFoundation H264 instable sur ce GPU)"
+                );
+                return VideoEncoderBackend::OpenH264Software;
+            }
+            tracing::debug!("🎬 Primary adapter: {name}");
+        }
+
+
         if env::var("LUMIERE_ENABLE_MF_AUTO")
             .ok()
             .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
         {
+            tracing::info!(
+                "🎬 Encoder: MediaFoundation H264 (LUMIERE_ENABLE_MF_AUTO=on, adapter '{}')",
+                adapter.as_deref().unwrap_or("<unknown>")
+            );
             return VideoEncoderBackend::MediaFoundationH264;
         }
+        tracing::info!(
+            "🎬 Encoder: OpenH264 (software, default Windows) on adapter '{}'",
+            adapter.as_deref().unwrap_or("<unknown>")
+        );
         return VideoEncoderBackend::OpenH264Software;
     }
 
@@ -265,6 +283,73 @@ fn detect_best_backend() -> VideoEncoderBackend {
     .into_iter()
     .find(|backend| ffmpeg_supports_backend(*backend))
     .unwrap_or(VideoEncoderBackend::OpenH264Software)
+}
+
+
+#[cfg(windows)]
+fn detect_primary_adapter_name() -> Option<String> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+
+    unsafe {
+        let factory: IDXGIFactory1 = match CreateDXGIFactory1() {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!("🎬 DXGI factory unavailable for encoder selection: {err}");
+                return None;
+            }
+        };
+
+        for adapter_index in 0..16u32 {
+            let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let desc = match adapter.GetDesc1() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // Cherche le premier adaptateur ayant au moins un output
+            // attaché au desktop — c'est lui qui pilote l'affichage.
+            let mut has_attached_output = false;
+            for output_index in 0..16u32 {
+                let Ok(output) = adapter.EnumOutputs(output_index) else { break };
+                let Ok(odesc) = output.GetDesc() else { continue };
+                if odesc.AttachedToDesktop.as_bool() {
+                    has_attached_output = true;
+                    break;
+                }
+            }
+            if !has_attached_output {
+                continue;
+            }
+
+            // UTF-16 fixed-array → String (trim sur le premier null).
+            let chars = &desc.Description;
+            let end = chars.iter().position(|c| *c == 0).unwrap_or(chars.len());
+            return Some(String::from_utf16_lossy(&chars[..end]).trim().to_string());
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn detect_primary_adapter_name() -> Option<String> {
+    None
+}
+
+
+pub(super) fn is_low_power_intel_gpu(adapter_name: &str) -> bool {
+    let lower = adapter_name.to_ascii_lowercase();
+    if !lower.contains("intel") {
+        return false;
+    }
+    // Familles intégrées historiquement problématiques pour MF H264 :
+    lower.contains("uhd graphics")
+        || lower.contains("hd graphics")
+        || lower.contains("iris plus")
+        || lower.contains("iris xe graphics")
+        || lower.contains("iris(r) plus")
+        || lower.contains("iris(r) xe graphics")
 }
 
 fn ffmpeg_binary() -> String {
@@ -296,5 +381,125 @@ fn ffmpeg_backend_args(backend: VideoEncoderBackend) -> &'static [&'static str] 
         VideoEncoderBackend::FfmpegQsv => &["-preset", "veryfast"],
         VideoEncoderBackend::FfmpegAmf => &["-usage", "ultralowlatency", "-quality", "speed"],
         VideoEncoderBackend::OpenH264Software => &[],
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_low_power_intel_gpu ──────────────────────────────────────────────
+
+    #[test]
+    fn detects_intel_uhd_730() {
+        assert!(is_low_power_intel_gpu("Intel(R) UHD Graphics 730"));
+    }
+
+    #[test]
+    fn detects_intel_uhd_770() {
+        assert!(is_low_power_intel_gpu("Intel(R) UHD Graphics 770"));
+    }
+
+    #[test]
+    fn detects_intel_hd_graphics_legacy() {
+        assert!(is_low_power_intel_gpu("Intel(R) HD Graphics 620"));
+        assert!(is_low_power_intel_gpu("Intel(R) HD Graphics 530"));
+    }
+
+    #[test]
+    fn detects_iris_xe_integrated() {
+        assert!(is_low_power_intel_gpu("Intel(R) Iris(R) Xe Graphics"));
+        assert!(is_low_power_intel_gpu("Intel Iris Xe Graphics"));
+    }
+
+    #[test]
+    fn detects_iris_plus() {
+        assert!(is_low_power_intel_gpu("Intel(R) Iris(R) Plus Graphics"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(is_low_power_intel_gpu("INTEL(R) UHD GRAPHICS 730"));
+        assert!(is_low_power_intel_gpu("intel uhd graphics 730"));
+    }
+
+    // ── Cas négatifs : ne PAS classer comme bas de gamme ────────────────────
+
+    #[test]
+    fn does_not_match_nvidia() {
+        assert!(!is_low_power_intel_gpu("NVIDIA GeForce GTX 1650"));
+        assert!(!is_low_power_intel_gpu("NVIDIA GeForce RTX 4090"));
+    }
+
+    #[test]
+    fn does_not_match_amd() {
+        assert!(!is_low_power_intel_gpu("AMD Radeon RX 6800"));
+        assert!(!is_low_power_intel_gpu("Radeon(TM) Graphics"));
+    }
+
+    #[test]
+    fn does_not_match_intel_arc_discrete() {
+        // Arc A-Series = discret, MF H264 fiable → ne pas dégrader.
+        assert!(!is_low_power_intel_gpu("Intel(R) Arc(TM) A770 Graphics"));
+        assert!(!is_low_power_intel_gpu("Intel Arc A750"));
+    }
+
+    #[test]
+    fn does_not_match_empty_or_unknown() {
+        assert!(!is_low_power_intel_gpu(""));
+        assert!(!is_low_power_intel_gpu("Unknown GPU"));
+    }
+
+    // ── Backend label / preset cohérence ─────────────────────────────────────
+
+    #[test]
+    fn open_h264_has_software_label() {
+        assert!(VideoEncoderBackend::OpenH264Software.label().contains("software"));
+    }
+
+    #[test]
+    fn open_h264_preset_is_modest() {
+        // Sur GPU intégré on s'attend à un preset modéré.
+        let preset = VideoEncoderBackend::OpenH264Software.default_preset();
+        assert!(preset.target_fps <= 30);
+        assert!(preset.bitrate_bps <= 5_000_000);
+    }
+
+    #[test]
+    fn ffmpeg_encoder_name_is_set_for_hardware_backends() {
+        assert_eq!(VideoEncoderBackend::FfmpegNvenc.ffmpeg_encoder_name(), Some("h264_nvenc"));
+        assert_eq!(VideoEncoderBackend::FfmpegQsv.ffmpeg_encoder_name(), Some("h264_qsv"));
+        assert_eq!(VideoEncoderBackend::FfmpegAmf.ffmpeg_encoder_name(), Some("h264_amf"));
+    }
+
+    #[test]
+    fn ffmpeg_encoder_name_is_none_for_native_backends() {
+        assert_eq!(VideoEncoderBackend::MediaFoundationH264.ffmpeg_encoder_name(), None);
+        assert_eq!(VideoEncoderBackend::OpenH264Software.ffmpeg_encoder_name(), None);
+    }
+
+    // ── parse_requested_backend ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_backend_handles_aliases() {
+        assert_eq!(parse_requested_backend("mf"), Some(VideoEncoderBackend::MediaFoundationH264));
+        assert_eq!(parse_requested_backend("MediaFoundation"), Some(VideoEncoderBackend::MediaFoundationH264));
+        assert_eq!(parse_requested_backend("nvenc"), Some(VideoEncoderBackend::FfmpegNvenc));
+        assert_eq!(parse_requested_backend("openh264"), Some(VideoEncoderBackend::OpenH264Software));
+        assert_eq!(parse_requested_backend("software"), Some(VideoEncoderBackend::OpenH264Software));
+    }
+
+    #[test]
+    fn parse_backend_auto_means_unspecified() {
+        assert_eq!(parse_requested_backend("auto"), None);
+        assert_eq!(parse_requested_backend("AUTO"), None);
+    }
+
+    #[test]
+    fn parse_backend_unknown_returns_none() {
+        assert_eq!(parse_requested_backend("hevc"), None);
+        assert_eq!(parse_requested_backend(""), None);
     }
 }
