@@ -78,6 +78,33 @@ pub(super) fn video_debug_enabled() -> bool {
     env_flag_true("LUMIERE_VIDEO_DEBUG")
 }
 
+pub(super) fn parse_candidate_type(candidate: &str) -> &'static str {
+    let needle = " typ ";
+    let Some(idx) = candidate.find(needle) else {
+        return "unknown";
+    };
+    let rest = &candidate[idx + needle.len()..];
+    let end = rest.find(' ').unwrap_or(rest.len());
+    match rest[..end].trim() {
+        "host" => "host",
+        "srflx" => "srflx",
+        "relay" => "relay",
+        "prflx" => "prflx",
+        _ => "unknown",
+    }
+}
+
+pub(super) fn parse_candidate_address(candidate: &str) -> Option<(String, u16)> {
+    let mut parts = candidate.split_whitespace();
+    let _foundation = parts.next()?;
+    let _component = parts.next()?;
+    let _protocol = parts.next()?;
+    let _priority = parts.next()?;
+    let ip = parts.next()?.to_string();
+    let port = parts.next()?.parse::<u16>().ok()?;
+    Some((ip, port))
+}
+
 pub(super) fn derive_stream_ssrc() -> u32 {
     let pid = std::process::id() as u64;
     let now = SystemTime::now()
@@ -131,9 +158,6 @@ impl AgentWebRtc {
             .build();
 
         let ice_servers = resolve_ice_servers_for_peer().await;
-        // Default = All (host + srflx + relay). Setting LUMIERE_FORCE_RELAY=1
-        // forces relay-only on the agent. webrtc-rs 0.11 has known issues with
-        // TURN allocation on some setups, so default is safe.
         let policy = if std::env::var("LUMIERE_FORCE_RELAY")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false)
@@ -142,7 +166,31 @@ impl AgentWebRtc {
         } else {
             RTCIceTransportPolicy::All
         };
-        tracing::info!("🧊 [ICE] Agent ICE transport policy: {:?}", policy);
+        let has_stun = ice_servers
+            .iter()
+            .any(|s| s.urls.iter().any(|u| u.starts_with("stun:")));
+        let has_turn = ice_servers
+            .iter()
+            .any(|s| s.urls.iter().any(|u| u.starts_with("turn:") || u.starts_with("turns:")));
+        tracing::info!(
+            "🧊 [ICE] Agent transport policy: {:?} | servers count={} stun={} turn={}",
+            policy,
+            ice_servers.len(),
+            has_stun,
+            has_turn
+        );
+        if !has_stun {
+            tracing::warn!(
+                "🧊 [ICE] Aucun serveur STUN configuré — les candidats srflx ne seront pas découverts. \
+                 Le LAN direct (host) peut quand même fonctionner mais le P2P inter-NAT échouera."
+            );
+        }
+        if policy == RTCIceTransportPolicy::Relay {
+            tracing::warn!(
+                "🧊 [ICE] LUMIERE_FORCE_RELAY=1 → seuls les candidats relay TURN seront tentés. \
+                 Le LAN direct est désactivé."
+            );
+        }
         let config = RTCConfiguration {
             ice_servers,
             ice_transport_policy: policy,
@@ -165,6 +213,13 @@ impl AgentWebRtc {
 
                 match candidate.to_json() {
                     Ok(init) => {
+                        let cand_type = parse_candidate_type(&init.candidate);
+                        let addr = parse_candidate_address(&init.candidate)
+                            .map(|(ip, port)| format!("{ip}:{port}"))
+                            .unwrap_or_else(|| "?".to_string());
+                        tracing::info!(
+                            "🧊 [ICE] agent → viewer  type={cand_type:<5} addr={addr}"
+                        );
                         let sdp_mid = init.sdp_mid.filter(|mid| !mid.is_empty());
                         let payload = serde_json::json!({
                             "candidate": init.candidate,
@@ -704,3 +759,55 @@ impl AgentWebRtc {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_candidate() {
+        let line = "candidate:1 1 udp 2113937151 192.168.1.42 51234 typ host generation 0";
+        assert_eq!(parse_candidate_type(line), "host");
+        assert_eq!(
+            parse_candidate_address(line),
+            Some(("192.168.1.42".to_string(), 51234))
+        );
+    }
+
+    #[test]
+    fn parse_srflx_candidate() {
+        let line = "candidate:2 1 udp 1677729535 80.50.10.5 41320 typ srflx raddr 192.168.1.42 rport 51234";
+        assert_eq!(parse_candidate_type(line), "srflx");
+        assert_eq!(parse_candidate_address(line).map(|p| p.0), Some("80.50.10.5".to_string()));
+    }
+
+    #[test]
+    fn parse_relay_candidate() {
+        let line = "candidate:3 1 udp 41819647 51.158.40.10 32000 typ relay raddr 0.0.0.0 rport 0";
+        assert_eq!(parse_candidate_type(line), "relay");
+    }
+
+    #[test]
+    fn parse_prflx_candidate() {
+        let line = "candidate:4 1 udp 1845501695 1.2.3.4 5678 typ prflx";
+        assert_eq!(parse_candidate_type(line), "prflx");
+    }
+
+    #[test]
+    fn parse_unknown_when_missing_typ() {
+        assert_eq!(parse_candidate_type("garbage"), "unknown");
+        assert_eq!(parse_candidate_type(""), "unknown");
+    }
+
+    #[test]
+    fn parse_ipv6_host_candidate() {
+        let line = "candidate:1 1 udp 2113937151 fe80::1 51234 typ host generation 0";
+        assert_eq!(parse_candidate_type(line), "host");
+        assert_eq!(parse_candidate_address(line).map(|p| p.0), Some("fe80::1".to_string()));
+    }
+
+    #[test]
+    fn parse_address_returns_none_on_malformed() {
+        assert!(parse_candidate_address("only one field").is_none());
+        assert!(parse_candidate_address("a b c d e not-a-port").is_none());
+    }
+}

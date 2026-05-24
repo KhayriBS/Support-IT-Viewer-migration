@@ -30,6 +30,14 @@ import {
   type InboundRtpVideoLike,
   type InboundStatsCounters,
 } from "./viewer-stats";
+import {
+  formatTransportSummary,
+  parseCandidateAddress,
+  parseCandidatePort,
+  parseCandidateType,
+  readSelectedCandidatePair,
+  type IceCandidateType,
+} from "./viewer-ice-diag";
 
 class ViewerPeer {
   // Reactive UI state
@@ -61,6 +69,10 @@ class ViewerPeer {
   viewerBitrateTier = $state<ViewerBitrateTier>("auto");
   viewerPreset = $state<ViewerPreset>("balanced");
   screenFrameError = $state<string | null>(null);
+  viewerCandidatePairType = $state<"host" | "srflx" | "relay" | "prflx" | "unknown" | null>(null);
+  viewerLocalCandidateAddress = $state<string | null>(null);
+  viewerRemoteCandidateAddress = $state<string | null>(null);
+  viewerTransportSummary = $state<string | null>(null);
 
   // Non-reactive internals
   viewerPeerConnection: RTCPeerConnection | null = null;
@@ -168,6 +180,54 @@ class ViewerPeer {
     if (this.inboundStatsTimer) {
       clearInterval(this.inboundStatsTimer);
       this.inboundStatsTimer = null;
+    }
+  };
+
+  diagnoseLanConnectivity = async (
+    pc?: RTCPeerConnection | null,
+  ): Promise<string | null> => {
+    const target = pc ?? this.viewerPeerConnection;
+    if (!target) {
+      this.viewerCandidatePairType = null;
+      this.viewerLocalCandidateAddress = null;
+      this.viewerRemoteCandidateAddress = null;
+      this.viewerTransportSummary = null;
+      return null;
+    }
+    try {
+      const pair = await readSelectedCandidatePair(target);
+      if (!pair) {
+        this.viewerCandidatePairType = null;
+        this.viewerLocalCandidateAddress = null;
+        this.viewerRemoteCandidateAddress = null;
+        this.viewerTransportSummary = "Aucune paire ICE nominée";
+        return this.viewerTransportSummary;
+      }
+      const localStr = pair.local.address && pair.local.port
+        ? `${pair.local.address}:${pair.local.port}`
+        : pair.local.address;
+      const remoteStr = pair.remote.address && pair.remote.port
+        ? `${pair.remote.address}:${pair.remote.port}`
+        : pair.remote.address;
+      this.viewerCandidatePairType = pair.pairType as IceCandidateType;
+      this.viewerLocalCandidateAddress = localStr;
+      this.viewerRemoteCandidateAddress = remoteStr;
+      this.viewerTransportSummary = formatTransportSummary(pair);
+      console.info(
+        `🧊 [ICE] selected pair type=${pair.pairType}  local=${localStr ?? "?"}  remote=${remoteStr ?? "?"}  → ${this.viewerTransportSummary}`,
+      );
+      if (pair.pairType === "relay") {
+        console.warn(
+          "🧊 [ICE] Le flux passe par TURN relay alors qu'un LAN direct était espéré. " +
+            "Causes fréquentes : firewall qui filtre UDP entre les deux postes, " +
+            "isolation client/AP (Wi-Fi guest), ou iceTransportPolicy='relay' côté config.",
+        );
+      }
+      return this.viewerTransportSummary;
+    } catch (err) {
+      console.warn("🧊 [ICE] diagnoseLanConnectivity failed", err);
+      this.viewerTransportSummary = `Diagnostic ICE échec : ${String(err)}`;
+      return this.viewerTransportSummary;
     }
   };
 
@@ -1018,6 +1078,7 @@ class ViewerPeer {
         this.maybeAutoUpgradeViewerProfile();
         this.startInboundStatsLogger(pc);
         this.stopIceRestartTimer();
+        void this.diagnoseLanConnectivity(pc);
       } else if (pc.connectionState === "failed") {
         this.screenFrameError = "La connexion WebRTC a echoue.";
         this.stopInboundStatsLogger();
@@ -1066,12 +1127,19 @@ class ViewerPeer {
         return;
       }
 
+      const candStr = event.candidate.candidate;
+      const cType = event.candidate.type ?? parseCandidateType(candStr);
+      const cAddr = event.candidate.address
+        ?? event.candidate.relatedAddress
+        ?? parseCandidateAddress(candStr);
+      const cPort = event.candidate.port ?? parseCandidatePort(candStr);
+
       const iceMessage: SignalMessage = {
         type: "ICE",
         to: "agent",
         sessionId,
         payload: {
-          candidate: event.candidate.candidate,
+          candidate: candStr,
           sdpMid: event.candidate.sdpMid,
           sdpMLineIndex: event.candidate.sdpMLineIndex
         }
@@ -1079,18 +1147,13 @@ class ViewerPeer {
 
       if (!signalBus.signalingConnected) {
         signalBus.bufferedLocalIceCandidates.push(iceMessage);
-        diag("ICE viewer: BUFFERED (signaling closed)", {
-          type: event.candidate.type,
-          candidate: event.candidate.candidate.slice(0, 80),
-          bufferSize: signalBus.bufferedLocalIceCandidates.length
-        });
+        console.info(
+          `🧊 [ICE] viewer (buffered, signaling closed)  type=${cType} addr=${cAddr}:${cPort}`
+        );
         return;
       }
 
-      diag("ICE viewer -> agent", {
-        type: event.candidate.type,
-        candidate: event.candidate.candidate.slice(0, 80)
-      });
+      console.info(`🧊 [ICE] viewer → agent  type=${cType} addr=${cAddr}:${cPort}`);
 
       try {
         signalBus.client.send(iceMessage, "viewer");
@@ -1211,6 +1274,10 @@ class ViewerPeer {
     this.viewerRemoteStream = null;
 
     this.screenFrameError = null;
+    this.viewerCandidatePairType = null;
+    this.viewerLocalCandidateAddress = null;
+    this.viewerRemoteCandidateAddress = null;
+    this.viewerTransportSummary = null;
   };
 
   // ── Inbound signal dispatch ─────────────────────────────────────────────
