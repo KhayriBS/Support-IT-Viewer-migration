@@ -36,6 +36,7 @@
   import RdFilesPanel from "$lib/components/RdFilesPanel.svelte";
   import RdChatPanel from "$lib/components/RdChatPanel.svelte";
   import RdScreenPanel from "$lib/components/RdScreenPanel.svelte";
+  import PrivacyControl from "$lib/components/PrivacyControl.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
   import { approvalManager, type ApprovalDecision } from "$lib/managers/approval-manager.svelte";
   import { historyManager } from "$lib/managers/history-manager.svelte";
@@ -931,6 +932,9 @@
 
     <!-- ── Sous-panneau "Écran" : vidéo + Play/Pause ──────────────── -->
     {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && sessionManager.selectedFeature === "screen"}
+      <div class="rd-privacy-row">
+        <PrivacyControl />
+      </div>
       <RdScreenPanel
         session={sessionManager.activeSession}
         actionLoading={sessionManager.actionLoading}

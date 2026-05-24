@@ -74,6 +74,15 @@ class ViewerPeer {
   viewerRemoteCandidateAddress = $state<string | null>(null);
   viewerTransportSummary = $state<string | null>(null);
 
+  // Privacy filter — agent-side blur of password fields. `true` = blur ON.
+  // Default-on; the technician must explicitly disable to view passwords.
+  // The `privacy` RTCDataChannel is created alongside `input` / `file`;
+  // its handle stays on the manager so PrivacyControl.svelte can flip
+  // the toggle without traversing the component tree.
+  viewerPrivacyBlurEnabled = $state<boolean>(true);
+  viewerPrivacyChannelOpen = $state<boolean>(false);
+  viewerPrivacyChannel: RTCDataChannel | null = null;
+
   // Non-reactive internals
   viewerPeerConnection: RTCPeerConnection | null = null;
   viewerControlChannel: RTCDataChannel | null = null;
@@ -779,6 +788,56 @@ class ViewerPeer {
     };
   };
 
+  // ── DataChannel "privacy" wiring ────────────────────────────────────────
+  // The viewer is the only side allowed to flip the blur. We keep the
+  // last known intent (default: blur ON) and replay it on channel open
+  // so a momentary signaling glitch can't leave the agent un-blurred.
+  configurePrivacyDataChannel = (channel: RTCDataChannel) => {
+    this.viewerPrivacyChannel = channel;
+    this.viewerPrivacyChannelOpen = channel.readyState === "open";
+
+    channel.onopen = () => {
+      this.viewerPrivacyChannel = channel;
+      this.viewerPrivacyChannelOpen = true;
+      // Replay current intent so the agent and viewer agree from the
+      // first frame — even if the technician had toggled OFF before
+      // the channel finished opening.
+      this.sendPrivacyBlurState(this.viewerPrivacyBlurEnabled);
+    };
+
+    channel.onclose = () => {
+      if (this.viewerPrivacyChannel === channel) {
+        this.viewerPrivacyChannelOpen = false;
+      }
+    };
+
+    channel.onerror = () => {
+      if (this.viewerPrivacyChannel === channel) {
+        this.viewerPrivacyChannelOpen = false;
+      }
+    };
+  };
+
+  /** Push the current blur intent to the agent. Returns true if sent. */
+  sendPrivacyBlurState = (enabled: boolean): boolean => {
+    const channel = this.viewerPrivacyChannel;
+    if (!channel || channel.readyState !== "open") {
+      return false;
+    }
+    try {
+      channel.send(JSON.stringify({ action: "set_blur", enabled }));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** Toggle (or explicitly set) the password blur. Updates UI state too. */
+  setPrivacyBlurEnabled = (enabled: boolean): void => {
+    this.viewerPrivacyBlurEnabled = enabled;
+    this.sendPrivacyBlurState(enabled);
+  };
+
   // ── Input gates / send ──────────────────────────────────────────────────
   canSendViewerInput = (): boolean => {
     const current = this.getSession();
@@ -1040,6 +1099,12 @@ class ViewerPeer {
 
     const fileChannelInstance = pc.createDataChannel("file", { ordered: true });
     this.configureFileDataChannel(fileChannelInstance);
+
+    // Privacy control channel — JSON-only, low traffic, ordered.
+    // Carries `{ action: "set_blur", enabled: bool }` to toggle the
+    // agent-side password blur. See PrivacyControl.svelte for the UI.
+    const privacyChannel = pc.createDataChannel("privacy", { ordered: true });
+    this.configurePrivacyDataChannel(privacyChannel);
 
     pc.addTransceiver("video", { direction: "recvonly" });
 

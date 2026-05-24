@@ -16,3 +16,4 @@ pub mod video_encoder;
 pub mod desktop_duplication;
 pub mod media_foundation_encoder;
 pub mod ai_executor;
+pub mod privacy_filter;

@@ -9,6 +9,7 @@ use tokio::sync::{watch, Mutex};
 
 
 use super::input_handler::InputHandler;
+use super::privacy_filter::PrivacyFilter;
 use super::signaling::SignalingClient;
 use super::video_encoder::{
     VideoEncoderBackend, VideoEncoderSelection,
@@ -130,6 +131,12 @@ pub struct AgentWebRtc {
     /// FFmpeg) court-circuitent toute production de frame — bande passante
     /// vidéo nulle, le DataChannel SCTP a la pipe pour lui seul.
     frame_emission_paused: Arc<AtomicBool>,
+    /// Shared privacy filter — toggled by the viewer via the `privacy`
+    /// DataChannel, consumed by the capture loop in `stream_senders.rs`.
+    /// Wrapped in `std::sync::Mutex` (not tokio's) because the lock is
+    /// held only briefly inside the synchronous capture path; we never
+    /// `.await` while holding it.
+    privacy_filter: Arc<std::sync::Mutex<PrivacyFilter>>,
     pending_remote_ice: Mutex<Vec<RTCIceCandidateInit>>,
 }
 
@@ -250,10 +257,18 @@ impl AgentWebRtc {
         // muet permanent même si le premier message se perd.
         let frame_emission_paused = Arc::new(AtomicBool::new(true));
         let frame_emission_paused_for_channel = Arc::clone(&frame_emission_paused);
+
+        // Privacy by default — only the technician can lift it, via an
+        // explicit click on the "Masquer mots de passe" toggle in the
+        // viewer that pushes a JSON message on the `privacy` DataChannel.
+        let privacy_filter = Arc::new(std::sync::Mutex::new(PrivacyFilter::new()));
+        let privacy_filter_for_channel = Arc::clone(&privacy_filter);
+
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_handler = Arc::clone(&input_handler);
             let activity_for_channel = Arc::clone(&activity_for_channel);
             let frame_emission_paused = Arc::clone(&frame_emission_paused_for_channel);
+            let privacy_filter = Arc::clone(&privacy_filter_for_channel);
             Box::pin(async move {
                 let label = channel.label().to_string();
                 tracing::info!("DataChannel recu: {label}");
@@ -421,6 +436,54 @@ impl AgentWebRtc {
                     }));
                 } else if label == "file" {
                     setup_file_channel(channel, allow_file_transfer).await;
+                } else if label == "privacy" {
+                    // Privacy control channel: viewer toggles password
+                    // blur via JSON `{ "action": "set_blur", "enabled": bool }`.
+                    // The agent's filter stays the source of truth — we
+                    // never trust an absent message (privacy by default).
+                    let privacy_filter = Arc::clone(&privacy_filter);
+                    let msg_label = label.clone();
+                    channel.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let privacy_filter = Arc::clone(&privacy_filter);
+                        let msg_label = msg_label.clone();
+                        Box::pin(async move {
+                            if !msg.is_string {
+                                return;
+                            }
+                            let Ok(text) = String::from_utf8(msg.data.to_vec()) else {
+                                tracing::warn!("Privacy message invalide sur {msg_label}");
+                                return;
+                            };
+                            let Ok(value) =
+                                serde_json::from_str::<serde_json::Value>(&text)
+                            else {
+                                tracing::warn!("Privacy JSON invalide: {text}");
+                                return;
+                            };
+                            let action = value
+                                .get("action")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            match action {
+                                "set_blur" => {
+                                    let enabled = value
+                                        .get("enabled")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(true);
+                                    if let Ok(mut guard) = privacy_filter.lock() {
+                                        guard.enabled = enabled;
+                                        tracing::info!(
+                                            "🔒 Privacy filter {} (viewer request)",
+                                            if enabled { "ENABLED" } else { "DISABLED" }
+                                        );
+                                    }
+                                }
+                                other => {
+                                    tracing::warn!("Privacy action inconnue: {other}");
+                                }
+                            }
+                        })
+                    }));
                 }
             })
         }));
@@ -491,6 +554,7 @@ impl AgentWebRtc {
             fps_tier_override_tx,
             activity_state,
             frame_emission_paused,
+            privacy_filter,
             pending_remote_ice: Mutex::new(Vec::new()),
         })
     }
@@ -654,6 +718,7 @@ impl AgentWebRtc {
         let fps_tier_override_rx = self.fps_tier_override_tx.subscribe();
         let activity_state = Arc::clone(&self.activity_state);
         let frame_emission_paused = Arc::clone(&self.frame_emission_paused);
+        let privacy_filter = Arc::clone(&self.privacy_filter);
 
         tokio::spawn(async move {
             let selection = VideoEncoderSelection::resolve();
@@ -678,6 +743,7 @@ impl AgentWebRtc {
                 fps_tier_override_rx: fps_tier_override_rx.clone(),
                 activity_state: Arc::clone(&activity_state),
                 frame_emission_paused: Arc::clone(&frame_emission_paused),
+                privacy_filter: Some(Arc::clone(&privacy_filter)),
             };
 
             let result = match selection.backend {

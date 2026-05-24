@@ -44,6 +44,7 @@ use super::h264_helpers::{
     split_annexb_nalus, summarize_nalus, NalSummary,
 };
 use super::media_foundation_encoder::MediaFoundationEncoderWorker;
+use super::privacy_filter::PrivacyFilter;
 use super::signaling::SignalingClient;
 use super::video_encoder::{FfmpegRtpBridge, VideoEncoderBackend, VideoEncoderPreset};
 use super::webrtc::derive_stream_ssrc;
@@ -81,6 +82,11 @@ pub(super) struct ScreenSenderArgs<'a> {
     pub fps_tier_override_rx: watch::Receiver<Option<FpsTier>>,
     pub activity_state: Arc<StreamingActivityState>,
     pub frame_emission_paused: Arc<AtomicBool>,
+    /// Shared privacy filter. When `Some`, every captured BGRA frame is
+    /// passed through `PrivacyFilter::process_frame` *before* H.264
+    /// encoding, so blurred regions never leave the agent over the wire.
+    /// `None` disables the feature entirely (no allocation, no overhead).
+    pub privacy_filter: Option<Arc<std::sync::Mutex<PrivacyFilter>>>,
 }
 
 /// Mutable RTP emission context — borrowed by [`emit_nal_as_rtp`] across the
@@ -338,6 +344,7 @@ pub(super) async fn run_openh264_screen_sender(
         mut fps_tier_override_rx,
         activity_state,
         frame_emission_paused,
+        privacy_filter,
     } = args;
     let SenderInitState {
         initial_config,
@@ -364,6 +371,7 @@ pub(super) async fn run_openh264_screen_sender(
     let capture_track = Arc::clone(track);
     let capture_cfg_rx = adaptive_rx.clone();
     let capture_paused = Arc::clone(&frame_emission_paused);
+    let capture_privacy_filter = privacy_filter.clone();
     let capture_task = tokio::spawn(async move {
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
@@ -408,7 +416,15 @@ pub(super) async fn run_openh264_screen_sender(
                 &mut *capturer,
                 scale_target,
             ) {
-                Ok(Some((w, h, frame))) => {
+                Ok(Some((w, h, mut frame))) => {
+                    // Privacy blur — applied *before* H.264 encoding so
+                    // password regions never reach the wire. No-op when
+                    // the filter is disabled (technician toggled OFF).
+                    if let Some(ref filter) = capture_privacy_filter {
+                        if let Ok(mut guard) = filter.lock() {
+                            guard.process_frame(&mut frame, w as u32, h as u32);
+                        }
+                    }
                     let arc = Arc::new(frame);
                     last_capture = Some((w, h, Arc::clone(&arc)));
                     (w, h, arc)
@@ -788,6 +804,7 @@ pub(super) async fn run_media_foundation_screen_sender(
         mut fps_tier_override_rx,
         activity_state,
         frame_emission_paused,
+        privacy_filter,
     } = args;
     let SenderInitState {
         initial_config,
@@ -813,6 +830,7 @@ pub(super) async fn run_media_foundation_screen_sender(
     let capture_track = Arc::clone(track);
     let capture_cfg_rx = adaptive_rx.clone();
     let capture_paused = Arc::clone(&frame_emission_paused);
+    let capture_privacy_filter = privacy_filter.clone();
     let capture_task = tokio::spawn(async move {
         #[cfg(windows)]
         let _timer_resolution_guard = WindowsTimerResolutionGuard::new(1);
@@ -856,7 +874,13 @@ pub(super) async fn run_media_foundation_screen_sender(
                 &mut *capturer,
                 scale_target,
             ) {
-                Ok(Some((w, h, frame))) => {
+                Ok(Some((w, h, mut frame))) => {
+                    // Privacy blur — applied before NV12 conversion / MF encode.
+                    if let Some(ref filter) = capture_privacy_filter {
+                        if let Ok(mut guard) = filter.lock() {
+                            guard.process_frame(&mut frame, w as u32, h as u32);
+                        }
+                    }
                     let arc = Arc::new(frame);
                     last_capture = Some((w, h, Arc::clone(&arc)));
                     (w, h, arc)

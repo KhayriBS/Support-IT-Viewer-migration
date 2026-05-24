@@ -85,6 +85,10 @@ windows = { version = "0.58", features = [
     # user32 — mouse_event, SetCursorPos, keybd_event, VkKeyScan
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # UI Automation — used by privacy_filter.rs to enumerate password
+    # fields (IUIAutomation, FindAll, BoundingRectangle). Requires
+    # Win32_System_Com + Win32_System_Variant (already present below).
+    "Win32_UI_Accessibility",
     # HiDPI : SetThreadDpiAwarenessContext pour que GDI BitBlt capture la
     # totalité de l'écran sur les displays scalés (4K @ 200%, etc.).
     "Win32_UI_HiDpi",
