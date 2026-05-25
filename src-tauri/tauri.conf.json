@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "lumiere-tech-it",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Lumiere Agent",
+        "width": 420,
+        "height": 600,
+        "resizable": false,
+        "visible": false,
+        "decorations": true,
+        "skipTaskbar": false
       }
     ],
     "security": {

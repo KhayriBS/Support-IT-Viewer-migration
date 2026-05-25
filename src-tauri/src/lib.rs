@@ -5,10 +5,14 @@
 // or the Angular viewer services.
 
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 
 pub mod agent;
 
+use agent::autostart::{
+    disable_autostart, enable_autostart, is_autostart_enabled,
+};
 use agent::metrics::{AgentMetrics, MetricsCollector};
 use agent::webrtc::IceServerConfig;
 use agent::session::{
@@ -17,6 +21,7 @@ use agent::session::{
 };
 use agent::file_transfer::FileListResponse;
 use agent::auth::PendingSession;
+use agent::tray::{build_tray, show_and_focus};
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
@@ -143,6 +148,80 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+// ─── Autostart commands ───────────────────────────────────────────────────────
+
+/// Returns `true` when HKCU\…\Run\LumiereAgent is set.
+/// Called from Svelte: `invoke("get_autostart_status")`
+#[tauri::command]
+fn get_autostart_status() -> bool {
+    is_autostart_enabled()
+}
+
+/// Enables / disables Windows autostart by writing the registry directly.
+/// Called from Svelte: `invoke("set_autostart", { enabled: true })`
+#[tauri::command]
+fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<(), String> {
+    if enabled {
+        enable_autostart()?;
+    } else {
+        disable_autostart()?;
+    }
+    // Keep the tray checkbox in sync with the new registry state — the
+    // user might toggle from the UI while the menu is closed.
+    if let Some(handles) =
+        app.try_state::<agent::tray::TrayHandles<tauri::Wry>>()
+    {
+        if let Ok(item) = handles.autostart_item.lock() {
+            let _ = item.set_checked(enabled);
+        }
+    }
+    Ok(())
+}
+
+/// Brings the main window to the foreground. Used by the frontend when
+/// a pending session approval arrives while the window is hidden in the
+/// tray — without this, the approval modal renders but stays invisible
+/// and the technician can't connect.
+///
+/// Idempotent: if the window is already visible, just refocuses it.
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    show_and_focus(&window).map_err(|e| format!("show_and_focus failed: {e}"))?;
+    // Set always-on-top briefly so the modal grabs attention even if
+    // the user is on another desktop / fullscreen app — then we drop
+    // it so we don't permanently steal focus from other windows.
+    let _ = window.set_always_on_top(true);
+    let win_clone = window.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let _ = win_clone.set_always_on_top(false);
+    });
+    Ok(())
+}
+
+/// Returns a short human-readable label for the current agent state.
+/// Used by the AgentStatus.svelte card *and* by the tray "status" row.
+#[tauri::command]
+async fn get_agent_status_label(state: State<'_, AppState>) -> Result<String, String> {
+    let s = state.agent.status.lock().await;
+    let label = if s.in_session {
+        match &s.technician {
+            Some(name) if !name.is_empty() => format!("Session en cours avec {name}"),
+            _ => "Session en cours".to_string(),
+        }
+    } else if s.authenticated {
+        "Agent actif — En attente".to_string()
+    } else if s.running {
+        "Connexion au serveur…".to_string()
+    } else {
+        "Hors ligne".to_string()
+    };
+    Ok(label)
+}
+
 // ─── Tauri setup ──────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -164,6 +243,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             agent: shared_state,
             metrics,
@@ -175,6 +255,7 @@ pub fn run() {
             start_agent_cmd,
             stop_agent_cmd,
             get_agent_status,
+            get_agent_status_label,
             // session
             join_session_cmd,
             leave_session_cmd,
@@ -184,9 +265,91 @@ pub fn run() {
             get_file_list_cmd,
             // webrtc
             get_ice_servers_cmd,
+            // autostart
+            get_autostart_status,
+            set_autostart,
+            // window control
+            show_main_window,
             // legacy
             greet,
         ])
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            // ── Inject AppHandle into SharedState ────────────────────
+            // Lets the agent loop (session.rs) update the tray and
+            // post Windows notifications without a circular dep
+            // back to Tauri internals.
+            {
+                let state: tauri::State<'_, AppState> = app.state();
+                let agent = Arc::clone(&state.agent);
+                let handle_for_state = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    *agent.app_handle.lock().await = Some(handle_for_state);
+                });
+            }
+
+            // ── Tray icon + menu ─────────────────────────────────────
+            // Built before we touch the window so the icon is ready
+            // by the time we hide/show.
+            if let Err(err) = build_tray(&handle) {
+                tracing::warn!("Tray init failed (continuing anyway): {err}");
+            }
+
+            // ── --minimized boot flag ────────────────────────────────
+            // Set by the Run-key command line on Windows login. When
+            // present we leave the window hidden — only the tray icon
+            // is visible, matching AnyDesk / Chrome Remote Desktop.
+            let args: Vec<String> = std::env::args().collect();
+            let minimized = args
+                .iter()
+                .any(|a| a == agent::autostart::AUTOSTART_FLAG);
+
+            if let Some(window) = app.get_webview_window("main") {
+                if minimized {
+                    let _ = window.hide();
+                    tracing::info!(
+                        "🕶  Agent demarre en arriere-plan (flag {} present)",
+                        agent::autostart::AUTOSTART_FLAG
+                    );
+                } else {
+                    let _ = show_and_focus(&window);
+
+                    // First-launch nudge: if autostart is OFF, prompt
+                    // the user to enable it. Cheap to do here — the
+                    // notification plugin no-ops on first call if the
+                    // OS hasn't granted permission.
+                    if !is_autostart_enabled() {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("Lumiere Agent")
+                            .body(
+                                "Activer le demarrage automatique pour que l'agent \
+                                 reste toujours actif au demarrage de Windows.",
+                            )
+                            .show();
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // ── Intercept the [X] button on the main window ──────────
+            // We want AnyDesk-style behaviour: hiding to tray, not
+            // tearing down the agent. The process keeps running, the
+            // signaling loop stays connected, sessions still come in.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    tracing::info!(
+                        "🪟 Fenetre principale masquee dans le tray (close intercepted)"
+                    );
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

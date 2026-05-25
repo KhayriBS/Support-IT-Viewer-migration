@@ -17,3 +17,5 @@ pub mod desktop_duplication;
 pub mod media_foundation_encoder;
 pub mod ai_executor;
 pub mod privacy_filter;
+pub mod autostart;
+pub mod tray;

@@ -86,6 +86,11 @@ pub struct SharedState {
     /// qu'il n'a pas été acquitté (= jusqu'à ce que send réussisse). Cleared
     /// par leave_session.
     pub pending_answer: Mutex<Option<serde_json::Value>>,
+    /// Tauri AppHandle injected by `lib.rs::setup()`. Used to update the
+    /// system tray status and trigger native Windows notifications when
+    /// a session starts / ends, even when the main window is hidden.
+    /// `None` during tests and before setup() completes.
+    pub app_handle: Mutex<Option<tauri::AppHandle<tauri::Wry>>>,
 }
 
 impl SharedState {
@@ -102,6 +107,7 @@ impl SharedState {
             stop_notify: Notify::new(),
             chat_tx: Mutex::new(None),
             pending_answer: Mutex::new(None),
+            app_handle: Mutex::new(None),
         })
     }
 }
@@ -477,6 +483,11 @@ pub async fn join_session(
         s.session_id = Some(pending.id);
         s.technician = Some(pending.technician_username.clone());
     }
+
+    // ── Tray + Action Center notification ───────────────────────────
+    // Done after the state flip so any observer that reacts to
+    // `update_tray_status` sees a consistent "in session" status.
+    notify_session_started(&state, &pending.technician_username).await;
 
     let client = Arc::new(SignalingClient::new(server_url));
     client.set_session_id(pending.id.to_string()).await;
@@ -1134,6 +1145,13 @@ async fn dispatch_signals(
 // ─── leave_session ────────────────────────────────────────────────────────────
 /// Equivalent of `LeaveSessionAsync()` in `SessionManager.cs`.
 pub async fn leave_session(state: Arc<SharedState>) {
+    // Capture "was it really in session" *before* we flip the flag so
+    // we don't fire an end-notification on idempotent leave calls.
+    let was_in_session = {
+        let s = state.status.lock().await;
+        s.in_session
+    };
+
     // Mark in_session=false FIRST so the grace task (if any) sees a closed
     // session when it wakes from grace_cancel and logs "shutdown" instead of
     // a false "viewer returned".
@@ -1142,6 +1160,10 @@ pub async fn leave_session(state: Arc<SharedState>) {
         s.in_session = false;
         s.session_id = None;
         s.technician = None;
+    }
+
+    if was_in_session {
+        notify_session_ended(&state).await;
     }
 
     // Cancel any pending grace task; the session is going away for real now.
@@ -1184,5 +1206,58 @@ pub async fn send_chat_message(
 // ─── get_file_list ────────────────────────────────────────────────────────────
 pub fn get_file_list(path: &str) -> FileListResponse {
     FileTransferService::new().get_directory_listing(path)
+}
+
+// ─── Session lifecycle notifications ──────────────────────────────────────────
+// Bridges the agent loop with the tray icon / Action Center. We never
+// fail loud: if the AppHandle isn't installed yet (tests, early boot)
+// the helpers are no-ops so the session code stays platform-agnostic.
+
+async fn notify_session_started(state: &Arc<SharedState>, technician: &str) {
+    let handle_opt = { state.app_handle.lock().await.clone() };
+    let Some(app) = handle_opt else {
+        return;
+    };
+    let label = if technician.trim().is_empty() {
+        "Session en cours".to_string()
+    } else {
+        format!("Session en cours avec {technician}")
+    };
+    super::tray::update_tray_status(&app, &label);
+
+    use tauri_plugin_notification::NotificationExt;
+    let body = if technician.trim().is_empty() {
+        "Un technicien controle votre ecran.".to_string()
+    } else {
+        format!("{technician} controle votre ecran.")
+    };
+    if let Err(err) = app
+        .notification()
+        .builder()
+        .title("Session distante active")
+        .body(body)
+        .show()
+    {
+        tracing::warn!("notify_session_started: {err}");
+    }
+}
+
+async fn notify_session_ended(state: &Arc<SharedState>) {
+    let handle_opt = { state.app_handle.lock().await.clone() };
+    let Some(app) = handle_opt else {
+        return;
+    };
+    super::tray::update_tray_status(&app, "Agent actif — En attente");
+
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(err) = app
+        .notification()
+        .builder()
+        .title("Session terminee")
+        .body("La session de support est terminee.")
+        .show()
+    {
+        tracing::warn!("notify_session_ended: {err}");
+    }
 }
 
