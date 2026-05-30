@@ -369,10 +369,14 @@ pub async fn start_agent(
     // Le serveur retrouve le propriétaire assigné via ce machineId pour
     // déterminer le rôle (TECHNICIAN / USER / PENDING) à envoyer au front.
     let machine_id = super::hardware::get_hardware_serial();
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let os = std::env::consts::OS.to_string();
 
     tracing::info!("MachineId : {machine_id}");
+    tracing::info!("Hostname  : {hostname}");
     tracing::info!("OS        : {os}");
 
     {
@@ -384,7 +388,7 @@ pub async fn start_agent(
 
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
-        if let Err(e) = agent_loop(state_clone, server_url, machine_id, os).await {
+        if let Err(e) = agent_loop(state_clone, server_url, machine_id, hostname, os).await {
             tracing::warn!("❌ Agent loop error: {e}");
         }
     });
@@ -410,13 +414,14 @@ async fn agent_loop(
     state: Arc<SharedState>,
     server_url: String,
     machine_id: String,
+    hostname: String,
     os: String,
 ) -> Result<(), String> {
     let auth = AgentAuthService::new(&server_url);
     let metrics_collector = MetricsCollector::new();
 
     // ── Register ──────────────────────────────────────────────────────────────
-    let agent = auth.register_or_update(&machine_id, &machine_id, &os).await?;
+    let agent = auth.register_or_update(&machine_id, &hostname, &os).await?;
     tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
 
     // ── Login → JWT + rôle ────────────────────────────────────────────────────
