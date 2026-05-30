@@ -1025,8 +1025,14 @@ async fn dispatch_signals(
                         .unwrap_or(false);
 
                     if is_peer_not_connected {
-                        tracing::info!(
-                            "ℹ️ Viewer pas encore connecté (signal normal pendant l'initialisation)"
+                        // This server error is sent every time we push a
+                        // message (StreamStats, etc.) while the viewer's
+                        // *signaling* WebSocket is dropped — typical on
+                        // Render free-tier once the WebRTC P2P channel
+                        // takes over. Logging at INFO produced one line
+                        // per second of pure noise; promoted to DEBUG.
+                        tracing::debug!(
+                            "ℹ️ Viewer pas encore connecté côté signaling (P2P OK, ignoré)"
                         );
                     } else {
                         tracing::warn!("⚠️ Signal ERROR serveur: {payload}");

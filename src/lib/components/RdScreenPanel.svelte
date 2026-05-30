@@ -5,6 +5,7 @@
   import { fileChannel } from "$lib/managers/file-channel.svelte";
   import { aiPipeline } from "$lib/managers/ai-pipeline.svelte";
   import RdViewerStatsBar from "./RdViewerStatsBar.svelte";
+  import RdQualitySelector from "./RdQualitySelector.svelte";
   import RdChatList from "./RdChatList.svelte";
   import RdChatCompose from "./RdChatCompose.svelte";
   import RdTransferList from "./RdTransferList.svelte";
@@ -140,6 +141,7 @@
         <span class="rd-viewer__fab-icon">←</span>
         <span class="rd-viewer__fab-label">Menu</span>
       </button>
+      <RdQualitySelector />
       {#if rdScreenPlayRequested}
         <button
           class="rd-viewer__fab"

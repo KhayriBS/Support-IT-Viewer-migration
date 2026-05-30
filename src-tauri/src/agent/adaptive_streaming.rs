@@ -429,7 +429,13 @@ impl AdaptiveRateController {
             || feedback.rtcp_pli_delta > 0
             || feedback.rtcp_fir_delta > 0;
         let network_congestion = feedback.rtcp_nack_delta >= 2;
-        let local_encode_pressure = feedback.dropped_before_encode > 2
+        // Threshold bumped from 2 → 6: with a software encoder doing
+        // 1080p (OpenH264 on Intel UHD), the encode loop legitimately
+        // skips 2–4 capture frames now and then without being "in
+        // distress". Reacting at >2 caused a death-spiral that dropped
+        // the target from 20 → 10 fps within seconds. >6 keeps the
+        // ramp-down for genuine sustained pressure only.
+        let local_encode_pressure = feedback.dropped_before_encode > 6
             && feedback.dropped_before_send == 0
             && !feedback.send_error
             && feedback.rtcp_nack_delta == 0
@@ -463,7 +469,11 @@ impl AdaptiveRateController {
         }
 
         if local_encode_pressure
-            && now.duration_since(self.last_adjust_at) >= Duration::from_millis(1500)
+            // Cooldown bumped from 1500 → 3000 ms. Gives the encoder
+            // time to recover before we slash the FPS again — combined
+            // with the higher threshold above this avoids the
+            // 20→18→16→14→12→10 cascade observed on software encoders.
+            && now.duration_since(self.last_adjust_at) >= Duration::from_millis(3000)
         {
             self.last_adjust_at = now;
             let next_fps = self.current.target_fps.saturating_sub(2).max(self.min_fps);

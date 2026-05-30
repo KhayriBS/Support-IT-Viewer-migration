@@ -39,11 +39,23 @@ mod imp {
 
     const BLACK_FRAME_THRESHOLD: u32 = 3;
 
-    /// Nombre maximum de retries en cas de DXGI_ERROR_WAIT_TIMEOUT avant
-    /// de basculer sur GDI. 5 × 10ms = jusqu'à 50ms supplémentaires
-    /// pour laisser à l'Intel UHD le temps de produire une frame.
-    const DXGI_TIMEOUT_RETRIES: u32 = 5;
-    const DXGI_TIMEOUT_RETRY_DELAY: Duration = Duration::from_millis(10);
+    /// Single DXGI attempt per `capture_next_frame` call. WAIT_TIMEOUT
+    /// means *the screen hasn't changed* — the right reaction is to
+    /// reuse the last captured frame (the sender loops handle this via
+    /// `Ok(None)`), not to retry-spin or fall back to GDI. The old
+    /// 5×10ms retry loop burned 50–130 ms per quiet frame and capped
+    /// throughput at ~10 fps on Intel UHD even when the screen *was*
+    /// updating; the encoder still emitted frames, but DXGI starved it.
+    const DXGI_TIMEOUT_RETRIES: u32 = 1;
+    const DXGI_TIMEOUT_RETRY_DELAY: Duration = Duration::from_millis(0);
+
+    /// Number of consecutive `capture_next_frame` calls returning
+    /// `Ok(None)` (DXGI timeout) before we conclude the driver is broken
+    /// on this GPU and switch permanently to GDI BitBlt. Genuine quiet
+    /// periods on a stable adapter typically deliver a frame within a
+    /// handful of ticks; a burst this long is a clear "DXGI dead"
+    /// signature (frequent on Intel UHD).
+    const DXGI_PERMANENT_TIMEOUT_THRESHOLD: u32 = 60;
 
     #[derive(Clone, Debug)]
     pub struct DesktopFrame {
@@ -151,6 +163,12 @@ mod imp {
         /// Compteur de frames noires consécutives renvoyées par DXGI.
         /// Quand ≥ BLACK_FRAME_THRESHOLD, on bascule en GDI.
         consecutive_black_frames: u32,
+        /// Compteur de `WAIT_TIMEOUT` consécutifs. Réinitialisé dès
+        /// qu'une frame est obtenue. Au-delà du seuil
+        /// `DXGI_PERMANENT_TIMEOUT_THRESHOLD`, on bascule définitivement
+        /// vers GDI : c'est la signature d'un driver Intel UHD cassé,
+        /// pas d'un écran inactif.
+        consecutive_dxgi_timeouts: u32,
         /// Description humaine de l'adaptateur sélectionné (ex: "Intel(R)
         /// UHD Graphics 730"). Loguée au démarrage et lors des fallbacks.
         adapter_name: String,
@@ -305,6 +323,7 @@ mod imp {
                                     gdi: None,
                                     force_gdi: force_gdi_env,
                                     consecutive_black_frames: 0,
+                                    consecutive_dxgi_timeouts: 0,
                                     adapter_name: adapter_name.clone(),
                                 });
                             }
@@ -365,6 +384,7 @@ mod imp {
                     gdi: None,
                     force_gdi: false,
                     consecutive_black_frames: 0,
+                    consecutive_dxgi_timeouts: 0,
                     adapter_name: String::new(),
                 })
             }
@@ -418,6 +438,11 @@ mod imp {
             }
 
         
+            // Single attempt with optional retries (defaults to 1).
+            // Treating WAIT_TIMEOUT as "no new frame → reuse last" is
+            // both faster and visually identical: the screen hasn't
+            // changed, there's nothing to re-encode. The sender loops
+            // reuse the last captured frame on `Ok(None)`.
             let mut acquired_frame: Option<DesktopFrame> = None;
             let mut last_dxgi_err: Option<String> = None;
             for retry in 0..DXGI_TIMEOUT_RETRIES {
@@ -427,13 +452,13 @@ mod imp {
                         break;
                     }
                     Ok(None) => {
-                        
-                        if retry + 1 < DXGI_TIMEOUT_RETRIES {
+                        if DXGI_TIMEOUT_RETRY_DELAY > Duration::ZERO
+                            && retry + 1 < DXGI_TIMEOUT_RETRIES
+                        {
                             thread::sleep(DXGI_TIMEOUT_RETRY_DELAY);
                         }
                     }
                     Err(err) => {
-      
                         last_dxgi_err = Some(err);
                         break;
                     }
@@ -450,14 +475,33 @@ mod imp {
             }
 
             let Some(frame) = acquired_frame else {
-      
-                tracing::warn!(
-                    "🎥 DXGI: {} timeouts consécutifs sur '{}' — capture GDI ponctuelle",
-                    DXGI_TIMEOUT_RETRIES,
-                    self.adapter_name
-                );
-                return self.capture_via_gdi().map(Some);
+                // WAIT_TIMEOUT path. Two scenarios:
+                //  (a) screen genuinely idle → return Ok(None), the
+                //      sender loop reuses the last captured frame
+                //      (the user sees a steady image, no jank).
+                //  (b) DXGI driver broken on this adapter → repeats
+                //      forever; after DXGI_PERMANENT_TIMEOUT_THRESHOLD
+                //      consecutive timeouts we switch to permanent GDI
+                //      because (a) implies the screen is changing
+                //      somewhere (mouse cursor, clock, etc).
+                self.consecutive_dxgi_timeouts =
+                    self.consecutive_dxgi_timeouts.saturating_add(1);
+                if self.consecutive_dxgi_timeouts >= DXGI_PERMANENT_TIMEOUT_THRESHOLD {
+                    tracing::warn!(
+                        "🎥 DXGI: {} timeouts consécutifs sur '{}' — \
+                         basculement permanent vers GDI BitBlt",
+                        self.consecutive_dxgi_timeouts,
+                        self.adapter_name
+                    );
+                    return self.activate_gdi_fallback_and_capture();
+                }
+                return Ok(None);
             };
+
+            // Got a real frame — clear the timeout streak.
+            if self.consecutive_dxgi_timeouts > 0 {
+                self.consecutive_dxgi_timeouts = 0;
+            }
 
 
             if is_black_frame(&frame.bgra) {

@@ -17,6 +17,9 @@
 //! calls `process_frame` once per captured BGRA frame) and the WebRTC
 //! "privacy" DataChannel handler (which mutates `enabled`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Rectangle in *screen-absolute* coordinates returned by UIA's
@@ -39,74 +42,125 @@ const DEFAULT_SCAN_INTERVAL_MS: u64 = 500;
 /// glyph details on standard DPI, even for very small password fields.
 pub const DEFAULT_BLUR_RADIUS: u32 = 15;
 
+/// Stable identifier for a UIA element across scans — the array of
+/// `i32` returned by `IUIAutomationElement::GetRuntimeId`. Two scans
+/// returning the same `RuntimeId` are guaranteed to refer to the same
+/// element (per Microsoft's UIA contract).
+type RuntimeId = Vec<i32>;
+
+/// Internal record tracking a previously-detected password input.
+///
+/// We key by `RuntimeId` (stable UIA identity) rather than by screen
+/// position because:
+///  - A password field can *move* between scans (scroll, reflow, virtual
+///    keyboard appearing) — spatial keying would miss it and the blur
+///    would lag by a frame.
+///  - An unrelated text input can *appear* at the same screen position
+///    after the password field is destroyed — spatial keying would
+///    bleed blur onto a non-sensitive control.
+///
+/// Each scan we re-read the element's `BoundingRectangle` so the blur
+/// follows the field as it moves.
+#[derive(Clone, Debug)]
+struct StickyRegion {
+    runtime_id: RuntimeId,
+    region: SensitiveRegion,
+    /// Last time the element reported `IsPassword=true`. Lets us drop a
+    /// sticky entry when the runtime id reappears as a normal `Edit`
+    /// without ever flipping back to password — meaning the user
+    /// *typed it as plain text* (e.g. into a search box that recycled
+    /// the same element). Old confirmations age out.
+    last_password_seen: Instant,
+}
+
+/// Max age for a sticky entry without any fresh `IsPassword=true`
+/// confirmation. Anything older is dropped on the next scan even if
+/// the underlying element is still alive — paranoid safety net so a
+/// permanently-unmasked input never stays blurred indefinitely.
+const STICKY_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// Snapshot of region state published by the background scanner.
+/// Accessed by the capture loop under an `RwLock` so reads don't block
+/// each other and don't contend with the slow UIA scan thread.
+#[derive(Default)]
+struct ScanSnapshot {
+    regions: Vec<SensitiveRegion>,
+    scan_screen_size: Option<(i32, i32)>,
+}
+
 /// Stateful privacy filter shared between the capture loop and the
-/// DataChannel handler that toggles it. See module docs.
+/// DataChannel handler that toggles it.
+///
+/// **Concurrency model.** The UIA scan (50–500 ms on a busy desktop) is
+/// far too slow to run on every captured frame, and even at the 500 ms
+/// cadence it would stall the capture loop while it ran. Instead, a
+/// dedicated background thread does the scans and pushes the resulting
+/// region list into a `RwLock<ScanSnapshot>`. `process_frame` only
+/// takes a *read* lock for a few µs and applies the blur — the hot
+/// path is decoupled from UIA entirely.
 pub struct PrivacyFilter {
-    pub regions: Vec<SensitiveRegion>,
-    pub last_scan: Instant,
-    pub scan_interval: Duration,
     pub enabled: bool,
-    /// Dimensions of the screen at the moment `regions` was refreshed.
-    /// Stored so we can rescale UIA coordinates if the encoder is fed a
-    /// downscaled buffer (e.g. 4K → 1080p auto-downscale).
-    pub scan_screen_size: Option<(i32, i32)>,
     /// Pixel radius of the box blur. 15 is enough to make any glyph
     /// unreadable; bump to 25 for very large fonts / accessibility mode.
     pub blur_radius: u32,
+    /// Latest scan snapshot, written by the background thread, read by
+    /// every captured frame.
+    snapshot: Arc<RwLock<ScanSnapshot>>,
+    /// `false` once `Drop` runs — signals the scanner thread to exit.
+    scanner_alive: Arc<AtomicBool>,
 }
 
 impl PrivacyFilter {
     pub fn new() -> Self {
+        let snapshot = Arc::new(RwLock::new(ScanSnapshot::default()));
+        let scanner_alive = Arc::new(AtomicBool::new(true));
+
+        // Spawn the background scanner exactly once. It owns the
+        // sticky cache so process_frame never sees half-updated state.
+        spawn_scanner(Arc::clone(&snapshot), Arc::clone(&scanner_alive));
+
         Self {
-            regions: Vec::new(),
-            // Force an immediate first scan by backdating `last_scan`.
-            last_scan: Instant::now()
-                .checked_sub(Duration::from_secs(60))
-                .unwrap_or_else(Instant::now),
-            scan_interval: Duration::from_millis(DEFAULT_SCAN_INTERVAL_MS),
             // Privacy by default — only the technician can lift it from
             // the viewer, and only after an explicit click.
             enabled: true,
-            scan_screen_size: None,
             blur_radius: DEFAULT_BLUR_RADIUS,
+            snapshot,
+            scanner_alive,
         }
-    }
-
-    pub fn should_rescan(&self) -> bool {
-        self.last_scan.elapsed() >= self.scan_interval
-    }
-
-    /// Re-runs UIA detection and updates `self.regions`. Safe to call from
-    /// any thread (Windows COM is initialized lazily as MTA inside).
-    pub fn refresh_regions(&mut self) {
-        self.regions = detect_password_fields();
-        self.scan_screen_size = current_screen_size();
-        self.last_scan = Instant::now();
     }
 
     /// Apply privacy blur to a captured BGRA frame.
     ///
-    /// Called once per captured frame from the encoder pipeline. When
-    /// `enabled == false` this is a no-op (zero allocation, zero copy)
-    /// so toggling off cleanly disables all overhead.
+    /// Hot path: only a *read* lock on the snapshot (no UIA, no
+    /// allocation when there are no regions). Returns immediately when
+    /// `enabled == false`.
     pub fn process_frame(&mut self, buffer: &mut Vec<u8>, width: u32, height: u32) {
         if !self.enabled {
             return;
         }
-        if self.should_rescan() {
-            self.refresh_regions();
-        }
-        if self.regions.is_empty() {
-            return;
-        }
+
+        // Read-only snapshot of the current sticky regions.
+        let (regions, scan_screen_size) = {
+            let snap = match self.snapshot.read() {
+                Ok(s) => s,
+                // PoisonError — another thread panicked while holding
+                // the lock. Treat as "no regions" rather than crash;
+                // the next scan will replace it.
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if snap.regions.is_empty() {
+                return;
+            }
+            (snap.regions.clone(), snap.scan_screen_size)
+        };
 
         // Rescale UIA regions to the buffer if the encoder is fed a
         // downscaled image (4K capture → 1080p stream is common).
-        let scaled = match self.scan_screen_size {
+        let scaled = match scan_screen_size {
             Some((sw, sh)) if sw > 0 && sh > 0 && (sw as u32 != width || sh as u32 != height) => {
                 let sx = width as f32 / sw as f32;
                 let sy = height as f32 / sh as f32;
-                self.regions
+                regions
                     .iter()
                     .map(|r| SensitiveRegion {
                         x: (r.x as f32 * sx) as i32,
@@ -116,10 +170,19 @@ impl PrivacyFilter {
                     })
                     .collect::<Vec<_>>()
             }
-            _ => self.regions.clone(),
+            _ => regions,
         };
 
         apply_privacy_blur(buffer, width, height, &scaled, self.blur_radius);
+    }
+}
+
+impl Drop for PrivacyFilter {
+    fn drop(&mut self) {
+        // Signal the scanner thread to exit at its next iteration.
+        // We don't `join` it — the worker sleeps in short ticks and
+        // checks the flag, so it'll terminate cleanly on its own.
+        self.scanner_alive.store(false, Ordering::Release);
     }
 }
 
@@ -127,6 +190,97 @@ impl Default for PrivacyFilter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Background thread that re-runs the UIA scan every
+/// [`DEFAULT_SCAN_INTERVAL_MS`] and publishes the result. Sleeps in
+/// 100 ms ticks so it exits promptly when the filter is dropped.
+fn spawn_scanner(snapshot: Arc<RwLock<ScanSnapshot>>, alive: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("privacy-filter-scanner".to_string())
+        .spawn(move || {
+            // Sticky cache lives entirely on this thread — never shared.
+            let sticky: Mutex<Vec<StickyRegion>> = Mutex::new(Vec::new());
+
+            // First scan happens immediately so the very first captured
+            // frame after enabling the filter already has regions.
+            let mut next_scan = Instant::now();
+
+            while alive.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if now < next_scan {
+                    // Coarse-grained sleep so a Drop signal is acted on
+                    // within ~100 ms rather than the full scan period.
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                next_scan = now + Duration::from_millis(DEFAULT_SCAN_INTERVAL_MS);
+
+                let (password_uia, edit_uia) = detect_uia_elements();
+                let mut sticky_guard = match sticky.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                // ── Refresh / add sticky entries from fresh password hits ──
+                for hit in &password_uia {
+                    if let Some(existing) = sticky_guard
+                        .iter_mut()
+                        .find(|s| s.runtime_id == hit.runtime_id)
+                    {
+                        existing.region = hit.region;
+                        existing.last_password_seen = now;
+                    } else {
+                        sticky_guard.push(StickyRegion {
+                            runtime_id: hit.runtime_id.clone(),
+                            region: hit.region,
+                            last_password_seen: now,
+                        });
+                    }
+                }
+
+                // ── Drop stickies whose runtime id vanished from UIA.
+                //       Keep stickies that reappear as a normal Edit
+                //       (= "show password" active) and follow their
+                //       new bounding rect across scans.
+                let password_ids: std::collections::HashSet<&RuntimeId> =
+                    password_uia.iter().map(|h| &h.runtime_id).collect();
+
+                sticky_guard.retain_mut(|s| {
+                    if password_ids.contains(&s.runtime_id) {
+                        return true;
+                    }
+                    if now.duration_since(s.last_password_seen) > STICKY_MAX_AGE {
+                        return false;
+                    }
+                    if let Some(edit) =
+                        edit_uia.iter().find(|e| e.runtime_id == s.runtime_id)
+                    {
+                        s.region = edit.region;
+                        return true;
+                    }
+                    false
+                });
+
+                // ── Publish snapshot for process_frame consumers ──
+                let new_regions: Vec<SensitiveRegion> =
+                    sticky_guard.iter().map(|s| s.region).collect();
+                drop(sticky_guard);
+
+                let new_screen = current_screen_size();
+                if let Ok(mut snap) = snapshot.write() {
+                    snap.regions = new_regions;
+                    snap.scan_screen_size = new_screen;
+                }
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|err| {
+            // If we can't spawn the worker, fail open (no scan = no blur)
+            // rather than crash the agent. Privacy is degraded but the
+            // session still runs.
+            tracing::warn!("🔒 privacy scanner spawn failed: {err}");
+        });
 }
 
 /// Iterates `regions` and blurs each one in place on the BGRA buffer.
@@ -274,32 +428,58 @@ fn current_screen_size() -> Option<(i32, i32)> {
     }
 }
 
+/// Pairs a UIA element's stable runtime id with its on-screen rect.
+/// Used as the unit returned by [`detect_uia_elements`] so the sticky
+/// cache can correlate elements across scans by identity rather than
+/// by position.
+#[derive(Clone, Debug)]
+struct UiaHit {
+    runtime_id: RuntimeId,
+    region: SensitiveRegion,
+}
+
 // ──────────────────────────────────────────────────────────────────────
 //                       UI Automation — Windows only
 // ──────────────────────────────────────────────────────────────────────
 
-/// Scans the desktop tree for password-like elements and returns their
-/// bounding rectangles. Returns an empty vector on any failure (elevated
-/// process, RPC_E_CHANGED_MODE, UAC secure desktop, etc.).
+/// Public convenience: returns only the on-screen rects of elements
+/// currently reporting `IsPassword=true`. Used by external callers /
+/// tests that don't need the sticky-cache plumbing.
 pub fn detect_password_fields() -> Vec<SensitiveRegion> {
+    detect_uia_elements()
+        .0
+        .into_iter()
+        .map(|h| h.region)
+        .collect()
+}
+
+/// Scans the desktop tree once and returns two lists of UIA hits:
+///  - `.0` : elements whose `IsPassword == true` *right now*,
+///  - `.1` : every visible `ControlType == Edit` control.
+///
+/// Each entry carries both the bounding rect and the element's
+/// `RuntimeId`. `PrivacyFilter::refresh_regions` keys the sticky cache
+/// on the runtime id so blur follows the *same control* across scans,
+/// regardless of position changes or `IsPassword` toggles.
+fn detect_uia_elements() -> (Vec<UiaHit>, Vec<UiaHit>) {
     #[cfg(windows)]
     {
-        match detect_password_fields_impl() {
-            Ok(regions) => regions,
+        match detect_uia_elements_impl() {
+            Ok(pair) => pair,
             Err(err) => {
-                tracing::debug!("🔒 UIA password detection skipped: {err}");
-                Vec::new()
+                tracing::debug!("🔒 UIA scan skipped: {err}");
+                (Vec::new(), Vec::new())
             }
         }
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        (Vec::new(), Vec::new())
     }
 }
 
 #[cfg(windows)]
-fn detect_password_fields_impl() -> Result<Vec<SensitiveRegion>, String> {
+fn detect_uia_elements_impl() -> Result<(Vec<UiaHit>, Vec<UiaHit>), String> {
     use windows::core::VARIANT;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -322,7 +502,6 @@ fn detect_password_fields_impl() -> Result<Vec<SensitiveRegion>, String> {
             if code == 0x8001_0106u32 as i32 {
                 return Err("COM already initialized in conflicting apartment (STA)".to_string());
             }
-            // Any other failure HRESULT is fatal here.
             return Err(format!("CoInitializeEx failed (hr=0x{code:08X})"));
         }
 
@@ -334,14 +513,13 @@ fn detect_password_fields_impl() -> Result<Vec<SensitiveRegion>, String> {
             .GetRootElement()
             .map_err(|e| format!("GetRootElement failed: {e}"))?;
 
-        let mut regions = Vec::new();
+        let mut password_hits = Vec::new();
+        let mut edit_hits = Vec::new();
 
-        // ── Condition 1 : IsPassword == true ────────────────────────
-        // Per the UIA spec, every password field — native Win32, WPF,
-        // UWP, Edge/Chrome, Electron — advertises IsPassword=true. This
-        // is the canonical detection path. (There is no
-        // UIA_PasswordControlTypeId in the SDK: the control type is
-        // always `Edit` and `IsPassword` discriminates.)
+        // ── Pass 1 : IsPassword == true ─────────────────────────────
+        // Native Win32, WPF, UWP, Edge/Chrome, Electron — they all
+        // advertise IsPassword=true on the masked control. UIA has no
+        // dedicated password control type; the type is always `Edit`.
         let pwd_variant = VARIANT::from(true);
         let pwd_condition = automation
             .CreatePropertyCondition(UIA_IsPasswordPropertyId, &pwd_variant)
@@ -351,29 +529,46 @@ fn detect_password_fields_impl() -> Result<Vec<SensitiveRegion>, String> {
             let count = array.Length().unwrap_or(0);
             for i in 0..count {
                 if let Ok(element) = array.GetElement(i) {
-                    if let Some(region) = bounding_rect_to_region(&element) {
-                        regions.push(region);
+                    if let Some(hit) = element_to_hit(&element) {
+                        password_hits.push(hit);
                     }
                 }
             }
         }
 
-        // ── Condition 2 : ControlType == Edit (best-effort fallback) ──
-        // Some legacy controls expose IsPassword incorrectly. We don't
-        // blur every Edit (that would hide normal text inputs), but we
-        // still build the condition object to validate the UIA tree is
-        // walkable — drops are silent.
+        // ── Pass 2 : every ControlType == Edit on screen ────────────
+        // Used by the sticky-cache layer to know "is *this specific*
+        // input still there?" after IsPassword flips to false on
+        // show-password. We never blur these unless their runtime id
+        // is already in the sticky cache (= confirmed password
+        // previously) — see `PrivacyFilter::refresh_regions`.
         let edit_variant = VARIANT::from(UIA_EditControlTypeId.0);
-        let _ = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &edit_variant);
+        let edit_condition = automation
+            .CreatePropertyCondition(UIA_ControlTypePropertyId, &edit_variant)
+            .map_err(|e| format!("CreatePropertyCondition(Edit) failed: {e}"))?;
 
-        Ok(regions)
+        if let Ok(array) = root.FindAll(TreeScope_Subtree, &edit_condition) {
+            let count = array.Length().unwrap_or(0);
+            for i in 0..count {
+                if let Ok(element) = array.GetElement(i) {
+                    if let Some(hit) = element_to_hit(&element) {
+                        edit_hits.push(hit);
+                    }
+                }
+            }
+        }
+
+        Ok((password_hits, edit_hits))
     }
 }
 
+/// Materializes a UIA element as `(runtime_id, bounding_rect)`. Returns
+/// `None` when either piece of metadata is unavailable — we treat such
+/// elements as if they didn't exist rather than risk a partial entry.
 #[cfg(windows)]
-fn bounding_rect_to_region(
+fn element_to_hit(
     element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-) -> Option<SensitiveRegion> {
+) -> Option<UiaHit> {
     unsafe {
         let rect = element.CurrentBoundingRectangle().ok()?;
         let width = rect.right - rect.left;
@@ -381,13 +576,61 @@ fn bounding_rect_to_region(
         if width <= 0 || height <= 0 {
             return None;
         }
-        Some(SensitiveRegion {
-            x: rect.left,
-            y: rect.top,
-            width,
-            height,
+        let runtime_id = extract_runtime_id(element)?;
+        if runtime_id.is_empty() {
+            return None;
+        }
+        Some(UiaHit {
+            runtime_id,
+            region: SensitiveRegion {
+                x: rect.left,
+                y: rect.top,
+                width,
+                height,
+            },
         })
     }
+}
+
+/// Extracts the UIA `RuntimeId` as a `Vec<i32>`. The SAFEARRAY allocated
+/// by UIA is destroyed before returning. `None` on any failure (out of
+/// the UIA tree, marshalling error) — the caller must treat the
+/// element as untrackable in that case.
+#[cfg(windows)]
+unsafe fn extract_runtime_id(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<RuntimeId> {
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+    };
+
+    let psa = element.GetRuntimeId().ok()?;
+    if psa.is_null() {
+        return None;
+    }
+
+    // RuntimeId is a 1-dimensional SAFEARRAY of i32 (VT_I4). Bounds use
+    // 1-based dim index per the OLE convention.
+    let lbound = SafeArrayGetLBound(psa, 1).ok()?;
+    let ubound = SafeArrayGetUBound(psa, 1).ok()?;
+    let count = (ubound - lbound + 1).max(0) as usize;
+    if count == 0 {
+        let _ = SafeArrayDestroy(psa);
+        return None;
+    }
+
+    let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+    if SafeArrayAccessData(psa, &mut data).is_err() || data.is_null() {
+        let _ = SafeArrayDestroy(psa);
+        return None;
+    }
+    let slice = std::slice::from_raw_parts(data as *const i32, count);
+    let runtime_id: RuntimeId = slice.to_vec();
+    // SafeArrayUnaccessData balances the AccessData lock. SafeArrayDestroy
+    // frees the descriptor + payload.
+    let _ = windows::Win32::System::Ole::SafeArrayUnaccessData(psa);
+    let _ = SafeArrayDestroy(psa);
+    Some(runtime_id)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -455,14 +698,19 @@ mod tests {
 
     #[test]
     fn disabled_filter_is_noop() {
+        // Inject a fake region so we can verify it's *not* applied
+        // when enabled=false — bypass the background scanner.
         let mut filter = PrivacyFilter::new();
         filter.enabled = false;
-        filter.regions = vec![SensitiveRegion {
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 8,
-        }];
+        {
+            let mut snap = filter.snapshot.write().unwrap();
+            snap.regions = vec![SensitiveRegion {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }];
+        }
         let mut buf = solid_buffer(16, 16, [42, 42, 42, 255]);
         let before = buf.clone();
         filter.process_frame(&mut buf, 16, 16);
@@ -471,24 +719,51 @@ mod tests {
 
     #[test]
     fn empty_regions_skip_work() {
+        // Default snapshot has no regions — process_frame should
+        // return without touching the buffer.
         let mut filter = PrivacyFilter::new();
         filter.enabled = true;
-        filter.regions = Vec::new();
         let mut buf = solid_buffer(16, 16, [42, 42, 42, 255]);
         let before = buf.clone();
-        // Force last_scan recent so refresh_regions isn't called.
-        filter.last_scan = Instant::now();
         filter.process_frame(&mut buf, 16, 16);
         assert_eq!(buf, before);
     }
 
     #[test]
-    fn should_rescan_after_interval() {
+    fn snapshot_regions_drive_blur() {
+        // Inject a region via the snapshot (simulating what the
+        // background scanner would write) and verify process_frame
+        // actually applies a blur over that area.
         let mut filter = PrivacyFilter::new();
-        filter.scan_interval = Duration::from_millis(10);
-        filter.last_scan = Instant::now();
-        assert!(!filter.should_rescan());
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(filter.should_rescan());
+        filter.enabled = true;
+        filter.blur_radius = 4;
+        {
+            let mut snap = filter.snapshot.write().unwrap();
+            snap.regions = vec![SensitiveRegion {
+                x: 4,
+                y: 4,
+                width: 8,
+                height: 8,
+            }];
+            snap.scan_screen_size = Some((16, 16));
+        }
+        // Half-black / half-white step image so blur produces a
+        // detectable intermediate gray inside the region.
+        let mut buf = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let i = (y * 16 + x) * 4;
+                let v = if x < 8 { 0 } else { 255 };
+                buf[i] = v;
+                buf[i + 1] = v;
+                buf[i + 2] = v;
+                buf[i + 3] = 255;
+            }
+        }
+        filter.process_frame(&mut buf, 16, 16);
+        // Pick a pixel inside the blurred region near the boundary.
+        let idx = (6 * 16 + 7) * 4;
+        let v = buf[idx];
+        assert!(v > 0 && v < 255, "no blur applied inside region (v={v})");
     }
 }

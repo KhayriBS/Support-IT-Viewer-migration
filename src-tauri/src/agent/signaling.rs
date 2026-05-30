@@ -167,7 +167,27 @@ impl SignalingClient {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<SignalMessage>(&text) {
                             Ok(msg) => {
-                                tracing::info!("📨 Reçu {:?} de {}", msg.signal_type, msg.from);
+                                // `Error` frames are the verbose "Peer not
+                                // connected: viewer" replies the server
+                                // emits to every push once the viewer's
+                                // signaling WebSocket has dropped — they
+                                // arrive once per second per StreamStats
+                                // and used to flood the console. The
+                                // dispatch layer still handles them; we
+                                // just log them at DEBUG instead of INFO.
+                                if matches!(msg.signal_type, SignalType::Error) {
+                                    tracing::debug!(
+                                        "📨 Reçu {:?} de {}",
+                                        msg.signal_type,
+                                        msg.from
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "📨 Reçu {:?} de {}",
+                                        msg.signal_type,
+                                        msg.from
+                                    );
+                                }
                                 let _ = event_tx_clone.send(msg);
                             }
                             Err(e) => tracing::warn!("⚠️ Parse signal error: {e} — {text}"),

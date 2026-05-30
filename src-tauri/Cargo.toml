@@ -113,6 +113,11 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    # OLE — pour les helpers SAFEARRAY (SafeArrayAccessData/Destroy/Get*Bound).
+    # Utilisé par privacy_filter::extract_runtime_id pour transformer le
+    # SAFEARRAY de i32 retourné par IUIAutomationElement::GetRuntimeId en
+    # Vec<i32> servant d'identité stable du contrôle UIA.
+    "Win32_System_Ole",
     # Registry — RegOpenKeyExW / RegSetValueExW pour l'autostart
     # (clé HKCU\Software\Microsoft\Windows\CurrentVersion\Run).
     "Win32_System_Registry",
