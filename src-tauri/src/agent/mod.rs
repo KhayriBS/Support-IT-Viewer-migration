@@ -19,3 +19,4 @@ pub mod ai_executor;
 pub mod privacy_filter;
 pub mod autostart;
 pub mod tray;
+pub mod hardware;

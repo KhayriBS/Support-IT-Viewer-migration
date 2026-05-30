@@ -16,8 +16,8 @@ use agent::autostart::{
 use agent::metrics::{AgentMetrics, MetricsCollector};
 use agent::webrtc::IceServerConfig;
 use agent::session::{
-    get_file_list, join_session, leave_session, send_chat_message, start_agent, stop_agent,
-    AgentStatus, SharedState,
+    get_file_list, join_session, leave_session, refresh_agent_role, send_chat_message,
+    start_agent, stop_agent, AgentStatus, SharedState,
 };
 use agent::file_transfer::FileListResponse;
 use agent::auth::PendingSession;
@@ -69,6 +69,23 @@ async fn stop_agent_cmd(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn get_agent_status(state: State<'_, AppState>) -> Result<AgentStatus, String> {
     Ok(state.agent.status.lock().await.clone())
+}
+
+/// Returns the agent's JWT (or empty string if not logged in yet).
+/// Svelte stores it in localStorage as `token` so `technicianApi` and
+/// every REST call automatically attaches `Authorization: Bearer …`.
+#[tauri::command]
+async fn get_agent_token(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.agent.jwt_token.lock().await.clone().unwrap_or_default())
+}
+
+/// Re-call `/agents/login` and update the in-memory role.
+/// Used by Svelte while in PENDING mode (polled every ~30s) to detect when
+/// the technician finally assigns this machine to a user.
+/// Called from Svelte: `invoke("refresh_agent_role")`
+#[tauri::command]
+async fn refresh_agent_role_cmd(state: State<'_, AppState>) -> Result<String, String> {
+    refresh_agent_role(Arc::clone(&state.agent)).await
 }
 
 // ─── Session management ───────────────────────────────────────────────────────
@@ -256,6 +273,8 @@ pub fn run() {
             stop_agent_cmd,
             get_agent_status,
             get_agent_status_label,
+            refresh_agent_role_cmd,
+            get_agent_token,
             // session
             join_session_cmd,
             leave_session_cmd,

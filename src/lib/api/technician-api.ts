@@ -83,6 +83,11 @@ export const technicianApi = {
     return request<Agent[]>("/agents/online", { token });
   },
 
+  /** Machines attribuées au propriétaire de la machine appelante (vue USER). */
+  getMyMachines(token?: string) {
+    return request<Agent[]>("/agents/mine", { token });
+  },
+
   async startSession(machineId: string, token?: string) {
     const res = await request<ApiResponse<ControlSession>>(`/sessions/start/${machineId}`, {
       method: "POST",

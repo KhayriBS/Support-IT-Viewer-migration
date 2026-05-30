@@ -31,6 +31,22 @@ pub struct PendingSession {
     pub allow_file_transfer: bool,
 }
 
+/// Réponse de `POST /agents/login` côté Spring (DTO `AgentLoginResponse`).
+///
+/// `role` vaut "TECHNICIAN" / "USER" / "PENDING" — c'est ce qui pilote la
+/// vue ouverte par Svelte au démarrage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLoginResult {
+    pub token: String,
+    pub role: String,
+    pub machine_id: String,
+    #[serde(default)]
+    pub assigned_username: Option<String>,
+    #[serde(default)]
+    pub connection_code: Option<String>,
+}
+
 // ─── AgentAuthService ─────────────────────────────────────────────────────────
 
 /// Mirrors `AgentAuthService.cs`.
@@ -84,8 +100,15 @@ impl AgentAuthService {
     }
 
     // ── POST /agents/login ────────────────────────────────────────────────────
-    /// Equivalent: `LoginAgentAsync(machineId, os)` → JWT token string.
-    pub async fn login(&self, machine_id: &str, os: &str) -> Result<String, String> {
+    /// Equivalent: `LoginAgentAsync(machineId, os)` → AgentLoginResult.
+    ///
+    /// Depuis l'introduction du système de rôles, le serveur renvoie un objet
+    /// JSON `{token, role, machineId, assignedUsername, connectionCode}`.
+    pub async fn login(
+        &self,
+        machine_id: &str,
+        os: &str,
+    ) -> Result<AgentLoginResult, String> {
         let url = format!("{}/agents/login", self.server_url);
         let params = [("machineId", machine_id), ("os", os)];
 
@@ -99,14 +122,15 @@ impl AgentAuthService {
 
         ensure_ok(&resp, &url)?;
 
-        let raw = resp.text().await.map_err(|e| e.to_string())?;
-        // Strip surrounding quotes if server returns a JSON string `"token"`
-        let token = raw.trim().trim_matches('"').to_string();
+        let result: AgentLoginResult = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse /agents/login JSON: {e}"))?;
 
-        if token.is_empty() {
+        if result.token.is_empty() {
             return Err("Agent login failed: empty token".into());
         }
-        Ok(token)
+        Ok(result)
     }
 
     // ── POST /agents/heartbeat ────────────────────────────────────────────────

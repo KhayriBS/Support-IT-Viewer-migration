@@ -39,6 +39,8 @@ pub struct AgentStatus {
     pub server_url: String,
     pub session_id: Option<i64>,
     pub technician: Option<String>,
+    pub role: String,
+    pub assigned_username: Option<String>,
 }
 
 impl Default for AgentStatus {
@@ -51,6 +53,8 @@ impl Default for AgentStatus {
             server_url: String::new(),
             session_id: None,
             technician: None,
+            role: String::new(),
+            assigned_username: None,
         }
     }
 }
@@ -112,16 +116,6 @@ impl SharedState {
     }
 }
 
-/// Default grace period (seconds) granted when the viewer disconnects
-/// non-explicitly (peer_disconnected / socket close 1000 / 1006…).
-/// Configurable via `LUMIERE_VIEWER_GRACE_SECS` (env ou .env.local).
-///
-/// Default monté à 180 s : sur Render free-tier la WS signaling se ferme en
-/// 1003/1011 dès l'OFFER/ANSWER échangé, et notre reconnect peut prendre
-/// jusqu'à plusieurs dizaines de secondes (back-off + reject côté serveur).
-/// Tant que le peer WebRTC est Connected, on n'a aucune raison de tuer la
-/// session — la grâce est de toute façon ré-armée à chaque expiration tant
-/// que `is_peer_connected()` répond true.
 fn viewer_grace_period_secs() -> u64 {
     let raw = std::env::var("LUMIERE_VIEWER_GRACE_SECS")
         .ok()
@@ -328,6 +322,34 @@ fn schedule_viewer_grace_period(
 }
 
 // ─── start_agent ──────────────────────────────────────────────────────────────
+/// Re-call `/agents/login` pour rafraîchir le rôle sans relancer l'agent loop.
+/// Utilisé en mode PENDING : Svelte poll toutes les 30s pour détecter
+/// l'attribution par le technicien.
+pub async fn refresh_agent_role(state: Arc<SharedState>) -> Result<String, String> {
+    let (server_url, machine_id) = {
+        let s = state.status.lock().await;
+        (s.server_url.clone(), s.machine_id.clone())
+    };
+
+    if server_url.is_empty() || machine_id.is_empty() {
+        return Err("Agent not started yet".into());
+    }
+
+    let auth = AgentAuthService::new(&server_url);
+    let os = std::env::consts::OS.to_string();
+    let login = auth.login(&machine_id, &os).await?;
+
+    {
+        *state.jwt_token.lock().await = Some(login.token.clone());
+        let mut s = state.status.lock().await;
+        s.role = login.role.clone();
+        s.assigned_username = login.assigned_username.clone();
+    }
+
+    Ok(login.role)
+}
+
+// ─── start_agent ──────────────────────────────────────────────────────────────
 /// Equivalent of `static async Task Main()` in `Program.cs`.
 ///
 /// Spawns the main agent loop in the background.
@@ -343,9 +365,10 @@ pub async fn start_agent(
         }
     }
 
-    let machine_id = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    // Identifiant matériel stable (BIOS serial), retombe sur hostname si KO.
+    // Le serveur retrouve le propriétaire assigné via ce machineId pour
+    // déterminer le rôle (TECHNICIAN / USER / PENDING) à envoyer au front.
+    let machine_id = super::hardware::get_hardware_serial();
 
     let os = std::env::consts::OS.to_string();
 
@@ -396,14 +419,21 @@ async fn agent_loop(
     let agent = auth.register_or_update(&machine_id, &machine_id, &os).await?;
     tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
 
-    // ── Login → JWT ───────────────────────────────────────────────────────────
-    let token = auth.login(&machine_id, &os).await?;
-    tracing::info!("✅ Agent authenticated (JWT received)");
+    // ── Login → JWT + rôle ────────────────────────────────────────────────────
+    let login = auth.login(&machine_id, &os).await?;
+    let token = login.token.clone();
+    tracing::info!(
+        "✅ Agent authenticated (role={}, assigned={:?})",
+        login.role,
+        login.assigned_username
+    );
 
     {
         *state.jwt_token.lock().await = Some(token.clone());
         let mut s = state.status.lock().await;
         s.authenticated = true;
+        s.role = login.role.clone();
+        s.assigned_username = login.assigned_username.clone();
     }
 
     // ── Periods (same as C#) ──────────────────────────────────────────────────

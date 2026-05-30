@@ -11,7 +11,11 @@ export interface AgentMetrics {
 interface AgentStatusSnapshot {
   running: boolean;
   machineId: string;
+  role?: string;
+  assignedUsername?: string | null;
 }
+
+export type AgentRole = "TECHNICIAN" | "USER" | "PENDING" | "";
 
 class AgentManager {
   metrics = $state<AgentMetrics | null>(null);
@@ -26,6 +30,9 @@ class AgentManager {
   localConnectionCodeLoading = $state(false);
   localConnectionCodeError = $state<string | null>(null);
   connectionCodeCopied = $state(false);
+
+  role = $state<AgentRole>("");
+  assignedUsername = $state<string | null>(null);
 
   refreshMetrics = async () => {
     try {
@@ -51,12 +58,56 @@ class AgentManager {
       }
 
       this.localMachineId = status.machineId?.trim() ?? "";
+      this.applyAuthSnapshot(status);
+      await this.persistTokenInLocalStorage();
       await this.refreshLocalConnectionCode();
 
       this.agentLifecycleError = null;
     } catch (error) {
       this.agentLifecycleError = String(error);
       this.agentRunning = false;
+    }
+  };
+
+  /** Re-call /agents/login (via Tauri) for PENDING polling. */
+  refreshRole = async (): Promise<AgentRole> => {
+    try {
+      const newRole = await invoke<string>("refresh_agent_role_cmd");
+      const status = await invoke<AgentStatusSnapshot>("get_agent_status");
+      this.applyAuthSnapshot(status);
+      await this.persistTokenInLocalStorage();
+      return (newRole as AgentRole) || this.role;
+    } catch (error) {
+      this.agentLifecycleError = String(error);
+      return this.role;
+    }
+  };
+
+  private applyAuthSnapshot(status: AgentStatusSnapshot) {
+    const incoming = (status.role ?? "").trim();
+    if (incoming === "TECHNICIAN" || incoming === "USER" || incoming === "PENDING") {
+      this.role = incoming;
+    } else if (!incoming) {
+      this.role = "";
+    }
+    this.assignedUsername = status.assignedUsername?.trim?.() || null;
+  }
+
+  // Le JWT agent vit dans Rust ; on le miroite dans localStorage pour que
+  // `technicianApi` (qui lit getStoredToken()) attache automatiquement le
+  // header Authorization sur tous les appels REST. Authentifie aussi les
+  // calls /admin/** (le JWT porte l'authority owner ROLE_ADMIN).
+  private persistTokenInLocalStorage = async () => {
+    if (typeof localStorage === "undefined") return;
+    try {
+      const token = await invoke<string>("get_agent_token");
+      if (token) {
+        localStorage.setItem("token", token);
+      } else {
+        localStorage.removeItem("token");
+      }
+    } catch {
+      /* tolérer un échec ponctuel — on retentera au prochain sync */
     }
   };
 
