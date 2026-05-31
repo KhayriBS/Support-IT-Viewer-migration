@@ -936,7 +936,13 @@
           onDisconnect={() => void sessionManager.stopByToken()} />
       {/if}
     {:else if dashView === null}
-      <!-- Accueil : grille de cartes -->
+      <!-- Accueil : connexion par code + grille de cartes -->
+      <RdConnectPanel
+        bind:connectionCode
+        actionLoading={sessionManager.actionLoading}
+        waitingForApproval={sessionManager.waitingForApproval}
+        actionError={sessionManager.actionError}
+        onConnect={() => void sessionManager.startSessionWithCode()} />
       <RdDashboardCards onPick={goCard} />
     {:else}
       <!-- Vue détail d'une carte -->
@@ -954,12 +960,6 @@
       {#if dashView === "me"}
         <RdMetricsPanel />
       {:else if dashView === "machines"}
-        <RdConnectPanel
-          bind:connectionCode
-          actionLoading={sessionManager.actionLoading}
-          waitingForApproval={sessionManager.waitingForApproval}
-          actionError={sessionManager.actionError}
-          onConnect={() => void sessionManager.startSessionWithCode()} />
         <RdSupervisedMachines />
       {:else if dashView === "users"}
         <RdUsersPanel />

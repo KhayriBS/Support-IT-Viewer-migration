@@ -110,6 +110,18 @@ export const technicianApi = {
     return request<AppUser[]>("/users", { token });
   },
 
+  createUser(body: Partial<AppUser> & { username: string; password?: string }, token?: string) {
+    return request<AppUser>("/users", { method: "POST", token, body });
+  },
+
+  updateUser(id: number, body: Partial<AppUser> & { password?: string }, token?: string) {
+    return request<AppUser>(`/users/${id}`, { method: "PUT", token, body });
+  },
+
+  deleteUser(id: number, token?: string) {
+    return request<void>(`/users/${id}`, { method: "DELETE", token });
+  },
+
   /** Lie une machine à un utilisateur (par id numérique). */
   assignMachine(machineId: number, userId: number, token?: string) {
     return request<Agent>(`/admin/machines/${machineId}/assign`, {

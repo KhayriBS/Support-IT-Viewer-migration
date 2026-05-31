@@ -22,6 +22,8 @@ export interface AppUser {
   username: string;
   email?: string;
   fullName?: string;
+  phoneNumber?: string;
+  department?: string;
   role: "USER" | "ADMIN";
   enabled?: boolean;
 }
