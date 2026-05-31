@@ -36,6 +36,8 @@
   import RdChatPanel from "$lib/components/RdChatPanel.svelte";
   import RdScreenPanel from "$lib/components/RdScreenPanel.svelte";
   import RdSupervisedMachines from "$lib/components/RdSupervisedMachines.svelte";
+  import RdUsersPanel from "$lib/components/RdUsersPanel.svelte";
+  import RdDashboardCards, { type DashCard } from "$lib/components/RdDashboardCards.svelte";
   import PrivacyControl from "$lib/components/PrivacyControl.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
   import { approvalManager } from "$lib/managers/approval-manager.svelte";
@@ -56,6 +58,10 @@
   let agentsUpdatedAt = $state<string>("-");
 
   let connectionCode = $state("");
+  /** Carte sélectionnée. null = grille d'accueil. */
+  let dashView = $state<DashCard | null>(null);
+  function goCard(c: DashCard) { dashView = c; }
+  function backToCards() { dashView = null; }
   // SignalBus (signaling state/logs/reconnect) → cf. $lib/managers/signal-bus.svelte.ts
   // Historique sessions/fichiers → cf. $lib/managers/history-manager.svelte.ts
 
@@ -859,111 +865,146 @@
 </svelte:head>
 
 <main class="rd-page">
-  <!-- UI "Bureau à Distance" (cf. maquette). -->
   <section class="rd-card">
     <RdAppHeader />
 
-    <RdConnectPanel
-      bind:connectionCode
-      actionLoading={sessionManager.actionLoading}
-      waitingForApproval={sessionManager.waitingForApproval}
-      actionError={sessionManager.actionError}
-      onConnect={() => void sessionManager.startSessionWithCode()} />
+    {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE"}
+      <!-- Session active : on garde l'UX historique (menu + sous-panneaux) -->
+      {#if !sessionManager.selectedFeature}
+        <RdSessionMenu
+          session={sessionManager.activeSession}
+          chatLocalRole={chatManager.chatLocalRole}
+          actionLoading={sessionManager.actionLoading}
+          onPickFeature={(f) => {
+            if (f === "chat") sessionManager.chooseFeature("chat");
+            else sessionManager.selectedFeature = f;
+          }}
+          onDisconnect={() => void sessionManager.stopByToken()} />
+      {/if}
 
-    <!-- ── Supervision globale (technicien uniquement) ──────────────── -->
-    <RdSupervisedMachines />
+      {#if sessionManager.selectedFeature === "files"}
+        <RdFilesPanel
+          session={sessionManager.activeSession}
+          actionLoading={sessionManager.actionLoading}
+          bind:fileInputEl={rdFileInputEl}
+          onBackToMenu={() => { sessionManager.selectedFeature = null; }}
+          onTriggerPicker={rdTriggerFilePicker}
+          onFilePicked={rdHandleFilePicked}
+          onDisconnect={() => void sessionManager.stopByToken()} />
+      {/if}
 
-    <!-- ── Session active : menu Écran / Fichier / Chat ─────────────── -->
-    {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && !sessionManager.selectedFeature}
-      <RdSessionMenu
-        session={sessionManager.activeSession}
-        chatLocalRole={chatManager.chatLocalRole}
-        actionLoading={sessionManager.actionLoading}
-        onPickFeature={(f) => {
-          if (f === "chat") sessionManager.chooseFeature("chat");
-          else sessionManager.selectedFeature = f;
-        }}
-        onDisconnect={() => void sessionManager.stopByToken()} />
-    {/if}
+      {#if sessionManager.selectedFeature === "chat"}
+        <RdChatPanel
+          chatConnected={chatManager.chatConnected}
+          chatError={chatManager.chatError}
+          chatLocalRole={chatManager.chatLocalRole}
+          messages={chatManager.chatMessages}
+          typing={chatManager.typingInfo}
+          bind:chatListEl={chatManager.chatListEl}
+          bind:chatInput={chatManager.chatInput}
+          actionLoading={sessionManager.actionLoading}
+          composeDisabled={!sessionManager.activeSession || sessionManager.activeSession.status !== "ACTIVE"}
+          onReconnect={() => void chatManager.connect()}
+          onBackToMenu={() => { sessionManager.selectedFeature = null; }}
+          onDisconnect={() => void sessionManager.stopByToken()}
+          onSend={() => void chatManager.send()}
+          onInput={chatManager.dispatchTyping} />
+      {/if}
 
-    <!-- ── Sous-panneau "Transfert de fichiers" (sans écran) ─────────── -->
-    {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && sessionManager.selectedFeature === "files"}
-      <RdFilesPanel
-        session={sessionManager.activeSession}
-        actionLoading={sessionManager.actionLoading}
-        bind:fileInputEl={rdFileInputEl}
-        onBackToMenu={() => { sessionManager.selectedFeature = null; }}
-        onTriggerPicker={rdTriggerFilePicker}
-        onFilePicked={rdHandleFilePicked}
-        onDisconnect={() => void sessionManager.stopByToken()} />
-    {/if}
-
-    <!-- ── Sous-panneau "Chat" (sans écran) ────────────────────────── -->
-    {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && sessionManager.selectedFeature === "chat"}
-      <RdChatPanel
-        chatConnected={chatManager.chatConnected}
-        chatError={chatManager.chatError}
-        chatLocalRole={chatManager.chatLocalRole}
-        messages={chatManager.chatMessages}
-        typing={chatManager.typingInfo}
-        bind:chatListEl={chatManager.chatListEl}
-        bind:chatInput={chatManager.chatInput}
-        actionLoading={sessionManager.actionLoading}
-        composeDisabled={!sessionManager.activeSession || sessionManager.activeSession.status !== "ACTIVE"}
-        onReconnect={() => void chatManager.connect()}
-        onBackToMenu={() => { sessionManager.selectedFeature = null; }}
-        onDisconnect={() => void sessionManager.stopByToken()}
-        onSend={() => void chatManager.send()}
-        onInput={chatManager.dispatchTyping} />
-    {/if}
-
-    <!-- ── Sous-panneau "Écran" : vidéo + Play/Pause ──────────────── -->
-    {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && sessionManager.selectedFeature === "screen"}
-      <div class="rd-privacy-row">
-        <PrivacyControl />
+      {#if sessionManager.selectedFeature === "screen"}
+        <div class="rd-privacy-row"><PrivacyControl /></div>
+        <RdScreenPanel
+          session={sessionManager.activeSession}
+          actionLoading={sessionManager.actionLoading}
+          chatConnected={chatManager.chatConnected}
+          chatLocalRole={chatManager.chatLocalRole}
+          messages={chatManager.chatMessages}
+          typing={chatManager.typingInfo}
+          bind:chatListEl={chatManager.chatListEl}
+          bind:chatInput={chatManager.chatInput}
+          {rdScreenPlayRequested}
+          {rdVideoPausedForTransfer}
+          bind:fileInputEl={rdFileInputEl}
+          onBackToMenu={() => { sessionManager.selectedFeature = null; }}
+          onPlay={rdPlayScreen}
+          onPause={rdPauseScreen}
+          onConnectChat={() => void chatManager.connect()}
+          onTriggerFilePicker={rdTriggerFilePicker}
+          onFilePicked={rdHandleFilePicked}
+          onSendMessage={() => void chatManager.send()}
+          onDispatchTyping={chatManager.dispatchTyping}
+          onDisconnect={() => void sessionManager.stopByToken()} />
+      {/if}
+    {:else if dashView === null}
+      <!-- Accueil : grille de cartes -->
+      <RdDashboardCards onPick={goCard} />
+    {:else}
+      <!-- Vue détail d'une carte -->
+      <div class="rd-back-row">
+        <button class="rd-back" type="button" onclick={backToCards}>← Retour</button>
+        <h2 class="rd-back__title">
+          {#if dashView === "me"}Ma machine
+          {:else if dashView === "machines"}Machines supervisées
+          {:else if dashView === "users"}Utilisateurs
+          {:else if dashView === "history"}Historiques
+          {/if}
+        </h2>
       </div>
-      <RdScreenPanel
-        session={sessionManager.activeSession}
-        actionLoading={sessionManager.actionLoading}
-        chatConnected={chatManager.chatConnected}
-        chatLocalRole={chatManager.chatLocalRole}
-        messages={chatManager.chatMessages}
-        typing={chatManager.typingInfo}
-        bind:chatListEl={chatManager.chatListEl}
-        bind:chatInput={chatManager.chatInput}
-        {rdScreenPlayRequested}
-        {rdVideoPausedForTransfer}
-        bind:fileInputEl={rdFileInputEl}
-        onBackToMenu={() => { sessionManager.selectedFeature = null; }}
-        onPlay={rdPlayScreen}
-        onPause={rdPauseScreen}
-        onConnectChat={() => void chatManager.connect()}
-        onTriggerFilePicker={rdTriggerFilePicker}
-        onFilePicked={rdHandleFilePicked}
-        onSendMessage={() => void chatManager.send()}
-        onDispatchTyping={chatManager.dispatchTyping}
-        onDisconnect={() => void sessionManager.stopByToken()} />
+
+      {#if dashView === "me"}
+        <RdMetricsPanel />
+      {:else if dashView === "machines"}
+        <RdConnectPanel
+          bind:connectionCode
+          actionLoading={sessionManager.actionLoading}
+          waitingForApproval={sessionManager.waitingForApproval}
+          actionError={sessionManager.actionError}
+          onConnect={() => void sessionManager.startSessionWithCode()} />
+        <RdSupervisedMachines />
+      {:else if dashView === "users"}
+        <RdUsersPanel />
+      {:else if dashView === "history"}
+        <div class="rd-history-grid">
+          <RdSessionHistory
+            entries={rdFilteredSessions}
+            error={historyManager.sessionsError}
+            loading={historyManager.sessionsLoading}
+            bind:search={historyManager.sessionSearch}
+            bind:typeFilter={historyManager.sessionTypeFilter}
+            bind:statusFilter={historyManager.sessionStatusFilter} />
+          <RdFileHistory
+            entries={rdFilteredFiles}
+            error={historyManager.filesError}
+            loading={historyManager.filesLoading}
+            bind:search={historyManager.fileSearch}
+            bind:filter={historyManager.fileFilter} />
+        </div>
+      {/if}
     {/if}
-
-    <RdMetricsPanel />
-
-    <div class="rd-history-grid">
-      <RdSessionHistory
-        entries={rdFilteredSessions}
-        error={historyManager.sessionsError}
-        loading={historyManager.sessionsLoading}
-        bind:search={historyManager.sessionSearch}
-        bind:typeFilter={historyManager.sessionTypeFilter}
-        bind:statusFilter={historyManager.sessionStatusFilter} />
-
-      <RdFileHistory
-        entries={rdFilteredFiles}
-        error={historyManager.filesError}
-        loading={historyManager.filesLoading}
-        bind:search={historyManager.fileSearch}
-        bind:filter={historyManager.fileFilter} />
-    </div>
   </section>
-
-  <!-- Le modal d'approbation est monté par +layout.svelte. -->
 </main>
+
+<style>
+  .rd-back-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 8px 0 18px;
+  }
+  .rd-back {
+    background: rgba(255, 255, 255, 0.06);
+    color: inherit;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .rd-back:hover { background: rgba(255, 255, 255, 0.12); }
+  .rd-back__title {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    opacity: 0.9;
+  }
+</style>
