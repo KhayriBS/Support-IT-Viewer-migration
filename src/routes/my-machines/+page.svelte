@@ -3,7 +3,7 @@
   // cette machine. Lecture seule — pas de bouton "démarrer session". L'approbation
   // d'une demande entrante reste gérée par le modal du +layout.svelte.
   import { onDestroy, onMount } from "svelte";
-  import { technicianApi } from "$lib/api";
+  import { onAgentUpdate, technicianApi } from "$lib/api";
   import type { Agent } from "$lib/api";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
 
@@ -12,6 +12,7 @@
   let error = $state<string | null>(null);
   let lastRefresh = $state<string>("");
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let unsubscribeRealtime: (() => void) | null = null;
 
   async function refresh() {
     loading = true;
@@ -34,11 +35,24 @@
 
   onMount(() => {
     void refresh();
-    refreshTimer = setInterval(refresh, 8000);
+    refreshTimer = setInterval(refresh, 30_000);
+
+    unsubscribeRealtime = onAgentUpdate((updated) => {
+      // Patch en place si la machine est déjà dans la liste, sinon re-fetch
+      // (le owner peut avoir reçu une nouvelle attribution).
+      const idx = machines.findIndex((m) => m.id === updated.id);
+      if (idx >= 0) {
+        machines = [...machines.slice(0, idx), updated, ...machines.slice(idx + 1)];
+        lastRefresh = new Date().toLocaleTimeString();
+      } else if (updated.assignedUsername === agentManager.assignedUsername) {
+        void refresh();
+      }
+    });
   });
 
   onDestroy(() => {
     if (refreshTimer) clearInterval(refreshTimer);
+    unsubscribeRealtime?.();
   });
 </script>
 
@@ -74,7 +88,7 @@
         <tr>
           <th>Hostname</th>
           <th>Identifiant matériel</th>
-          <th>OS info</th>
+          <th>OS</th>
           <th>Statut</th>
           <th>Dernier ping</th>
         </tr>
@@ -84,7 +98,7 @@
           <tr class:current={m.machineId === agentManager.localMachineId}>
             <td>{m.hostname ?? "—"}</td>
             <td><code>{m.machineId}</code></td>
-            <td>{m.osInfo ?? "—"}</td>
+            <td>{m.os ?? "—"}</td>
             <td><span class={statusBadgeClass(m.status)}>{m.status ?? "—"}</span></td>
             <td>{m.lastHeartbeat ?? "—"}</td>
           </tr>

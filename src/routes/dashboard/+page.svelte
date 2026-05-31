@@ -35,6 +35,7 @@
   import RdFilesPanel from "$lib/components/RdFilesPanel.svelte";
   import RdChatPanel from "$lib/components/RdChatPanel.svelte";
   import RdScreenPanel from "$lib/components/RdScreenPanel.svelte";
+  import RdSupervisedMachines from "$lib/components/RdSupervisedMachines.svelte";
   import PrivacyControl from "$lib/components/PrivacyControl.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
   import { approvalManager } from "$lib/managers/approval-manager.svelte";
@@ -868,6 +869,9 @@
       waitingForApproval={sessionManager.waitingForApproval}
       actionError={sessionManager.actionError}
       onConnect={() => void sessionManager.startSessionWithCode()} />
+
+    <!-- ── Supervision globale (technicien uniquement) ──────────────── -->
+    <RdSupervisedMachines />
 
     <!-- ── Session active : menu Écran / Fichier / Chat ─────────────── -->
     {#if sessionManager.activeSession && sessionManager.activeSession.status === "ACTIVE" && !sessionManager.selectedFeature}

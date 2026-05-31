@@ -2,6 +2,7 @@ import type {
   Agent,
   AgentMetrics,
   ApiResponse,
+  AppUser,
   ChatMessage,
   ControlSession,
   FileTransferHistoryEntry,
@@ -86,6 +87,36 @@ export const technicianApi = {
   /** Machines attribuées au propriétaire de la machine appelante (vue USER). */
   getMyMachines(token?: string) {
     return request<Agent[]>("/agents/mine", { token });
+  },
+
+  /** Toutes les machines + sessions actives + stats (vue TECHNICIEN). */
+  getAdminDashboard(token?: string) {
+    return request<{
+      machines: Agent[];
+      activeSessions: ControlSession[];
+      stats: {
+        totalMachines: number;
+        onlineMachines: number;
+        offlineMachines: number;
+        unassignedMachines: number;
+        activeSessions: number;
+        totalUsers: number;
+      };
+    }>("/admin/dashboard", { token });
+  },
+
+  /** Tous les utilisateurs (pour le picker d'assignation). */
+  listUsers(token?: string) {
+    return request<AppUser[]>("/users", { token });
+  },
+
+  /** Lie une machine à un utilisateur (par id numérique). */
+  assignMachine(machineId: number, userId: number, token?: string) {
+    return request<Agent>(`/admin/machines/${machineId}/assign`, {
+      method: "PUT",
+      token,
+      body: { userId }
+    });
   },
 
   async startSession(machineId: string, token?: string) {

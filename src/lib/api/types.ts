@@ -8,15 +8,22 @@ export interface Agent {
   id: number;
   machineId: string;
   hostname: string;
-  osInfo: string;
-  ipAddress: string;
+  os: string;
   status: string;
   lastHeartbeat: string;
   assignedUsername?: string;
+  assignedAt?: string;
+  assignedBy?: string;
   connectionCode?: string;
-  cpuUsage?: number;
-  memoryUsage?: number;
-  diskUsage?: number;
+}
+
+export interface AppUser {
+  id: number;
+  username: string;
+  email?: string;
+  fullName?: string;
+  role: "USER" | "ADMIN";
+  enabled?: boolean;
 }
 
 export interface AgentMetrics {

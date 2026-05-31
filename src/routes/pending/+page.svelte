@@ -1,10 +1,14 @@
 <script lang="ts">
   // Écran d'attente quand l'agent n'a encore aucun propriétaire assigné.
-  // Le polling /agents/login toutes les 30 s est déclenché par +layout.svelte
-  // (cf. pendingPollTimer). L'utilisateur n'a qu'à attendre — dès qu'un
-  // technicien fait PUT /admin/machines/{id}/assign, le role bascule et
-  // +layout.svelte redirige automatiquement.
+  // Deux mécanismes de bascule automatique :
+  //  - STOMP /topic/agents (instantané) : si un event arrive sur NOTRE machineId
+  //    avec un assignedUsername défini, on déclenche refreshRole().
+  //  - Polling 30 s dans +layout.svelte (fallback si STOMP HS).
+  import { onDestroy, onMount } from "svelte";
+  import { onAgentUpdate } from "$lib/api";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
+
+  let unsubscribeRealtime: (() => void) | null = null;
 
   async function copyMachineId() {
     if (!agentManager.localMachineId) return;
@@ -18,6 +22,20 @@
   async function refreshNow() {
     await agentManager.refreshRole();
   }
+
+  onMount(() => {
+    unsubscribeRealtime = onAgentUpdate((updated) => {
+      if (updated.machineId === agentManager.localMachineId
+          && updated.assignedUsername
+          && updated.assignedUsername.trim() !== "") {
+        void agentManager.refreshRole();
+      }
+    });
+  });
+
+  onDestroy(() => {
+    unsubscribeRealtime?.();
+  });
 </script>
 
 <svelte:head>
