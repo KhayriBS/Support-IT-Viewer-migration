@@ -1,22 +1,37 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { technicianApi } from "$lib/api";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
 
-  // Statut internet réel via navigator.onLine + events online/offline.
-  let online = $state(
-    typeof navigator !== "undefined" ? navigator.onLine : true
-  );
+  // Ping réel toutes les 5 s avec timeout 2 s. navigator.onLine est ignoré
+  // (peu fiable sur webview Windows : il rapporte true même WiFi coupé).
+  let online = $state(true);
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
 
-  function syncOnline() { online = navigator.onLine; }
+  async function pingServer() {
+    const ctl = new AbortController();
+    const timeoutId = setTimeout(() => ctl.abort(), 2000);
+    try {
+      const res = await fetch(`${technicianApi.baseUrl}/auth/machine-status/__ping__`, {
+        method: "GET",
+        signal: ctl.signal,
+        cache: "no-store"
+      });
+      online = res.ok || res.status === 404; // 404 reste une preuve que le serveur a répondu
+    } catch {
+      online = false;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
 
   onMount(() => {
-    window.addEventListener("online", syncOnline);
-    window.addEventListener("offline", syncOnline);
+    void pingServer();
+    pingTimer = setInterval(pingServer, 5000);
   });
 
   onDestroy(() => {
-    window.removeEventListener("online", syncOnline);
-    window.removeEventListener("offline", syncOnline);
+    if (pingTimer) clearInterval(pingTimer);
   });
 </script>
 
