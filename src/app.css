@@ -178,6 +178,7 @@
     color: #fff;
   }
   .rd-metric__value--ok { color: #4ade80; }
+  .rd-metric__value--ko { color: #ff8484; }
 
   /* ── Historique grille ────────────────────────────────────────── */
   .rd-history-grid {

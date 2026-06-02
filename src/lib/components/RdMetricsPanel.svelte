@@ -1,5 +1,23 @@
 <script lang="ts">
+  import { onDestroy, onMount } from "svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
+
+  // Statut internet réel via navigator.onLine + events online/offline.
+  let online = $state(
+    typeof navigator !== "undefined" ? navigator.onLine : true
+  );
+
+  function syncOnline() { online = navigator.onLine; }
+
+  onMount(() => {
+    window.addEventListener("online", syncOnline);
+    window.addEventListener("offline", syncOnline);
+  });
+
+  onDestroy(() => {
+    window.removeEventListener("online", syncOnline);
+    window.removeEventListener("offline", syncOnline);
+  });
 </script>
 
 <section class="rd-panel">
@@ -19,7 +37,9 @@
     </div>
     <div class="rd-metric">
       <div class="rd-metric__head"><span class="rd-metric__icon rd-metric__icon--net">📶</span> Réseau</div>
-      <div class="rd-metric__value rd-metric__value--ok">Connected</div>
+      <div class="rd-metric__value {online ? 'rd-metric__value--ok' : 'rd-metric__value--ko'}">
+        {online ? "Connecté" : "Non connecté"}
+      </div>
     </div>
   </div>
 </section>
