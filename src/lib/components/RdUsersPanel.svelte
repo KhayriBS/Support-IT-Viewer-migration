@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
   import { technicianApi } from "$lib/api";
   import type { AppUser } from "$lib/api";
+  import { dashboardData } from "$lib/managers/dashboard-data.svelte";
 
   type FormState = {
     id: number | null;
@@ -29,13 +29,8 @@
     };
   }
 
-  let users = $state<AppUser[]>([]);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
   let search = $state("");
   let roleFilter = $state<"all" | "USER" | "ADMIN">("all");
-  let lastRefresh = $state("");
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
   // État du modal d'édition / création
   let formOpen = $state(false);
@@ -43,18 +38,13 @@
   let saving = $state(false);
   let formError = $state<string | null>(null);
 
-  async function refresh() {
-    loading = true;
-    try {
-      users = (await technicianApi.listUsers()) ?? [];
-      error = null;
-      lastRefresh = new Date().toLocaleTimeString();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
-  }
+  // Source de vérité partagée : la liste vient du store (déjà chargée par
+  // le layout au démarrage). Le composant n'attend rien.
+  const users = $derived(dashboardData.users);
+  const loading = $derived(dashboardData.loadingUsers);
+  const error = $derived(dashboardData.error);
+  const lastRefresh = $derived(dashboardData.lastRefresh);
+  const refresh = dashboardData.refreshUsers;
 
   const filtered = $derived.by(() => {
     const q = search.trim().toLowerCase();
@@ -134,6 +124,8 @@
     }
   }
 
+  let actionError = $state<string | null>(null);
+
   async function remove(u: AppUser) {
     if (!confirm(`Supprimer l'utilisateur "${u.username}" ?\nToutes ses machines seront désaffectées.`)) {
       return;
@@ -142,18 +134,10 @@
       await technicianApi.deleteUser(u.id);
       await refresh();
     } catch (e) {
-      error = String(e);
+      actionError = String(e);
     }
   }
 
-  onMount(() => {
-    void refresh();
-    refreshTimer = setInterval(refresh, 15_000);
-  });
-
-  onDestroy(() => {
-    if (refreshTimer) clearInterval(refreshTimer);
-  });
 </script>
 
 <section class="rd-panel users">
@@ -182,8 +166,8 @@
     </select>
   </div>
 
-  {#if error}
-    <p class="users__error">{error}</p>
+  {#if error || actionError}
+    <p class="users__error">{actionError ?? error}</p>
   {/if}
 
   {#if filtered.length === 0 && !loading}

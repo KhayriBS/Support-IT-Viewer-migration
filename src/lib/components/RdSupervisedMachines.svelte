@@ -1,49 +1,29 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-  import { onAgentUpdate, technicianApi } from "$lib/api";
-  import type { Agent, AppUser } from "$lib/api";
+  import { technicianApi } from "$lib/api";
+  import { dashboardData } from "$lib/managers/dashboard-data.svelte";
 
-  let machines = $state<Agent[]>([]);
-  let users = $state<AppUser[]>([]);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
   let assigningId = $state<number | null>(null);
   let pickedUserByMachine = $state<Record<number, number | "">>({});
-  let lastRefresh = $state<string>("");
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
-  let unsubscribeRealtime: (() => void) | null = null;
+  let actionError = $state<string | null>(null);
 
-  async function refresh() {
-    loading = true;
-    try {
-      const dash = await technicianApi.getAdminDashboard();
-      machines = dash?.machines ?? [];
-      error = null;
-      lastRefresh = new Date().toLocaleTimeString();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
-  }
-
-  async function loadUsers() {
-    try {
-      users = (await technicianApi.listUsers()) ?? [];
-    } catch (e) {
-      error = String(e);
-    }
-  }
+  const machines = $derived(dashboardData.machines);
+  const users = $derived(dashboardData.users);
+  const lastRefresh = $derived(dashboardData.lastRefresh);
+  const loading = $derived(dashboardData.loadingMachines);
 
   async function assign(machineId: number) {
     const userId = pickedUserByMachine[machineId];
     if (!userId) return;
     assigningId = machineId;
+    actionError = null;
     try {
       await technicianApi.assignMachine(machineId, Number(userId));
-      await refresh();
+      // STOMP pousse l'update sur /topic/agents → patch in-place automatique
+      // via dashboard-data ; on déclenche un refresh stats juste pour synchro
+      // au cas où le broadcast STOMP serait en retard.
+      void dashboardData.refreshDashboard();
     } catch (e) {
-      error = String(e);
+      actionError = String(e);
     } finally {
       assigningId = null;
     }
@@ -54,31 +34,6 @@
     if (status === "BUSY") return "busy";
     return "off";
   }
-
-  onMount(() => {
-    void refresh();
-    void loadUsers();
-    // Filet de sécurité plus large que 8 s puisque les events STOMP
-    // déclenchent un patch in-place sans attendre.
-    refreshTimer = setInterval(refresh, 30_000);
-
-    unsubscribeRealtime = onAgentUpdate((updated) => {
-      // Patch en place pour éviter de re-fetch tout le dashboard à chaque
-      // event ; on tombe sur refresh() seulement si la machine est nouvelle.
-      const idx = machines.findIndex((m) => m.id === updated.id);
-      if (idx >= 0) {
-        machines = [...machines.slice(0, idx), updated, ...machines.slice(idx + 1)];
-      } else {
-        machines = [...machines, updated];
-      }
-      lastRefresh = new Date().toLocaleTimeString();
-    });
-  });
-
-  onDestroy(() => {
-    if (refreshTimer) clearInterval(refreshTimer);
-    unsubscribeRealtime?.();
-  });
 </script>
 
 <section class="rd-panel sup">
@@ -87,14 +42,14 @@
     <div class="sup__meta">
       <span>{machines.length} machine{machines.length > 1 ? "s" : ""}</span>
       {#if lastRefresh}<span class="sub">· MAJ {lastRefresh}</span>{/if}
-      <button class="sup__reload" type="button" onclick={refresh} disabled={loading}>
+      <button class="sup__reload" type="button" onclick={dashboardData.refreshDashboard} disabled={loading}>
         {loading ? "…" : "Rafraîchir"}
       </button>
     </div>
   </header>
 
-  {#if error}
-    <p class="sup__error">{error}</p>
+  {#if actionError}
+    <p class="sup__error">{actionError}</p>
   {/if}
 
   {#if machines.length === 0 && !loading}

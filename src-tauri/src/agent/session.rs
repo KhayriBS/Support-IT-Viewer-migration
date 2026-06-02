@@ -379,16 +379,34 @@ pub async fn start_agent(
     tracing::info!("Hostname  : {hostname}");
     tracing::info!("OS        : {os}");
 
+    // Register + login SYNCHRONES avant de spawn la boucle, sinon Svelte se
+    // retrouve avec role="" et reste 30s sur l'écran "Connexion…" jusqu'au
+    // prochain polling du layout.
+    let auth = AgentAuthService::new(&server_url);
+    let agent = auth.register_or_update(&machine_id, &hostname, &os).await?;
+    tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
+    let login = auth.login(&machine_id, &os).await?;
+    let token = login.token.clone();
+    tracing::info!(
+        "✅ Agent authenticated (role={}, assigned={:?})",
+        login.role,
+        login.assigned_username
+    );
+
     {
+        *state.jwt_token.lock().await = Some(token.clone());
         let mut s = state.status.lock().await;
         s.running = true;
+        s.authenticated = true;
         s.machine_id = machine_id.clone();
         s.server_url = server_url.clone();
+        s.role = login.role.clone();
+        s.assigned_username = login.assigned_username.clone();
     }
 
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
-        if let Err(e) = agent_loop(state_clone, server_url, machine_id, hostname, os).await {
+        if let Err(e) = agent_loop(state_clone, server_url, machine_id, hostname, os, token).await {
             tracing::warn!("❌ Agent loop error: {e}");
         }
     });
@@ -414,32 +432,15 @@ async fn agent_loop(
     state: Arc<SharedState>,
     server_url: String,
     machine_id: String,
-    hostname: String,
-    os: String,
+    _hostname: String,
+    _os: String,
+    token: String,
 ) -> Result<(), String> {
     let auth = AgentAuthService::new(&server_url);
     let metrics_collector = MetricsCollector::new();
 
-    // ── Register ──────────────────────────────────────────────────────────────
-    let agent = auth.register_or_update(&machine_id, &hostname, &os).await?;
-    tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
-
-    // ── Login → JWT + rôle ────────────────────────────────────────────────────
-    let login = auth.login(&machine_id, &os).await?;
-    let token = login.token.clone();
-    tracing::info!(
-        "✅ Agent authenticated (role={}, assigned={:?})",
-        login.role,
-        login.assigned_username
-    );
-
-    {
-        *state.jwt_token.lock().await = Some(token.clone());
-        let mut s = state.status.lock().await;
-        s.authenticated = true;
-        s.role = login.role.clone();
-        s.assigned_username = login.assigned_username.clone();
-    }
+    // register + login déjà faits par start_agent() avant le spawn — on entre
+    // directement dans la boucle heartbeat/metrics/session-poll.
 
     // ── Periods (same as C#) ──────────────────────────────────────────────────
     let mut heartbeat_tick = interval(Duration::from_secs(10));

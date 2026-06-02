@@ -26,19 +26,25 @@ class HistoryManager {
   }
 
   fetchSessions = async () => {
-    const key = this.resolveKey();
-    if (!key) {
-      this.sessions = [];
-      return;
-    }
     this.sessionsLoading = true;
     this.sessionsError = null;
     try {
-      this.sessions = await technicianApi.getSessionHistory(key, {
-        direction: this.sessionTypeFilter,
-        status: this.sessionStatusFilter,
-        q: this.sessionSearch
-      });
+      // Vue technicien : tout l'historique global (toutes machines).
+      // Vue USER : historique restreint à sa propre machine via la clé.
+      if (agentManager.role === "TECHNICIAN") {
+        this.sessions = await technicianApi.getAllSessionHistory({
+          status: this.sessionStatusFilter,
+          q: this.sessionSearch
+        });
+      } else {
+        const key = this.resolveKey();
+        if (!key) { this.sessions = []; return; }
+        this.sessions = await technicianApi.getSessionHistory(key, {
+          direction: this.sessionTypeFilter,
+          status: this.sessionStatusFilter,
+          q: this.sessionSearch
+        });
+      }
     } catch (err) {
       this.sessionsError = String(err);
       this.sessions = [];
@@ -48,25 +54,27 @@ class HistoryManager {
   };
 
   fetchFiles = async () => {
-    const key = this.resolveKey();
-    if (!key) {
-      this.files = [];
-      return;
-    }
     this.filesLoading = true;
     this.filesError = null;
     try {
-      // fileFilter "upload" = sortant (ce PC envoie) → "outgoing"
-      // fileFilter "download" = entrant (ce PC reçoit) → "incoming"
-      const direction =
-        this.fileFilter === "upload" ? "outgoing"
-          : this.fileFilter === "download" ? "incoming"
-          : "all";
-      this.files = await technicianApi.getFileTransferHistory(key, {
-        direction,
-        status: "all",
-        q: this.fileSearch
-      });
+      if (agentManager.role === "TECHNICIAN") {
+        this.files = await technicianApi.getAllFileTransferHistory({
+          status: "all",
+          q: this.fileSearch
+        });
+      } else {
+        const key = this.resolveKey();
+        if (!key) { this.files = []; return; }
+        const direction =
+          this.fileFilter === "upload" ? "outgoing"
+            : this.fileFilter === "download" ? "incoming"
+            : "all";
+        this.files = await technicianApi.getFileTransferHistory(key, {
+          direction,
+          status: "all",
+          q: this.fileSearch
+        });
+      }
     } catch (err) {
       this.filesError = String(err);
       this.files = [];

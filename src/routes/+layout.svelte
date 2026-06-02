@@ -6,6 +6,7 @@
   import RdApprovalModal from "$lib/components/RdApprovalModal.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
   import { approvalManager, type ApprovalDecision } from "$lib/managers/approval-manager.svelte";
+  import { dashboardData } from "$lib/managers/dashboard-data.svelte";
   import { sessionManager } from "$lib/managers/session-manager.svelte";
 
   let { children } = $props();
@@ -35,6 +36,11 @@
   $effect(() => {
     const role = agentManager.role;
     if (!role) return;
+    // Pré-charge le cache dashboard dès qu'on est TECHNICIAN — la navigation
+    // entre cartes devient instantanée.
+    if (role === "TECHNICIAN") {
+      dashboardData.start();
+    }
     const target = routeForRole(role);
     if (page.url.pathname === "/" || page.url.pathname === target) {
       if (page.url.pathname !== target) {
@@ -79,6 +85,7 @@
     if (approvalTimer) clearInterval(approvalTimer);
     if (pendingPollTimer) clearInterval(pendingPollTimer);
     if (!realUnloadInProgress) return;
+    dashboardData.stop();
     void agentManager.stopLifecycle();
   });
 </script>

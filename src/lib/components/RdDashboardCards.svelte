@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-  import { onAgentUpdate, technicianApi } from "$lib/api";
-  import type { Agent, AppUser } from "$lib/api";
+  import { dashboardData } from "$lib/managers/dashboard-data.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
 
   export type DashCard = "me" | "machines" | "users" | "history";
@@ -12,48 +10,12 @@
 
   let { onPick }: Props = $props();
 
-  // Compteurs agrégés affichés sur chaque carte. On lit l'admin dashboard
-  // (qui renvoie déjà machines + activeSessions + stats) + la liste users.
-  let totalMachines = $state(0);
-  let onlineMachines = $state(0);
-  let activeSessions = $state(0);
-  let unassigned = $state(0);
-  let totalUsers = $state(0);
-  let error = $state<string | null>(null);
-  let unsubRealtime: (() => void) | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-
-  async function refreshStats() {
-    try {
-      const dash = await technicianApi.getAdminDashboard();
-      if (dash) {
-        totalMachines = dash.stats.totalMachines;
-        onlineMachines = dash.stats.onlineMachines;
-        activeSessions = dash.stats.activeSessions;
-        unassigned = dash.stats.unassignedMachines;
-        totalUsers = dash.stats.totalUsers;
-        error = null;
-      }
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  onMount(() => {
-    void refreshStats();
-    pollTimer = setInterval(refreshStats, 30_000);
-    unsubRealtime = onAgentUpdate(() => void refreshStats());
-  });
-
-  onDestroy(() => {
-    if (pollTimer) clearInterval(pollTimer);
-    unsubRealtime?.();
-  });
+  const stats = $derived(dashboardData.stats);
 </script>
 
 <section class="cards">
-  {#if error}
-    <p class="cards__error">Erreur stats : {error}</p>
+  {#if dashboardData.error}
+    <p class="cards__error">Erreur stats : {dashboardData.error}</p>
   {/if}
 
   <div class="cards__grid">
@@ -71,9 +33,9 @@
     <button class="card card--machines" type="button" onclick={() => onPick("machines")}>
       <div class="card__head"><span class="card__icon">🖥</span><h3>Machines</h3></div>
       <div class="card__body">
-        <p class="card__big">{onlineMachines}<span>/{totalMachines} en ligne</span></p>
-        {#if unassigned > 0}
-          <p class="card__metric warn">{unassigned} non attribuée{unassigned > 1 ? "s" : ""}</p>
+        <p class="card__big">{stats.onlineMachines}<span>/{stats.totalMachines} en ligne</span></p>
+        {#if stats.unassignedMachines > 0}
+          <p class="card__metric warn">{stats.unassignedMachines} non attribuée{stats.unassignedMachines > 1 ? "s" : ""}</p>
         {/if}
       </div>
       <span class="card__cta">Superviser →</span>
@@ -82,7 +44,7 @@
     <button class="card card--users" type="button" onclick={() => onPick("users")}>
       <div class="card__head"><span class="card__icon">👤</span><h3>Utilisateurs</h3></div>
       <div class="card__body">
-        <p class="card__big">{totalUsers}<span>compte{totalUsers > 1 ? "s" : ""}</span></p>
+        <p class="card__big">{stats.totalUsers}<span>compte{stats.totalUsers > 1 ? "s" : ""}</span></p>
       </div>
       <span class="card__cta">Gérer →</span>
     </button>
@@ -90,7 +52,7 @@
     <button class="card card--history" type="button" onclick={() => onPick("history")}>
       <div class="card__head"><span class="card__icon">⏱</span><h3>Historiques</h3></div>
       <div class="card__body">
-        <p class="card__big">{activeSessions}<span>session{activeSessions > 1 ? "s" : ""} active{activeSessions > 1 ? "s" : ""}</span></p>
+        <p class="card__big">{stats.activeSessions}<span>session{stats.activeSessions > 1 ? "s" : ""} active{stats.activeSessions > 1 ? "s" : ""}</span></p>
       </div>
       <span class="card__cta">Voir l'historique →</span>
     </button>

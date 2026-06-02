@@ -159,6 +159,23 @@ export const technicianApi = {
     return unwrap(res) ?? [];
   },
 
+  /**
+   * Historique GLOBAL — vue technicien. Réservé ADMIN côté serveur.
+   * Pas de machineId, retourne toutes les sessions.
+   */
+  async getAllSessionHistory(
+    options: { status?: string; q?: string } = {},
+    token?: string
+  ) {
+    const params = new URLSearchParams();
+    if (options.status && options.status !== "all") params.set("status", options.status);
+    if (options.q && options.q.trim()) params.set("q", options.q.trim());
+    const qs = params.toString();
+    const path = `/sessions/history${qs ? `?${qs}` : ""}`;
+    const res = await request<ApiResponse<SessionHistoryEntry[]>>(path, { token });
+    return unwrap(res) ?? [];
+  },
+
   async startSessionByCode(code: string, token?: string) {
     const res = await request<ApiResponse<ControlSession>>(`/sessions/start-by-code/${code}`, {
       method: "POST",
@@ -327,6 +344,20 @@ export const technicianApi = {
    * Historique des transferts d'une machine donnée (machineId direct ou
    * connection_code 6 chiffres). Filtres direction/status/q (search).
    */
+  /** Historique GLOBAL des transferts — vue technicien (ROLE_ADMIN). */
+  async getAllFileTransferHistory(
+    options: { status?: string; q?: string } = {},
+    token?: string
+  ) {
+    const params = new URLSearchParams();
+    if (options.status && options.status !== "all") params.set("status", options.status);
+    if (options.q && options.q.trim()) params.set("q", options.q.trim());
+    const qs = params.toString();
+    const path = `/file-transfers/history${qs ? `?${qs}` : ""}`;
+    const res = await request<ApiResponse<FileTransferHistoryEntry[]>>(path, { token });
+    return unwrap(res) ?? [];
+  },
+
   async getFileTransferHistory(
     machineId: string,
     options: {
