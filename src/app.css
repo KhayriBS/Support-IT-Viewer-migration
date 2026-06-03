@@ -295,6 +295,42 @@
     font-family: "Consolas", monospace;
     margin-left: 4px;
   }
+  .rd-viewer__actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .rd-viewer__btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: inherit;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .rd-viewer__btn:hover { background: rgba(255, 255, 255, 0.12); }
+  .rd-viewer__btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .rd-viewer__disconnect {
+    background: rgba(255, 132, 132, 0.16);
+    color: #ff8484;
+    border: 1px solid rgba(255, 132, 132, 0.35);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .rd-viewer__disconnect:hover {
+    background: rgba(255, 132, 132, 0.28);
+    border-color: rgba(255, 132, 132, 0.55);
+  }
+  .rd-viewer__disconnect:disabled { opacity: 0.45; cursor: not-allowed; }
+
   .rd-viewer__sub {
     margin: 4px 0 0 0;
     font-size: 12px;

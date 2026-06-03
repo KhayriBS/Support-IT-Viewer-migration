@@ -54,7 +54,9 @@
         <button class="rd-viewer__btn" type="button" onclick={onReconnect}>Reconnecter</button>
       {/if}
       <button class="rd-viewer__btn" type="button" onclick={onBackToMenu}>← Menu</button>
-      <button class="rd-viewer__disconnect" type="button" onclick={onDisconnect} disabled={actionLoading}>Déconnecter</button>
+      {#if chatLocalRole !== "agent"}
+        <button class="rd-viewer__disconnect" type="button" onclick={onDisconnect} disabled={actionLoading}>Déconnecter</button>
+      {/if}
     </div>
   </header>
 

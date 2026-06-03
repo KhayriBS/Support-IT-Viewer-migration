@@ -807,6 +807,17 @@
 
     // Lifecycle agent + approval polling vivent dans +layout.svelte
     // (cross-route). Ici on ne s'occupe que de la vue technicien.
+
+    // Sanitize : après un échec de signaling (close 1011, peer abandonné),
+    // waitingForApproval ou actionLoading peuvent rester collés à true et
+    // bloquer l'input "Connexion par code". On les reset si plus aucune
+    // session active.
+    if (!sessionManager.activeSession) {
+      sessionManager.waitingForApproval = false;
+      sessionManager.actionLoading = false;
+      sessionManager.actionError = null;
+    }
+
     void viewerPeer.refreshViewerIceServers();
     agentManager.refreshMetrics();
     refreshOnlineAgents();

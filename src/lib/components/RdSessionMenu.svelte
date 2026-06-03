@@ -28,13 +28,15 @@
       </h2>
       <p class="rd-viewer__sub">Choisis quelle fonctionnalité utiliser. La vidéo ne démarre que si tu cliques "Écran".</p>
     </div>
-    <button
-      class="rd-viewer__disconnect"
-      type="button"
-      onclick={onDisconnect}
-      disabled={actionLoading}>
-      Déconnecter
-    </button>
+    {#if chatLocalRole !== "agent"}
+      <button
+        class="rd-viewer__disconnect menu-disconnect"
+        type="button"
+        onclick={onDisconnect}
+        disabled={actionLoading}>
+        Déconnecter
+      </button>
+    {/if}
   </header>
 
   <div class="rd-features" class:rd-features--single={chatLocalRole === "agent"}>
@@ -61,3 +63,28 @@
     </button>
   </div>
 </section>
+
+<style>
+  /* Style scoped : garantit que le bouton est visible même si app.css n'est
+     pas rechargé après un rebuild (Vite/Tauri peut louper le hot-reload du
+     CSS global). */
+  .menu-disconnect {
+    background: rgba(255, 132, 132, 0.16);
+    color: #ff8484;
+    border: 1px solid rgba(255, 132, 132, 0.35);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .menu-disconnect:hover {
+    background: rgba(255, 132, 132, 0.28);
+    border-color: rgba(255, 132, 132, 0.55);
+  }
+  .menu-disconnect:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+</style>

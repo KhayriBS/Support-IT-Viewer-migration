@@ -1,7 +1,12 @@
 import { ChatRealtimeClient, technicianApi } from "$lib/api";
 import type { ChatMessage, ControlSession, TypingNotification } from "$lib/api";
 import { mergeMessages, msgKey } from "$lib/utils/chat";
+import { agentManager } from "./agent-manager.svelte";
 import { aiPipeline } from "./ai-pipeline.svelte";
+// Import circulaire intentionnel : sessionManager → chatManager (méthodes)
+// et chatManager → sessionManager ($derived, évalué lazy). Au runtime les
+// deux singletons existent quand le derived est lu pour la première fois.
+import { sessionManager } from "./session-manager.svelte";
 
 class ChatManager {
   client = new ChatRealtimeClient();
@@ -29,13 +34,25 @@ class ChatManager {
 
   // ── Derived role helpers ─────────────────────────────────────────────────
   /**
-   * Local user role. "agent" when the bridge says the local Tauri agent is
-   * the target machine; "viewer" otherwise. Used so chat messages from the
-   * agent side carry the right sender label.
+   * Local user role. "agent" si la machine locale est la cible de la session ;
+   * "viewer" sinon. Réactif sur sessionManager.activeSession ET
+   * agentManager.localMachineId — pas de dépendance à isLocalAgentTargeted
+   * (qui souffrait d'un bug de timing : si la callback était câblée APRÈS
+   * l'activation de la session, le derived restait collé à "viewer" car rien
+   * de réactif ne le re-déclenchait).
    */
   chatLocalRole = $derived.by<"agent" | "viewer">(() => {
-    const session = this.getSession();
-    return session && this.isLocalAgentTargeted(session) ? "agent" : "viewer";
+    // Lecture DIRECTE des $state pour que Svelte capture les dépendances
+    // réactives. Passer par getSession() (callback wired tardivement par
+    // /dashboard.onMount) fait que le derived reste collé à "viewer" si la
+    // callback est posée APRÈS l'activation de la session.
+    const session = sessionManager.queriedSession ?? sessionManager.activeSession;
+    if (!session) return "viewer";
+    const targetMachineId = session.agentMachineId?.trim() ?? "";
+    const currentMachineId = agentManager.localMachineId.trim();
+    return !!targetMachineId && !!currentMachineId && targetMachineId === currentMachineId
+      ? "agent"
+      : "viewer";
   });
 
   chatRemoteRole = $derived(this.chatLocalRole === "agent" ? "viewer" : "agent");
