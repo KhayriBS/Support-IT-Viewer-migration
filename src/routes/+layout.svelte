@@ -34,6 +34,17 @@
   }
 
   $effect(() => {
+    // Pendant une session ACTIVE, on force /dashboard quel que soit le rôle :
+    // l'orchestration UI (signaling, viewer, chat, fichiers) y est centralisée.
+    // À la fin de session, l'effet redéclenche et renvoie au rôle.
+    const sess = sessionManager.activeSession;
+    if (sess && sess.status === "ACTIVE") {
+      if (!page.url.pathname.startsWith("/dashboard")) {
+        void goto("/dashboard", { replaceState: true });
+      }
+      return;
+    }
+
     const role = agentManager.role;
     if (!role) return;
     // Pré-charge le cache dashboard dès qu'on est TECHNICIAN — la navigation

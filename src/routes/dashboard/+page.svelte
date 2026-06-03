@@ -875,6 +875,11 @@
           session={sessionManager.activeSession}
           chatLocalRole={chatManager.chatLocalRole}
           actionLoading={sessionManager.actionLoading}
+          peerLabel={
+            sessionManager.activeSession.agentMachineId === agentManager.localMachineId
+              ? (sessionManager.activeSession.technicianUsername || "le technicien")
+              : sessionManager.activeSession.agentMachineId
+          }
           onPickFeature={(f) => {
             if (f === "chat") sessionManager.chooseFeature("chat");
             else sessionManager.selectedFeature = f;

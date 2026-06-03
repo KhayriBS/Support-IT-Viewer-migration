@@ -7,11 +7,15 @@
     session: ControlSession;
     chatLocalRole: "viewer" | "agent" | string;
     actionLoading: boolean;
+    /** Identifiant du correspondant — calculé côté parent selon qui regarde. */
+    peerLabel?: string;
     onPickFeature: (feature: Feature) => void;
     onDisconnect: () => void;
   }
 
-  let { session, chatLocalRole, actionLoading, onPickFeature, onDisconnect }: Props = $props();
+  let { session, chatLocalRole, actionLoading, peerLabel, onPickFeature, onDisconnect }: Props = $props();
+
+  const displayedPeer = $derived(peerLabel?.trim() || session.agentMachineId);
 </script>
 
 <section class="rd-panel">
@@ -20,7 +24,7 @@
       <h2 class="rd-panel__title">
         <span class="rd-icon">🔗</span>
         Session établie avec
-        <strong class="rd-viewer__peer">{session.agentMachineId}</strong>
+        <strong class="rd-viewer__peer">{displayedPeer}</strong>
       </h2>
       <p class="rd-viewer__sub">Choisis quelle fonctionnalité utiliser. La vidéo ne démarre que si tu cliques "Écran".</p>
     </div>
