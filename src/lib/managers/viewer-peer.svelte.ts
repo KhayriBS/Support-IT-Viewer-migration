@@ -1,6 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
+import { technicianApi } from "$lib/api";
 import type { ControlSession, SignalMessage } from "$lib/api";
 import { defaultViewerIceServers, isEditableTarget, resolveIceServers } from "$lib/utils/viewer";
+
+// Préfixes ICE qu'on refuse — VPN WireGuard/NordLynx, VirtualBox Host-Only,
+// VMware VMnet1/8, APIPA, IPv6 link-local. Même liste que le côté Rust
+// (src-tauri/src/agent/network.rs::BLOCKED_IP_PREFIXES). À garder en
+// synchro si tu ajoutes une nouvelle interface virtuelle.
+const BLOCKED_IP_PREFIXES = [
+  "10.5.", "10.6.",
+  "192.168.56.",
+  "192.168.30.", "192.168.9.",
+  "169.254.",
+  "fe80:", "fe80::"
+];
+
+function extractCandidateIp(line: string | null | undefined): string | null {
+  if (!line) return null;
+  const stripped = line.startsWith("candidate:") ? line.slice("candidate:".length) : line;
+  const parts = stripped.split(/\s+/);
+  return parts.length >= 5 ? parts[4] : null;
+}
+
+/** false si l'IP du candidat tombe dans BLOCKED_IP_PREFIXES (VPN/virtuel/APIPA). */
+function isValidCandidate(candidate: RTCIceCandidate): boolean {
+  const ip = (candidate.address ?? extractCandidateIp(candidate.candidate))?.toLowerCase();
+  if (!ip) return true; // pas d'IP parsable (mDNS .local) — on laisse passer
+  return !BLOCKED_IP_PREFIXES.some((prefix) => ip.startsWith(prefix.toLowerCase()));
+}
 import { diag } from "$lib/utils/diag";
 import { signalBus } from "./signal-bus.svelte";
 import {
@@ -1088,6 +1115,17 @@ class ViewerPeer {
       return this.viewerPeerConnection;
     }
 
+    // Logge l'IP physique de l'agent (best-effort) avant d'ouvrir la PC.
+    // C'est purement informatif pour le debug — la sélection ICE est
+    // toujours pilotée par les candidats annoncés des deux côtés.
+    const session = this.getSession();
+    if (session?.agentMachineId) {
+      void technicianApi
+        .getAgentNetwork(session.agentMachineId)
+        .then((net) => console.info(`🛰 Agent ${session.agentMachineId} localIp=${net?.localIp || "?"}`))
+        .catch((e) => console.warn(`🛰 getAgentNetwork failed for ${session.agentMachineId}:`, e));
+    }
+
     diag("creating new RTCPeerConnection with iceServers", this.viewerIceServers);
     const pc = new RTCPeerConnection({
       iceServers: this.viewerIceServers,
@@ -1198,6 +1236,14 @@ class ViewerPeer {
         ?? event.candidate.relatedAddress
         ?? parseCandidateAddress(candStr);
       const cPort = event.candidate.port ?? parseCandidatePort(candStr);
+
+      // Filtre VPN / VirtualBox / VMware / APIPA / IPv6 link-local — sans ça,
+      // un candidat host inutilisable peut être sélectionné par ICE et la
+      // session ne converge pas.
+      if (!isValidCandidate(event.candidate)) {
+        console.warn(`🚫 [ICE] viewer SKIP  type=${cType} addr=${cAddr}:${cPort} (interface bloquée)`);
+        return;
+      }
 
       const iceMessage: SignalMessage = {
         type: "ICE",

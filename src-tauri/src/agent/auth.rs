@@ -108,9 +108,14 @@ impl AgentAuthService {
         &self,
         machine_id: &str,
         os: &str,
+        local_ip: &str,
     ) -> Result<AgentLoginResult, String> {
         let url = format!("{}/agents/login", self.server_url);
-        let params = [("machineId", machine_id), ("os", os)];
+        let params = [
+            ("machineId", machine_id),
+            ("os", os),
+            ("localIp", local_ip),
+        ];
 
         let resp = self
             .client

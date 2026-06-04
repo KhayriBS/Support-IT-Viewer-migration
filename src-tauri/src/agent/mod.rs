@@ -20,3 +20,4 @@ pub mod privacy_filter;
 pub mod autostart;
 pub mod tray;
 pub mod hardware;
+pub mod network;

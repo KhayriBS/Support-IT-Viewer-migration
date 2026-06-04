@@ -89,6 +89,11 @@ export const technicianApi = {
     return request<Agent[]>("/agents/mine", { token });
   },
 
+  /** IP physique active enregistrée pour cette machine au dernier login. */
+  getAgentNetwork(machineId: string, token?: string) {
+    return request<{ localIp: string }>(`/agents/${encodeURIComponent(machineId)}/network`, { token });
+  },
+
   /** Toutes les machines + sessions actives + stats (vue TECHNICIEN). */
   getAdminDashboard(token?: string) {
     return request<{

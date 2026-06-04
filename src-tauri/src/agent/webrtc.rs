@@ -224,6 +224,18 @@ impl AgentWebRtc {
                         let addr = parse_candidate_address(&init.candidate)
                             .map(|(ip, port)| format!("{ip}:{port}"))
                             .unwrap_or_else(|| "?".to_string());
+
+                        // Filtrage des interfaces VPN / VirtualBox / VMware / APIPA :
+                        // sans ça, webrtc-rs annonce des candidats host inutilisables
+                        // par le peer distant et ICE met 5-10 s à converger sur un
+                        // relay (ou échoue carrément).
+                        if !super::network::is_valid_ice_candidate(&init.candidate) {
+                            tracing::warn!(
+                                "🚫 [ICE] agent SKIP  type={cand_type:<5} addr={addr} (interface bloquée)"
+                            );
+                            return;
+                        }
+
                         tracing::info!(
                             "🧊 [ICE] agent → viewer  type={cand_type:<5} addr={addr}"
                         );

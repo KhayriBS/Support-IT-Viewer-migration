@@ -337,7 +337,8 @@ pub async fn refresh_agent_role(state: Arc<SharedState>) -> Result<String, Strin
 
     let auth = AgentAuthService::new(&server_url);
     let os = std::env::consts::OS.to_string();
-    let login = auth.login(&machine_id, &os).await?;
+    let local_ip = super::network::get_local_ip().unwrap_or_default();
+    let login = auth.login(&machine_id, &os, &local_ip).await?;
 
     {
         *state.jwt_token.lock().await = Some(login.token.clone());
@@ -385,7 +386,12 @@ pub async fn start_agent(
     let auth = AgentAuthService::new(&server_url);
     let agent = auth.register_or_update(&machine_id, &hostname, &os).await?;
     tracing::info!("🟢 Registered: {} ({})", agent.machine_id, agent.status);
-    let login = auth.login(&machine_id, &os).await?;
+    // IP physique active : transmise au serveur pour que le viewer puisse
+    // valider qu'il joint la bonne interface (les candidats VPN/virtuels
+    // sont déjà filtrés par network::is_valid_ice_candidate côté Rust).
+    let local_ip = super::network::get_local_ip().unwrap_or_default();
+    tracing::info!("LocalIP   : {}", if local_ip.is_empty() { "?" } else { &local_ip });
+    let login = auth.login(&machine_id, &os, &local_ip).await?;
     let token = login.token.clone();
     tracing::info!(
         "✅ Agent authenticated (role={}, assigned={:?})",
