@@ -11,8 +11,17 @@ class SessionManager {
   actionError = $state<string | null>(null);
   waitingForApproval = $state(false);
   sessionTokenQuery = $state("");
+  /**
+   * Côté CIBLE uniquement : true si l'utilisateur a cliqué "← Retour" pour
+   * masquer la vue session sans la terminer. Le +layout ne redirige plus vers
+   * /dashboard tant que ce flag est true. /my-machines affiche alors une
+   * bannière "Reprendre la session" qui le remet à false → re-redirection.
+   * Reset automatiquement à false quand la session change.
+   */
+  dismissedByAgent = $state(false);
 
   private sessionActivationTimer: ReturnType<typeof setInterval> | null = null;
+  private sessionTerminationTimer: ReturnType<typeof setInterval> | null = null;
 
   // ── Callbacks set by the orchestrator (+page.svelte) ─────────────────────
   /** Open the signaling WebSocket once a session reaches ACTIVE. */
@@ -28,6 +37,65 @@ class SessionManager {
       clearInterval(this.sessionActivationTimer);
       this.sessionActivationTimer = null;
     }
+  };
+
+  private stopTerminationWatch = () => {
+    if (this.sessionTerminationTimer) {
+      clearInterval(this.sessionTerminationTimer);
+      this.sessionTerminationTimer = null;
+    }
+  };
+
+  /**
+   * Reset complet du state session — utilisé quand le serveur a marqué la
+   * session TERMINATED (le tech a fait Déconnecter, ou timeout).
+   */
+  clearSessionLocal = () => {
+    this.stopTerminationWatch();
+    this.stopActivationWatch();
+    this.activeSession = null;
+    this.queriedSession = null;
+    this.selectedFeature = null;
+    this.waitingForApproval = false;
+    this.sessionTokenQuery = "";
+    this.dismissedByAgent = false;
+  };
+
+  /**
+   * Côté CIBLE : masque la vue session sans la terminer côté serveur.
+   * Le Rust agent continue de streamer, le technicien ne voit aucune
+   * coupure. Le +layout ne redirige plus vers /dashboard. L'agent peut
+   * revenir via le bouton "Reprendre la session" sur /my-machines.
+   */
+  dismissSessionLocally = () => {
+    this.dismissedByAgent = true;
+    this.selectedFeature = null;
+  };
+
+  /** Annule le masquage et permet à +layout de re-rediriger vers /dashboard. */
+  resumeSessionView = () => {
+    this.dismissedByAgent = false;
+  };
+
+  /**
+   * Poll le statut de la session toutes les 4 s. Dès qu'elle passe TERMINATED
+   * (ou disparaît), clear local + le router +layout renvoie automatiquement
+   * sur la route du rôle (USER → /my-machines, TECHNICIAN → /dashboard accueil).
+   */
+  watchTermination = (sessionToken: string) => {
+    this.stopTerminationWatch();
+    if (!sessionToken) return;
+
+    this.sessionTerminationTimer = setInterval(async () => {
+      try {
+        const session = await technicianApi.getSessionByToken(sessionToken);
+        if (!session || session.status === "TERMINATED") {
+          this.clearSessionLocal();
+        }
+      } catch {
+        /* best-effort, on retentera au prochain tick */
+      }
+    }, 4000);
   };
 
   private watchActivation = (sessionToken: string) => {
@@ -88,6 +156,7 @@ class SessionManager {
       this.sessionTokenQuery = this.activeSession.signalingToken;
       this.waitingForApproval = this.activeSession.status === "PENDING_APPROVAL";
       this.watchActivation(this.activeSession.signalingToken);
+      this.watchTermination(this.activeSession.signalingToken);
     } catch (error) {
       this.actionError = String(error);
       this.waitingForApproval = false;
@@ -113,6 +182,7 @@ class SessionManager {
       this.sessionTokenQuery = this.activeSession.signalingToken;
       this.waitingForApproval = this.activeSession.status === "PENDING_APPROVAL";
       this.watchActivation(this.activeSession.signalingToken);
+      this.watchTermination(this.activeSession.signalingToken);
     } catch (error) {
       this.actionError = String(error);
       this.waitingForApproval = false;
@@ -132,6 +202,7 @@ class SessionManager {
     this.actionError = null;
     try {
       this.stopActivationWatch();
+      this.stopTerminationWatch();
       await this.disconnectSignaling({ sendLeave: true });
       chatManager.disconnect();
       await technicianApi.stopSessionByToken(token);

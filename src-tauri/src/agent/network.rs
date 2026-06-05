@@ -7,7 +7,7 @@
 // → "Peer not connected: agent". On bloque ces préfixes avant l'envoi au
 // signaling pour forcer ICE à converger sur le LAN physique.
 
-use std::net::UdpSocket;
+use std::net::{IpAddr, UdpSocket};
 
 /// Préfixes d'adresses qu'on refuse d'annoncer comme candidats ICE.
 /// Étendre cette liste si une nouvelle interface virtuelle apparaît.
@@ -39,6 +39,16 @@ pub fn get_local_ip() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     let addr = socket.local_addr().ok()?;
     Some(addr.ip().to_string())
+}
+
+/// `true` si l'IP appartient à une interface bloquée (VPN/virtuel/APIPA).
+/// Appelé par `SettingEngine::set_ip_filter` pour que webrtc-rs n'énumère
+/// même pas les candidats sur ces interfaces (au lieu de les filtrer après
+/// émission). Équivalent typé de `is_valid_ice_candidate` pour la couche
+/// gathering bas niveau.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    let s = ip.to_string().to_ascii_lowercase();
+    BLOCKED_IP_PREFIXES.iter().any(|p| s.starts_with(&p.to_ascii_lowercase()))
 }
 
 /// `false` si le candidat ICE pointe sur une interface VPN/virtuelle/APIPA.
@@ -120,6 +130,30 @@ mod tests {
     fn accepts_relay() {
         let cand = "candidate:4 1 udp 41886207 172.232.192.83 48802 typ relay raddr 0.0.0.0 rport 0";
         assert!(is_valid_ice_candidate(cand));
+    }
+
+    #[test]
+    fn ip_filter_blocks_typed_vpn() {
+        let ip: IpAddr = "10.5.0.2".parse().unwrap();
+        assert!(is_blocked_ip(ip));
+    }
+
+    #[test]
+    fn ip_filter_blocks_typed_virtualbox() {
+        let ip: IpAddr = "192.168.56.1".parse().unwrap();
+        assert!(is_blocked_ip(ip));
+    }
+
+    #[test]
+    fn ip_filter_blocks_typed_ipv6_link_local() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_blocked_ip(ip));
+    }
+
+    #[test]
+    fn ip_filter_accepts_typed_physical_wifi() {
+        let ip: IpAddr = "192.168.1.179".parse().unwrap();
+        assert!(!is_blocked_ip(ip));
     }
 
     #[test]

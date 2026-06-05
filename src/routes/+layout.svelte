@@ -25,6 +25,9 @@
     sessionManager.queriedSession = sessionManager.activeSession;
     sessionManager.selectedFeature = null;
     sessionManager.waitingForApproval = false;
+    // Côté cible : on poll le statut serveur pour détecter quand le technicien
+    // disconnect → +layout redirige automatiquement vers la route du rôle.
+    sessionManager.watchTermination(decision.session.signalingToken);
   };
 
   function routeForRole(role: string): string {
@@ -37,8 +40,11 @@
     // Pendant une session ACTIVE, on force /dashboard quel que soit le rôle :
     // l'orchestration UI (signaling, viewer, chat, fichiers) y est centralisée.
     // À la fin de session, l'effet redéclenche et renvoie au rôle.
+    // EXCEPTION : si la cible a cliqué "← Retour", on laisse le routing rôle
+    // normal s'appliquer pour qu'elle puisse aller sur /my-machines. La session
+    // reste ACTIVE côté serveur, le Rust agent continue de streamer.
     const sess = sessionManager.activeSession;
-    if (sess && sess.status === "ACTIVE") {
+    if (sess && sess.status === "ACTIVE" && !sessionManager.dismissedByAgent) {
       if (!page.url.pathname.startsWith("/dashboard")) {
         void goto("/dashboard", { replaceState: true });
       }

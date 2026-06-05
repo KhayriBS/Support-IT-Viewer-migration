@@ -750,6 +750,29 @@
     sessionManager.disconnectSignaling = (opts) => disconnectSignaling(opts);
     sessionManager.getConnectionCode = () => connectionCode;
 
+    // Catch-up : si la session est déjà ACTIVE quand /dashboard mount (cas
+    // d'une redirection depuis /my-machines après approbation), watchActivation
+    // a peut-être déjà appelé connectSignaling AVANT que la vraie callback
+    // soit câblée (no-op silencieux). On rattrape ici en kickant le connect
+    // une fois qu'on est sûr d'avoir le bon callback.
+    //
+    // GUARD CRITIQUE : NE PAS kicker connectSignaling si cette machine est la
+    // CIBLE de la session (agentMachineId == localMachineId). Sinon on ouvre
+    // une 2e WS role=viewer sur le SignalingService qui n'a qu'un slot viewer
+    // → on écrase la WS du vrai viewer → ICE relaye entre la cible et son
+    // propre Rust agent → checking immédiat puis disconnected.
+    // Le pipeline signaling de la cible est géré par son Rust agent
+    // (auto-join via session_tick), pas par sa Svelte.
+    const isTargetOfSession =
+      sessionManager.activeSession?.agentMachineId === agentManager.localMachineId;
+    if (
+      sessionManager.activeSession?.status === "ACTIVE"
+      && !signalBus.signalingConnected
+      && !isTargetOfSession
+    ) {
+      void connectSignaling();
+    }
+
     signalBus.shouldReconnect = () => {
       const current = sessionManager.queriedSession ?? sessionManager.activeSession;
       return !!current && current.status === "ACTIVE";
@@ -895,7 +918,8 @@
             if (f === "chat") sessionManager.chooseFeature("chat");
             else sessionManager.selectedFeature = f;
           }}
-          onDisconnect={() => void sessionManager.stopByToken()} />
+          onDisconnect={() => void sessionManager.stopByToken()}
+          onBackToInterface={() => sessionManager.dismissSessionLocally()} />
       {/if}
 
       {#if sessionManager.selectedFeature === "files"}

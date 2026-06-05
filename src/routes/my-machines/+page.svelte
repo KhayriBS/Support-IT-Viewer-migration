@@ -142,6 +142,28 @@
       {/if}
     </p>
 
+    <!-- ── Bannière session masquée : un technicien contrôle cette machine ── -->
+    {#if sessionManager.activeSession?.status === "ACTIVE" && sessionManager.dismissedByAgent}
+      <section class="resume-banner" role="status">
+        <div class="resume-banner__icon">🟢</div>
+        <div class="resume-banner__text">
+          <strong>Session active en arrière-plan</strong>
+          <p>
+            Un technicien contrôle actuellement votre poste.
+            {#if sessionManager.activeSession.technicianUsername}
+              Connecté : <code>{sessionManager.activeSession.technicianUsername}</code>
+            {/if}
+          </p>
+        </div>
+        <button
+          class="resume-banner__btn"
+          type="button"
+          onclick={() => sessionManager.resumeSessionView()}>
+          Reprendre la vue session →
+        </button>
+      </section>
+    {/if}
+
     <!-- ── Connexion par code (initie une session, redirige vers /dashboard) ── -->
     <RdConnectPanel
       bind:connectionCode
@@ -286,4 +308,55 @@
   .badge.busy { background: rgba(255, 184, 0, 0.18); color: #ffb800; }
   .badge.off { background: rgba(255, 132, 132, 0.18); color: #ff8484; }
   .hint { margin-top: 12px; font-size: 12px; opacity: 0.6; }
+
+  .resume-banner {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 12px 0 20px;
+    padding: 14px 18px;
+    background: rgba(46, 196, 121, 0.10);
+    border: 1px solid rgba(46, 196, 121, 0.32);
+    border-radius: 10px;
+  }
+  .resume-banner__icon {
+    font-size: 22px;
+    line-height: 1;
+  }
+  .resume-banner__text {
+    flex: 1;
+    min-width: 0;
+  }
+  .resume-banner__text strong {
+    display: block;
+    font-size: 13px;
+    color: #2ec479;
+  }
+  .resume-banner__text p {
+    margin: 4px 0 0;
+    font-size: 12px;
+    opacity: 0.85;
+  }
+  .resume-banner__text code {
+    font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .resume-banner__btn {
+    background: rgba(46, 196, 121, 0.18);
+    color: #2ec479;
+    border: 1px solid rgba(46, 196, 121, 0.4);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    font-family: inherit;
+  }
+  .resume-banner__btn:hover {
+    background: rgba(46, 196, 121, 0.32);
+  }
 </style>

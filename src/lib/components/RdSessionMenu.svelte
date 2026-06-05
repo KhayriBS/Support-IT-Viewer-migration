@@ -11,9 +11,11 @@
     peerLabel?: string;
     onPickFeature: (feature: Feature) => void;
     onDisconnect: () => void;
+    /** Quitter la vue session sans terminer côté serveur (cible uniquement). */
+    onBackToInterface?: () => void;
   }
 
-  let { session, chatLocalRole, actionLoading, peerLabel, onPickFeature, onDisconnect }: Props = $props();
+  let { session, chatLocalRole, actionLoading, peerLabel, onPickFeature, onDisconnect, onBackToInterface }: Props = $props();
 
   const displayedPeer = $derived(peerLabel?.trim() || session.agentMachineId);
 </script>
@@ -35,6 +37,13 @@
         onclick={onDisconnect}
         disabled={actionLoading}>
         Déconnecter
+      </button>
+    {:else if onBackToInterface}
+      <button
+        class="menu-back"
+        type="button"
+        onclick={onBackToInterface}>
+        ← Retour
       </button>
     {/if}
   </header>
@@ -86,5 +95,18 @@
   .menu-disconnect:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+  .menu-back {
+    background: rgba(255, 255, 255, 0.06);
+    color: inherit;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .menu-back:hover {
+    background: rgba(255, 255, 255, 0.12);
   }
 </style>
