@@ -450,9 +450,21 @@ impl AiExecutor {
         };
 
         // Timeout 30s — protege contre les commandes interactives qui pendraient.
-        let exec = TokioCommand::new(program)
-            .args(&args)
-            .output();
+        // Sur Windows : CREATE_NO_WINDOW (0x08000000) pour empêcher l'allocation
+        // d'une console visible — sans ce flag, l'agent Tauri (GUI, sans console
+        // parent à hériter) fait clignoter une fenêtre cmd.exe noire pendant
+        // ~100ms à chaque action `shell`. Effet de bord : très visible pour
+        // l'utilisateur final, peu professionnel pour la démo PFE.
+        let mut command = TokioCommand::new(program);
+        command.args(&args);
+        #[cfg(windows)]
+        {
+            // tokio::process::Command expose nativement creation_flags() sur
+            // Windows (pas besoin de l'extension trait std).
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let exec = command.output();
 
         let output = tokio::time::timeout(Duration::from_secs(30), exec)
             .await

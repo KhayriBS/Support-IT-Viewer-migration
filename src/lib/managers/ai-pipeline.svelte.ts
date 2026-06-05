@@ -481,13 +481,31 @@ class AiPipeline {
       return;
     }
 
-    // Seules les erreurs sont remontées dans le chat. Les succès des
-    // actions individuelles (✅ click OK, etc.) ne sont plus affichés —
-    // le technicien voit déjà le résultat visuel sur le flux écran et
-    // l'historique d'actions verbeux polluait l'UI.
+    // Pour les actions VISUELLES (click, type_text, key, scroll, drag, move),
+    // les succès ne sont pas affichés — le technicien voit le résultat sur le
+    // flux vidéo et l'historique d'actions verbeux polluait l'UI.
+    //
+    // Pour les actions SANS sortie visuelle (shell), le stdout EST le résultat
+    // utile (sortie ipconfig, version Windows, etc.). On l'affiche toujours,
+    // succès ou échec — sinon la commande IA "donne mon IP" exécute ipconfig
+    // mais le technicien ne voit rien (le shell est invisible avec
+    // CREATE_NO_WINDOW côté agent).
+    const isShellAction = action === "shell";
+
     if (!ok) {
       this.appendAiChatMessage(
         `❌ ${action} a echoue : ${message || "erreur inconnue"}`,
+        "ai-system"
+      );
+    } else if (isShellAction && message) {
+      // Format pretty-print du résultat shell : on retire le "exit=0\n" qui
+      // n'apporte rien quand la commande a réussi, et on garde stdout/stderr.
+      const cleaned = message
+        .replace(/^exit=0\n?/, "")
+        .replace(/^stdout:\s*/, "")
+        .trim();
+      this.appendAiChatMessage(
+        `💻 Résultat shell :\n${cleaned}`,
         "ai-system"
       );
     }
