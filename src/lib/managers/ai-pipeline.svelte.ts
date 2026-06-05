@@ -1,5 +1,5 @@
 import { AiRealtimeClient } from "$lib/api";
-import type { AiAction, AiActionEnvelope, ChatMessage, ControlSession } from "$lib/api";
+import type { AiAction, AiActionEnvelope, AiHistoryStep, ChatMessage, ControlSession } from "$lib/api";
 import { formatBytesApprox } from "$lib/utils/format";
 import { viewerPeer } from "./viewer-peer.svelte";
 
@@ -37,6 +37,20 @@ interface PendingScreenshot {
 const AI_MIN_INTERVAL_MS = 6_000;
 const AI_BUSY_WATCHDOG_MS = 60_000;
 
+// ── Boucle agentic ──────────────────────────────────────────────────────────
+/** Plafond dur d'itérations pour une même commande utilisateur. Au-delà,
+ *  on stop même si Gemini renvoie done=false (protection contre boucle
+ *  infinie sur un Gemini buggé ou un objectif impossible à atteindre). */
+const AGENTIC_MAX_ITERATIONS = 5;
+/** Délai entre la fin d'exécution des actions et la relance auto du tour
+ *  suivant — laisse le temps à l'UI distante de se stabiliser (animations,
+ *  ouverture de fenêtres) avant la prochaine capture. */
+const AGENTIC_INTER_TURN_DELAY_MS = 800;
+/** Cap sur le nombre de caractères de stdout/résultat conservé dans le
+ *  resultText envoyé à Gemini au tour suivant. Trop grand = budget tokens
+ *  exploré, trop petit = perte de signal utile (ex. sortie ipconfig). */
+const AGENTIC_RESULT_TEXT_MAX = 600;
+
 class AiPipeline {
   client = new AiRealtimeClient();
 
@@ -52,6 +66,38 @@ class AiPipeline {
    *  est affiché dans le modal — l'IA séquentielle ne produira jamais
    *  deux demandes simultanées mais on garde une liste par sécurité. */
   pendingShellApprovals = $state<PendingShellApproval[]>([]);
+
+  // ── État boucle agentic ──────────────────────────────────────────────────
+  /** Activable/désactivable par l'utilisateur (toggle UI futur). Quand
+   *  désactivé, l'IA fonctionne en mono-shot comme avant : 1 commande
+   *  utilisateur = 1 plan = aucun re-call automatique. */
+  agenticEnabled = $state(true);
+  /** Tour courant — 0 pour le premier appel, incrémenté à chaque relance
+   *  automatique. Reset quand l'utilisateur saisit une nouvelle commande. */
+  agenticIteration = $state(0);
+  /** True pendant toute la durée d'une boucle multi-tour (de la commande
+   *  utilisateur jusqu'au done=true / max / cancel). Permet à l'UI
+   *  d'afficher "tour 2/5" et de distinguer "réflexion" vs "exécution". */
+  agenticActive = $state(false);
+  /** Compteur d'actions restantes pour le tour courant — décrémenté à chaque
+   *  AI_ACTION_RESULT reçu. Quand il atteint 0, on déclenche la relance. */
+  private agenticActionsRemaining = 0;
+  /** Historique des tours précédents — envoyé à Gemini à chaque relance. */
+  private agenticHistory: AiHistoryStep[] = [];
+  /** Commande utilisateur d'origine — reutilisée à chaque tour (Gemini
+   *  voit toujours le même objectif initial, et l'historique pour le contexte). */
+  private agenticOriginalCommand: string | null = null;
+  /** Buffer des résultats du tour courant — concat des stdout shell / status
+   *  click pour donner du contexte à Gemini. Reset entre chaque tour. */
+  private agenticCurrentTurnResults: string[] = [];
+  /** Rationale + actions du tour courant, capturés au moment du envelope.
+   *  Stockés pour les insérer dans l'historique au moment de la relance. */
+  private agenticCurrentTurnRationale: string | null = null;
+  private agenticCurrentTurnActionsJson: string = "[]";
+  /** Dernière screenshot remontée par l'agent via AI_ACTION_RESULT — quand
+   *  Gemini termine son plan par un screenshot, on le réutilise comme input
+   *  du tour suivant (gain de temps + plus fiable que recapturer côté viewer). */
+  private agenticLastAgentScreenshot: { b64: string; width: number; height: number } | null = null;
 
   private detachAiActionListener: (() => void) | null = null;
   private detachAiConnectionListener: (() => void) | null = null;
@@ -109,6 +155,10 @@ class AiPipeline {
     // Vide la file d'approbations shell — l'agent Rust va timeout à 60s
     // et refuser par défaut, le viewer n'a plus à les afficher.
     this.pendingShellApprovals = [];
+
+    // Coupe toute boucle agentic en cours — la session disparaît, plus de
+    // raison de relancer l'IA.
+    this.stopAgenticLoop("Session fermée");
   };
 
   // ── Kill switch + shell approval (P0 sécurité) ───────────────────────────
@@ -135,6 +185,8 @@ class AiPipeline {
       // répond pas (channel cassé), le watchdog 60s catchera.
       this.aiBusy = false;
       this.stopAiBusyWatchdog();
+      // Coupe aussi la boucle agentic — pas de relance après une annulation.
+      this.stopAgenticLoop("Annulé par le technicien");
       return true;
     } catch (err) {
       this.aiError = `Envoi AI_CANCEL impossible : ${String(err)}`;
@@ -474,10 +526,18 @@ class AiPipeline {
     const ok = !!result.ok;
     const message = (result.message ?? "").trim();
 
-    // Screenshot de vérif : on garde l'image (utile pour Gemini multi-tour)
-    // mais on n'écrit rien dans le chat — l'image suffit.
+    // Screenshot : on garde l'image pour l'affichage ET pour la relance agentic
+    // (réutiliser le screenshot post-action au lieu d'en capturer un nouveau
+    // côté viewer = plus fiable, déjà décodé par l'agent au bon timing).
     if (action === "screenshot" && result.screenshot) {
       this.aiLastVerificationImage = `data:image/jpeg;base64,${result.screenshot}`;
+      if (this.agenticActive) {
+        // Dimensions ne sont pas dans le payload pour le screenshot de vérif,
+        // on met 0x0 — le backend connaît déjà la résolution via le 1er tour.
+        this.agenticLastAgentScreenshot = { b64: result.screenshot, width: 0, height: 0 };
+        this.agenticCurrentTurnResults.push("screenshot OK");
+      }
+      this.tickAgenticActionCompleted();
       return;
     }
 
@@ -497,6 +557,15 @@ class AiPipeline {
         `❌ ${action} a echoue : ${message || "erreur inconnue"}`,
         "ai-system"
       );
+      // L'action "cancel" est émise par l'agent quand le plan est interrompu
+      // par AI_CANCEL — on arrête toute la boucle agentic ici.
+      if (action === "cancel" && this.agenticActive) {
+        this.stopAgenticLoop("Plan annulé par le technicien");
+        return;
+      }
+      if (this.agenticActive) {
+        this.agenticCurrentTurnResults.push(`${action} FAILED: ${message}`);
+      }
     } else if (isShellAction && message) {
       // Format pretty-print du résultat shell : on retire le "exit=0\n" qui
       // n'apporte rien quand la commande a réussi, et on garde stdout/stderr.
@@ -508,22 +577,34 @@ class AiPipeline {
         `💻 Résultat shell :\n${cleaned}`,
         "ai-system"
       );
+      if (this.agenticActive) {
+        // Le stdout est crucial pour le tour suivant — Gemini doit lire le
+        // résultat d'ipconfig pour décider s'il a fini.
+        this.agenticCurrentTurnResults.push(`${action}: ${cleaned}`);
+      }
+    } else if (this.agenticActive) {
+      // Click/type/key réussi : note minimal pour l'historique.
+      this.agenticCurrentTurnResults.push(`${action} OK`);
     }
+
+    this.tickAgenticActionCompleted();
   };
 
   handleAiActionEnvelope = (env: AiActionEnvelope) => {
-    this.aiBusy = false;
     this.stopAiBusyWatchdog();
     this.aiLastRationale = env.rationale ?? null;
 
     const current = this.getSession();
     if (current && String(current.id) !== env.sessionId) {
+      // L'envelope concerne une autre session — on ignore mais on ne touche
+      // pas aiBusy : si on a une autre boucle en cours, elle reste active.
       return;
     }
 
     if (env.status !== "ok") {
       this.aiError = env.error ?? "Erreur IA inconnue.";
       this.appendAiChatMessage(`❌ ${this.aiError}`, "ai-system");
+      this.stopAgenticLoop(this.aiError);
       return;
     }
     this.aiError = null;
@@ -532,19 +613,201 @@ class AiPipeline {
       this.appendAiChatMessage(`🧠 ${env.rationale}`, "ai-system");
     }
 
-    // On ne logue plus chaque action dans le chat : seule la rationale
-    // (🧠 ci-dessus) reste visible côté technicien. Les échecs d'envoi
-    // (DataChannel fermé) sont toujours signalés car ils bloquent la
-    // suite du plan.
-    for (const action of env.actions ?? []) {
+    const actions = env.actions ?? [];
+    const isDone = !!env.done;
+
+    // Cas 1 — boucle agentic active : on capture le contexte pour l'historique
+    // et on décide si on relance après exécution.
+    if (this.agenticActive) {
+      this.agenticCurrentTurnRationale = env.rationale ?? null;
+      try {
+        this.agenticCurrentTurnActionsJson = JSON.stringify(actions);
+      } catch {
+        this.agenticCurrentTurnActionsJson = "[]";
+      }
+      this.agenticCurrentTurnResults = [];
+      this.agenticLastAgentScreenshot = null;
+
+      if (isDone && actions.length === 0) {
+        // Gemini a fini sans actions supplémentaires — la rationale est la
+        // réponse finale. Boucle terminée proprement.
+        this.stopAgenticLoop(null);
+        return;
+      }
+
+      if (this.agenticIteration + 1 >= AGENTIC_MAX_ITERATIONS && !isDone) {
+        // On va faire ce tour mais ce sera le dernier — on prévient Gemini
+        // dans le chat technicien et on coupera la relance après les résultats.
+        this.appendAiChatMessage(
+          `⚠️ Tour ${this.agenticIteration + 1}/${AGENTIC_MAX_ITERATIONS} — dernier tour avant arrêt automatique.`,
+          "ai-system"
+        );
+      }
+
+      // En agentic, on attend que TOUTES les actions du tour aient remonté
+      // leur AI_ACTION_RESULT avant de relancer. Si actions vide + done=false,
+      // on relance quand même (Gemini réfléchit sans agir — autorisé 1 tour).
+      this.agenticActionsRemaining = actions.length;
+      if (isDone) {
+        // done=true + actions non vides = dernière exécution avec réponse
+        // finale, on arrêtera la boucle après l'exécution.
+        this.agenticDoneAfterTurn = true;
+      }
+    } else {
+      // Cas 2 — mono-shot classique : libère aiBusy tout de suite.
+      this.aiBusy = false;
+    }
+
+    // Envoi des actions à l'agent Rust.
+    for (const action of actions) {
       const ok = this.forwardAiActionToAgent(action);
       if (!ok) {
         this.appendAiChatMessage(
           `⚠️ Impossible d'envoyer cette action a l'agent (DataChannel indisponible).`,
           "ai-system"
         );
+        if (this.agenticActive) {
+          this.stopAgenticLoop("DataChannel agent fermé");
+        }
         break;
       }
+    }
+
+    // Cas "actions vide" en mode agentic : Gemini "réfléchit" sans action.
+    // On déclenche immédiatement la relance (rien à attendre).
+    if (this.agenticActive && actions.length === 0 && !isDone) {
+      this.tickAgenticActionCompleted();
+    }
+  };
+
+  /** True quand `done=true` est arrivé MAIS qu'il reste des actions à
+   *  exécuter — on arrête la boucle après leur complétion. */
+  private agenticDoneAfterTurn = false;
+
+  /**
+   * Décrémente le compteur d'actions restantes du tour courant. Quand il
+   * atteint 0, on décide : relance auto, arrêt par done, ou arrêt par max.
+   */
+  private tickAgenticActionCompleted = () => {
+    if (!this.agenticActive) return;
+    if (this.agenticActionsRemaining > 0) {
+      this.agenticActionsRemaining--;
+    }
+    if (this.agenticActionsRemaining > 0) return;
+
+    // Tour complet. Décision :
+    if (this.agenticDoneAfterTurn) {
+      this.stopAgenticLoop(null);
+      return;
+    }
+    if (this.agenticIteration + 1 >= AGENTIC_MAX_ITERATIONS) {
+      this.appendAiChatMessage(
+        `🛑 Limite de ${AGENTIC_MAX_ITERATIONS} tours atteinte — arrêt automatique.`,
+        "ai-system"
+      );
+      this.stopAgenticLoop(null);
+      return;
+    }
+    // Sinon : on push le tour dans l'historique et on relance.
+    this.pushCurrentTurnToHistory();
+    this.agenticIteration++;
+    setTimeout(() => {
+      // Re-check : l'utilisateur a peut-être cliqué Stop pendant le délai.
+      if (!this.agenticActive) return;
+      void this.dispatchNextAgenticTurn();
+    }, AGENTIC_INTER_TURN_DELAY_MS);
+  };
+
+  private pushCurrentTurnToHistory = () => {
+    const resultText = this.agenticCurrentTurnResults
+      .join(" | ")
+      .slice(0, AGENTIC_RESULT_TEXT_MAX);
+    this.agenticHistory.push({
+      iteration: this.agenticIteration,
+      rationale: this.agenticCurrentTurnRationale,
+      actionsJson: this.agenticCurrentTurnActionsJson,
+      resultText
+    });
+  };
+
+  /**
+   * Lance le tour suivant : capture screenshot (de préférence celui remonté
+   * par l'agent au tour précédent, sinon canvas local), puis publishFrame
+   * avec l'historique. Bypass le cooldown 6s (c'est une relance auto, pas
+   * une nouvelle commande utilisateur).
+   */
+  private dispatchNextAgenticTurn = async (): Promise<void> => {
+    if (!this.agenticActive || !this.agenticOriginalCommand) return;
+    const session = this.getSession();
+    if (!session || session.status !== "ACTIVE") {
+      this.stopAgenticLoop("Session inactive");
+      return;
+    }
+
+    // Préfère la dernière screenshot remontée par l'agent (post-actions),
+    // sinon retombe sur la capture viewer canvas / agent direct.
+    let frame: { jpegBase64: string; width: number; height: number };
+    if (this.agenticLastAgentScreenshot?.b64) {
+      frame = {
+        jpegBase64: this.agenticLastAgentScreenshot.b64,
+        width: this.agenticLastAgentScreenshot.width,
+        height: this.agenticLastAgentScreenshot.height
+      };
+    } else {
+      // Pas de screenshot fraîche dans le tour précédent — on en redemande
+      // une à l'agent. Si l'agent ne répond pas (tier 1 KO), on prend le
+      // canvas viewer (tier 2).
+      try {
+        const remote = await this.requestScreenshotFromRemote(3000);
+        frame = remote;
+      } catch {
+        const local = await this.captureFrameWithAutoResume();
+        if (!local) {
+          this.stopAgenticLoop("Capture impossible pour la relance agentic");
+          return;
+        }
+        frame = local;
+      }
+    }
+
+    this.aiBusy = true;
+    this.startAiBusyWatchdog();
+    console.log(
+      `[ai] 🔁 tour agentic ${this.agenticIteration}/${AGENTIC_MAX_ITERATIONS}`
+    );
+
+    const ok = await this.client.publishFrame({
+      sessionId: String(session.id),
+      command: this.agenticOriginalCommand,
+      screenshot: frame.jpegBase64,
+      frameWidth: frame.width,
+      frameHeight: frame.height,
+      technicianUsername: session.technicianUsername ?? undefined,
+      iteration: this.agenticIteration,
+      history: this.agenticHistory
+    });
+    if (!ok) {
+      this.stopAgenticLoop("Échec d'envoi du frame agentic");
+    }
+  };
+
+  /**
+   * Arrête proprement la boucle agentic. Reset tous les compteurs et libère
+   * aiBusy pour permettre une nouvelle commande utilisateur.
+   */
+  private stopAgenticLoop = (reason: string | null) => {
+    if (!this.agenticActive) return;
+    this.agenticActive = false;
+    this.agenticActionsRemaining = 0;
+    this.agenticHistory = [];
+    this.agenticOriginalCommand = null;
+    this.agenticCurrentTurnResults = [];
+    this.agenticDoneAfterTurn = false;
+    this.agenticLastAgentScreenshot = null;
+    this.aiBusy = false;
+    this.stopAiBusyWatchdog();
+    if (reason) {
+      console.log(`[ai] 🔁 boucle agentic arrêtée : ${reason}`);
     }
   };
 
@@ -621,17 +884,32 @@ class AiPipeline {
 
     this.appendAiChatMessage(`/ai ${trimmed}`, "ai-user");
 
+    // Initialise l'état boucle agentic — sera désactivé par sendAiCancel,
+    // par done=true côté Gemini, ou par AGENTIC_MAX_ITERATIONS atteint.
+    if (this.agenticEnabled) {
+      this.agenticActive = true;
+      this.agenticIteration = 0;
+      this.agenticHistory = [];
+      this.agenticOriginalCommand = trimmed;
+      this.agenticCurrentTurnResults = [];
+      this.agenticCurrentTurnRationale = null;
+      this.agenticCurrentTurnActionsJson = "[]";
+      this.agenticLastAgentScreenshot = null;
+      this.agenticDoneAfterTurn = false;
+    }
+
     const ok = await this.client.publishFrame({
       sessionId: String(session.id),
       command: trimmed,
       screenshot: frame.jpegBase64,
       frameWidth: frame.width,
       frameHeight: frame.height,
-      technicianUsername: session.technicianUsername ?? undefined
+      technicianUsername: session.technicianUsername ?? undefined,
+      iteration: 0,
+      history: []
     });
     if (!ok) {
-      this.aiBusy = false;
-      this.stopAiBusyWatchdog();
+      this.stopAgenticLoop("Echec d'envoi du frame IA");
       this.aiError = "Echec d'envoi du frame IA (REST + STOMP tous les deux KO). Verifie la connexion reseau.";
     }
   };

@@ -15,7 +15,14 @@
     <div class="rd-ai-takeover__banner">
       <span class="rd-ai-takeover__pulse" aria-hidden="true"></span>
       <div class="rd-ai-takeover__text">
-        <strong>IA en cours d'action</strong>
+        <strong>
+          IA en cours d'action
+          {#if aiPipeline.agenticActive}
+            <span class="rd-ai-takeover__iter">
+              · tour {aiPipeline.agenticIteration + 1}/5
+            </span>
+          {/if}
+        </strong>
         <span class="rd-ai-takeover__sub">
           {aiPipeline.aiLastRationale ?? "Analyse et exécution du plan…"}
         </span>
@@ -91,6 +98,13 @@
     color: #fcd34d;
     font-size: 13px;
     font-weight: 600;
+  }
+  .rd-ai-takeover__iter {
+    color: #5eead4;
+    font-size: 12px;
+    font-weight: 500;
+    margin-left: 4px;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
   }
   .rd-ai-takeover__sub {
     color: #cbd5e1;

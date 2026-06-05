@@ -25,6 +25,23 @@ export interface AiActionEnvelope {
   error?: string | null;
   actions: AiAction[];
   rationale?: string | null;
+  /** Mode agentic : Gemini indique qu'il a fini. Si absent, considéré comme
+   *  false (rétrocompat avec anciens backends mono-shot). */
+  done?: boolean | null;
+  /** Tour courant tel que renvoyé par le backend — utile pour debug si la
+   *  réponse arrive hors ordre. */
+  iteration?: number | null;
+}
+
+/** Une étape passée envoyée à Gemini au tour N+1 pour qu'il sache ce qu'il
+ *  a déjà tenté. Texte uniquement, le visuel est porté par le screenshot. */
+export interface AiHistoryStep {
+  iteration: number;
+  rationale: string | null;
+  /** Liste d'actions sérialisée — compacte pour ne pas exploser le payload. */
+  actionsJson: string;
+  /** Résultats agrégés (stdout shell tronqué, "click OK", erreurs…). */
+  resultText: string;
 }
 
 export interface AiFrameRequest {
@@ -36,6 +53,11 @@ export interface AiFrameRequest {
   frameWidth: number;
   frameHeight: number;
   technicianUsername?: string;
+  /** Tour courant (0 = premier appel). Permet à Gemini de calibrer son
+   *  comportement (refuser de boucler indéfiniment). */
+  iteration?: number;
+  /** Résumé des tours précédents — vide ou omis au premier appel. */
+  history?: AiHistoryStep[];
 }
 
 export type AiConnectionState = "idle" | "connecting" | "connected" | "error";
