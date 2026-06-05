@@ -13,6 +13,17 @@ interface AiActionResult {
   action?: string;
 }
 
+/** Demande d'approbation shell émise par l'agent Rust quand une commande
+ *  est hors allow-list. Le viewer affiche un modal de validation. */
+export interface PendingShellApproval {
+  actionId: string;
+  cmd: string;
+  shell: string;
+  /** Timestamp d'arrivée — utilisé pour timeout côté UI (60s = même
+   *  fenêtre que côté Rust). */
+  receivedAt: number;
+}
+
 interface PendingScreenshot {
   resolve: (payload: { jpegBase64: string; width: number; height: number }) => void;
   reject: (err: Error) => void;
@@ -37,6 +48,10 @@ class AiPipeline {
   aiLastVerificationImage = $state<string | null>(null);
   /** Anti-spam cote client : timestamp ms du dernier sendAiCommand. */
   aiLastSentAtMs = $state(0);
+  /** File des approbations shell en attente (FIFO). Le premier élément
+   *  est affiché dans le modal — l'IA séquentielle ne produira jamais
+   *  deux demandes simultanées mais on garde une liste par sécurité. */
+  pendingShellApprovals = $state<PendingShellApproval[]>([]);
 
   private detachAiActionListener: (() => void) | null = null;
   private detachAiConnectionListener: (() => void) | null = null;
@@ -90,6 +105,96 @@ class AiPipeline {
       pending.reject(new Error("Session IA fermee avant reponse screenshot"));
     }
     this.pendingScreenshots.clear();
+
+    // Vide la file d'approbations shell — l'agent Rust va timeout à 60s
+    // et refuser par défaut, le viewer n'a plus à les afficher.
+    this.pendingShellApprovals = [];
+  };
+
+  // ── Kill switch + shell approval (P0 sécurité) ───────────────────────────
+  /**
+   * Envoie `AI_CANCEL` sur le DataChannel input. L'agent Rust marquera le
+   * plan en cours comme annulé et la boucle dispatch() s'arrêtera entre
+   * deux actions. `aiBusy` retombera quand l'agent renverra le résultat
+   * "Plan annulé" ou que le watchdog 60s expirera.
+   */
+  sendAiCancel = (): boolean => {
+    const channel = viewerPeer.viewerControlChannel;
+    if (!channel || channel.readyState !== "open") {
+      this.aiError = "Impossible d'annuler : DataChannel input fermé.";
+      return false;
+    }
+    try {
+      channel.send(JSON.stringify({ type: "AI_CANCEL" }));
+      this.appendAiChatMessage(
+        "🛑 Annulation demandée — l'IA s'arrêtera à la fin de l'action courante.",
+        "ai-system"
+      );
+      // Optimistic UI : on libère immédiatement aiBusy pour permettre une
+      // nouvelle commande dès que l'agent aura confirmé. Si l'agent ne
+      // répond pas (channel cassé), le watchdog 60s catchera.
+      this.aiBusy = false;
+      this.stopAiBusyWatchdog();
+      return true;
+    } catch (err) {
+      this.aiError = `Envoi AI_CANCEL impossible : ${String(err)}`;
+      return false;
+    }
+  };
+
+  /**
+   * Appelé par viewer-peer quand un `AI_SHELL_REQUEST` arrive sur le
+   * DataChannel input. Push la demande dans la file — l'UI (modal)
+   * réagit sur le state. L'agent attend 60s avant de timeout côté Rust.
+   */
+  handleShellRequest = (payload: Record<string, unknown>) => {
+    const actionId = typeof payload.actionId === "string" ? payload.actionId : "";
+    const cmd = typeof payload.cmd === "string" ? payload.cmd : "";
+    const shell = typeof payload.shell === "string" ? payload.shell : "powershell";
+    if (!actionId || !cmd) {
+      console.warn("[ai] AI_SHELL_REQUEST invalide (actionId/cmd manquant)", payload);
+      return;
+    }
+    // Anti-doublon : si l'actionId est déjà dans la file (re-livraison réseau),
+    // ne pas push une seconde fois.
+    if (this.pendingShellApprovals.some((p) => p.actionId === actionId)) {
+      return;
+    }
+    this.pendingShellApprovals = [
+      ...this.pendingShellApprovals,
+      { actionId, cmd, shell, receivedAt: Date.now() }
+    ];
+    this.appendAiChatMessage(
+      `🔐 L'IA demande l'autorisation d'exécuter une commande shell. Vérifie le modal.`,
+      "ai-system"
+    );
+  };
+
+  /**
+   * Renvoie la décision (approuvé / refusé) à l'agent Rust et retire la
+   * demande de la file. Si le DataChannel est fermé, on remonte une erreur
+   * mais on retire quand même la demande (sinon le modal reste bloqué).
+   */
+  respondShellApproval = (actionId: string, approved: boolean): boolean => {
+    this.pendingShellApprovals = this.pendingShellApprovals.filter(
+      (p) => p.actionId !== actionId
+    );
+    const channel = viewerPeer.viewerControlChannel;
+    if (!channel || channel.readyState !== "open") {
+      this.aiError = "Impossible de renvoyer la décision : DataChannel fermé.";
+      return false;
+    }
+    try {
+      channel.send(JSON.stringify({
+        type: "AI_SHELL_DECISION",
+        actionId,
+        approved
+      }));
+      return true;
+    } catch (err) {
+      this.aiError = `Envoi AI_SHELL_DECISION impossible : ${String(err)}`;
+      return false;
+    }
   };
 
   // ── Busy watchdog ────────────────────────────────────────────────────────

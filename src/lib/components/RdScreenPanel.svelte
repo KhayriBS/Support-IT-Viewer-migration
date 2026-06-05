@@ -9,6 +9,7 @@
   import RdChatList from "./RdChatList.svelte";
   import RdChatCompose from "./RdChatCompose.svelte";
   import RdTransferList from "./RdTransferList.svelte";
+  import RdAiTakeoverOverlay from "./RdAiTakeoverOverlay.svelte";
 
   interface Props {
     session: ControlSession;
@@ -123,6 +124,8 @@
         <p>Émission suspendue. Clique pour la reprendre.</p>
       </div>
     {/if}
+
+    <RdAiTakeoverOverlay />
 
     <RdViewerStatsBar
       bind:visible={viewerPeer.viewerStatsBarVisible}

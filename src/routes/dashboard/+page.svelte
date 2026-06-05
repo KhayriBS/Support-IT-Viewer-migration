@@ -792,6 +792,7 @@
     viewerPeer.resetFileChannel = () => fileChannel.reset();
     viewerPeer.handleAiActionResult = (payload) => aiPipeline.handleAiActionResult(payload);
     viewerPeer.handleScreenshotResponse = (payload) => aiPipeline.handleScreenshotResponse(payload);
+    viewerPeer.handleAiShellRequest = (payload) => aiPipeline.handleShellRequest(payload);
     viewerPeer.onControlChannelOpen = () => { rdLastSentPaused = null; };
 
     fileChannel.getSession = () => sessionManager.activeSession ?? sessionManager.queriedSession;

@@ -4,6 +4,7 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import RdApprovalModal from "$lib/components/RdApprovalModal.svelte";
+  import RdAiShellApprovalModal from "$lib/components/RdAiShellApprovalModal.svelte";
   import { agentManager } from "$lib/managers/agent-manager.svelte";
   import { approvalManager, type ApprovalDecision } from "$lib/managers/approval-manager.svelte";
   import { dashboardData } from "$lib/managers/dashboard-data.svelte";
@@ -120,3 +121,8 @@
   onApprove={approvalManager.approve}
   onReject={approvalManager.reject}
   onClose={approvalManager.close} />
+
+<!-- AI shell approval modal : pop-up côté TECHNICIEN quand l'IA propose
+     une commande shell hors allow-list. Globalement monté pour fonctionner
+     même si l'utilisateur a navigué hors du panneau Écran entretemps. -->
+<RdAiShellApprovalModal />

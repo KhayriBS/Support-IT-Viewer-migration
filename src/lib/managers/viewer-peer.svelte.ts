@@ -129,6 +129,9 @@ class ViewerPeer {
   handleAiActionResult: (payload: Record<string, unknown>) => void = () => {};
   /** Forward a screenshot_response (or chunked variant) received over the control DataChannel. */
   handleScreenshotResponse: (payload: Record<string, unknown>) => void = () => {};
+  /** Forward an AI_SHELL_REQUEST emitted by the agent when a shell command
+   *  falls outside the allow-list and requires technician approval. */
+  handleAiShellRequest: (payload: Record<string, unknown>) => void = () => {};
   /** Reset the orchestrator's pause/resume tracking when the input channel re-opens. */
   onControlChannelOpen: () => void = () => {};
 
@@ -772,6 +775,9 @@ class ViewerPeer {
         switch (msgType) {
           case "AI_ACTION_RESULT":
             this.handleAiActionResult(payload);
+            break;
+          case "AI_SHELL_REQUEST":
+            this.handleAiShellRequest(payload);
             break;
           case "screenshot_response":
           case "screenshot_response_error":

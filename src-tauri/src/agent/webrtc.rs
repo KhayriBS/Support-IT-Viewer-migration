@@ -400,6 +400,38 @@ impl AgentWebRtc {
                                             .await;
                                             return;
                                         }
+                                        // Kill switch IA : le technicien a cliqué "Stop" pendant
+                                        // l'exécution d'un AI_PLAN. On marque le plan courant comme
+                                        // annulé — la boucle dispatch() s'arrêtera à la prochaine
+                                        // action. L'action en cours d'exécution termine (on n'interrompt
+                                        // pas enigo en plein move_mouse pour éviter un état souris
+                                        // incohérent).
+                                        "AI_CANCEL" => {
+                                            tracing::info!("🛑 AI_CANCEL reçu du viewer");
+                                            super::ai_executor::request_cancel();
+                                            return;
+                                        }
+                                        // Décision du technicien sur une demande d'approbation
+                                        // shell : { actionId, approved: bool }. Le `do_shell` de
+                                        // l'agent attend sur un oneshot pour cet actionId.
+                                        "AI_SHELL_DECISION" => {
+                                            let action_id = value
+                                                .get("actionId")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let approved = value
+                                                .get("approved")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            if action_id.is_empty() {
+                                                tracing::warn!("AI_SHELL_DECISION sans actionId");
+                                            } else {
+                                                super::ai_executor::resolve_shell_approval(
+                                                    action_id, approved,
+                                                );
+                                            }
+                                            return;
+                                        }
                                         // Pre-Gemini : le viewer veut un screenshot REEL de notre
                                         // ecran (et pas la frame WebRTC decodee, qui peut etre noire
                                         // si emission_paused=true). On capture cote agent avec

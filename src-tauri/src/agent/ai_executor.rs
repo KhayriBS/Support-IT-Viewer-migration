@@ -15,16 +15,73 @@
 //! sous la forme `{ "type": "AI_ACTION_RESULT", "ok": bool, "message": str,
 //! "screenshot"?: str }`. Le viewer affiche ces messages dans le chat.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use webrtc::data_channel::RTCDataChannel;
 
 use super::screen_capture::capture_primary_jpeg_base64;
+
+// ── Cancellation & shell approval (P0 sécurité) ──────────────────────────────
+//
+// Deux mécanismes de sécurité partagés entre `dispatch()` et `webrtc.rs` :
+//
+// 1. **Kill switch** : un compteur monotone `CURRENT_PLAN_ID` identifie le
+//    plan en cours. Quand le viewer envoie `AI_CANCEL`, on stocke l'id du
+//    plan annulé dans `CANCELLED_PLAN_ID`. La boucle d'exécution compare son
+//    propre id à `CANCELLED_PLAN_ID` entre chaque action et s'arrête net.
+//    Pas de Mutex car les accès sont triviaux (load/store atomique).
+//
+// 2. **Approval shell** : chaque action `shell` qui n'est pas dans
+//    l'allow-list `is_safe_shell_command()` doit être validée par le viewer
+//    avant exécution. On stocke un `oneshot::Sender<bool>` par actionId
+//    dans `PENDING_SHELL_APPROVALS`. Le viewer renvoie un
+//    `AI_SHELL_DECISION { actionId, approved }`, le webrtc handler appelle
+//    `resolve_shell_approval()` qui complète le oneshot. Timeout 60s — un
+//    technicien distrait ne doit pas bloquer l'agent indéfiniment.
+static CURRENT_PLAN_ID: AtomicU64 = AtomicU64::new(0);
+static CANCELLED_PLAN_ID: AtomicU64 = AtomicU64::new(0);
+static PENDING_SHELL_APPROVALS: OnceLock<
+    std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>,
+> = OnceLock::new();
+
+fn pending_shell_approvals() -> &'static std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>> {
+    PENDING_SHELL_APPROVALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Appelé par le handler `AI_CANCEL` côté `webrtc.rs`. Marque le plan en
+/// cours comme annulé — la boucle s'arrête à la prochaine itération (l'action
+/// courante va jusqu'au bout pour éviter d'interrompre `enigo` en plein
+/// mouvement souris).
+pub fn request_cancel() {
+    let current = CURRENT_PLAN_ID.load(Ordering::Acquire);
+    CANCELLED_PLAN_ID.store(current, Ordering::Release);
+    tracing::info!("🛑 AI cancel requested (plan_id={current})");
+}
+
+/// Appelé par le handler `AI_SHELL_DECISION` côté `webrtc.rs`. Résout le
+/// `oneshot::Sender` correspondant à l'`actionId`. Si la map ne le contient
+/// pas (timeout déjà passé ou actionId inconnu), on ignore — pas de panique.
+pub fn resolve_shell_approval(action_id: &str, approved: bool) {
+    let Ok(mut guard) = pending_shell_approvals().lock() else {
+        tracing::warn!("[ai] shell approval mutex poisoned, ignoring decision");
+        return;
+    };
+    if let Some(sender) = guard.remove(action_id) {
+        let _ = sender.send(approved);
+        tracing::info!(
+            "[ai] shell approval resolved: action_id={action_id} approved={approved}"
+        );
+    } else {
+        tracing::warn!("[ai] shell approval for unknown action_id={action_id}");
+    }
+}
 
 // ── DTO ──────────────────────────────────────────────────────────────────────
 
@@ -156,8 +213,22 @@ pub async fn dispatch(channel: Arc<RTCDataChannel>, raw_json: &str) {
         return;
     }
 
-    tracing::info!("🤖 AI executing {} action(s)", actions.len());
-    for action in actions {
+    // Réserve un plan_id unique pour cette exécution. Si le viewer envoie
+    // `AI_CANCEL` pendant qu'on tourne, `CANCELLED_PLAN_ID` prendra cette
+    // valeur — la boucle ci-dessous le detectera et coupera.
+    let plan_id = CURRENT_PLAN_ID.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    tracing::info!("🤖 AI executing {} action(s) [plan_id={plan_id}]", actions.len());
+
+    for (idx, action) in actions.into_iter().enumerate() {
+        if CANCELLED_PLAN_ID.load(Ordering::Acquire) == plan_id {
+            tracing::info!(
+                "🛑 Plan {plan_id} cancelled at action {idx} — aborting remaining steps"
+            );
+            executor
+                .reply_error(Some("cancel"), "Plan annulé par le technicien")
+                .await;
+            return;
+        }
         executor.execute(action).await;
     }
 }
@@ -345,6 +416,24 @@ impl AiExecutor {
                 }
             });
 
+        // Allow-list : si la commande matche un pattern sûr (lecture seule,
+        // diagnostic, installation via winget), on l'exécute directement.
+        // Sinon on demande l'autorisation au viewer via AI_SHELL_REQUEST
+        // et on bloque jusqu'à AI_SHELL_DECISION (timeout 60s).
+        if !is_safe_shell_command(cmd) {
+            tracing::info!(
+                "🔐 Shell hors allow-list, demande d'approbation viewer: {}",
+                truncate(cmd, 120)
+            );
+            let approved = self.request_shell_approval(cmd, &shell).await;
+            if !approved {
+                return Err(format!(
+                    "Commande shell refusée par le technicien : {}",
+                    truncate(cmd, 200)
+                ));
+            }
+        }
+
         let (program, args): (&str, Vec<String>) = match shell.as_str() {
             "cmd" => ("cmd", vec!["/C".into(), cmd.into()]),
             "powershell" => (
@@ -388,6 +477,65 @@ impl AiExecutor {
             Ok(Some(msg))
         } else {
             Err(msg)
+        }
+    }
+
+    /// Demande au viewer l'autorisation d'exécuter une commande shell hors
+    /// allow-list. Renvoie `true` si approuvé, `false` si refusé ou timeout.
+    ///
+    /// Le protocole :
+    ///   1. Génère un actionId UUID
+    ///   2. Stocke un `oneshot::Sender` dans `PENDING_SHELL_APPROVALS`
+    ///   3. Envoie `{"type":"AI_SHELL_REQUEST","actionId":...,"cmd":...,"shell":...}`
+    ///   4. Attend la résolution (60s max) — `resolve_shell_approval()` est
+    ///      appelé par webrtc.rs quand `AI_SHELL_DECISION` arrive.
+    ///   5. Si timeout : on retire le sender de la map (sinon la mémoire fuit)
+    ///      et on refuse par défaut (deny-by-default, fail-closed).
+    async fn request_shell_approval(&self, cmd: &str, shell: &str) -> bool {
+        let action_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel::<bool>();
+
+        // Enregistre AVANT d'envoyer la requête pour éviter une race où le
+        // viewer répondrait avant que le sender soit en place.
+        if let Ok(mut guard) = pending_shell_approvals().lock() {
+            guard.insert(action_id.clone(), tx);
+        } else {
+            tracing::warn!("[ai] shell approval mutex poisoned, denying by default");
+            return false;
+        }
+
+        let req = serde_json::json!({
+            "type": "AI_SHELL_REQUEST",
+            "actionId": action_id,
+            "cmd": cmd,
+            "shell": shell,
+        });
+        if let Err(e) = self.channel.send_text(req.to_string()).await {
+            tracing::warn!("[ai] failed to send AI_SHELL_REQUEST: {e}");
+            // Nettoie le sender — le oneshot va dropper et rx renverra Err.
+            if let Ok(mut guard) = pending_shell_approvals().lock() {
+                guard.remove(&action_id);
+            }
+            return false;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(60), rx).await {
+            Ok(Ok(approved)) => approved,
+            Ok(Err(_)) => {
+                tracing::warn!("[ai] shell approval channel dropped, denying");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[ai] shell approval timeout (60s) for action_id={action_id} — denying"
+                );
+                // Le sender est probablement encore là — on le supprime
+                // pour éviter une fuite si une réponse tardive arrivait.
+                if let Ok(mut guard) = pending_shell_approvals().lock() {
+                    guard.remove(&action_id);
+                }
+                false
+            }
         }
     }
 
@@ -641,6 +789,101 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Allow-list des commandes shell autorisées SANS approbation explicite du
+/// technicien. Tout le reste passe par le flux `AI_SHELL_REQUEST`.
+///
+/// Le critère : la commande doit être manifestement non destructive — lecture
+/// seule (Get-*, ipconfig, systeminfo…), diagnostic, ou installation/mise à
+/// jour via gestionnaire de paquets officiel (winget). Volontairement strict :
+/// mieux vaut un faux-négatif qui demande une confirmation inutile qu'un
+/// faux-positif qui exécute `rm -rf /`.
+///
+/// Le test d'allow-list est insensible à la casse et appliqué sur le PREMIER
+/// token (jusqu'au premier espace, pipe ou point-virgule). Ça empêche le
+/// classique contournement `Get-Process; Remove-Item C:\* -Recurse`.
+fn is_safe_shell_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Si la commande contient un séparateur de chaînage, on rejette d'office —
+    // l'IA est explicitement instruite de produire une action par séparation.
+    // `&&`, `||`, `;`, `|` (pipe sauf cas légitimes), backtick.
+    // Note: on accepte `|` car les commandes diagnostic en pipent souvent
+    // (ipconfig | findstr), mais on interdit les autres chaînages.
+    let dangerous_chains = ["&&", "||", ";", "`", "$(", "`("];
+    for sep in &dangerous_chains {
+        if trimmed.contains(sep) {
+            return false;
+        }
+    }
+
+    // Premier "verbe" de la commande, normalisé minuscule.
+    let head: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '|')
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    // Verbes PowerShell sûrs (read-only). PowerShell est case-insensitive, on
+    // matche sur la version minuscule.
+    const SAFE_PS_VERBS: &[&str] = &[
+        "get-", "test-", "select-", "where-", "measure-", "compare-",
+        "find-", "show-", "out-", "format-", "convertto-", "convertfrom-",
+        "read-", "resolve-", "ping-", "trace-",
+    ];
+    for v in SAFE_PS_VERBS {
+        if head.starts_with(v) {
+            return true;
+        }
+    }
+
+    // Commandes diagnostic Windows / Unix sûres.
+    const SAFE_PROGRAMS: &[&str] = &[
+        "ipconfig", "ifconfig", "systeminfo", "hostname", "whoami",
+        "tasklist", "ps", "df", "du", "free", "uptime", "uname",
+        "ver", "winver", "echo", "type", "cat", "ls", "dir",
+        "netstat", "arp", "route", "tracert", "traceroute", "ping",
+        "nslookup", "wmic", "query", "qwinsta", "qprocess",
+        // Winget en MODE LECTURE OU INSTALL OFFICIEL — uninstall non
+        // autorisé sans approbation (cf has_safe_winget_args plus bas).
+    ];
+    if SAFE_PROGRAMS.contains(&head.as_str()) {
+        return true;
+    }
+
+    // Cas spécial winget : on autorise `winget list`, `winget search`,
+    // `winget show`, `winget --version`, `winget upgrade --all` mais PAS
+    // `winget uninstall`. Faut un parsing plus fin.
+    if head == "winget" {
+        return is_safe_winget(trimmed);
+    }
+
+    // (Get-XX ...).Property — PowerShell sub-expression read-only.
+    if trimmed.starts_with("(Get-") || trimmed.starts_with("(get-") {
+        return true;
+    }
+
+    false
+}
+
+fn is_safe_winget(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    // tokens après "winget"
+    let after = lower.trim_start_matches("winget").trim_start();
+    const SAFE_SUBCOMMANDS: &[&str] = &[
+        "list", "search", "show", "--version", "-v",
+        "source", "settings", "help", "--help", "upgrade",
+    ];
+    for sub in SAFE_SUBCOMMANDS {
+        if after.starts_with(sub) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Convertit des coordonnées normalisées (0.0 → 1.0) en pixels écran absolus.
 /// Clampe l'entrée car Gemini renvoie parfois des valeurs légèrement hors borne
 /// (1.0001) après analyse — on ne veut surtout pas une coord négative ou hors
@@ -818,6 +1061,82 @@ mod tests {
         let action: AiAction = serde_json::from_str(json).unwrap();
         assert_eq!(action.cmd.as_deref(), Some("echo hello"));
         assert_eq!(action.shell.as_deref(), Some("powershell"));
+    }
+
+    // ── is_safe_shell_command (allow-list P0 sécurité) ──────────────────────
+
+    #[test]
+    fn allowlist_accepts_powershell_read_verbs() {
+        assert!(is_safe_shell_command("Get-Process"));
+        assert!(is_safe_shell_command("get-process | Sort-Object CPU"));
+        assert!(is_safe_shell_command("Test-Connection 8.8.8.8"));
+        assert!(is_safe_shell_command("Select-Object -First 5"));
+    }
+
+    #[test]
+    fn allowlist_accepts_diagnostic_programs() {
+        assert!(is_safe_shell_command("ipconfig /all"));
+        assert!(is_safe_shell_command("systeminfo"));
+        assert!(is_safe_shell_command("whoami"));
+        assert!(is_safe_shell_command("tasklist"));
+        assert!(is_safe_shell_command("ping 1.1.1.1"));
+        assert!(is_safe_shell_command("ipconfig | findstr IPv4"));
+    }
+
+    #[test]
+    fn allowlist_accepts_safe_winget_subcommands() {
+        assert!(is_safe_shell_command("winget list"));
+        assert!(is_safe_shell_command("winget search vscode"));
+        assert!(is_safe_shell_command("winget --version"));
+        assert!(is_safe_shell_command("winget upgrade --all"));
+    }
+
+    #[test]
+    fn allowlist_rejects_winget_uninstall() {
+        // winget install/uninstall = effets persistants → approbation requise.
+        assert!(!is_safe_shell_command("winget uninstall Chrome"));
+        assert!(!is_safe_shell_command("winget install Chrome"));
+    }
+
+    #[test]
+    fn allowlist_rejects_destructive() {
+        // Cas explicitement dangereux — doivent passer par approval.
+        assert!(!is_safe_shell_command("Remove-Item C:\\* -Recurse -Force"));
+        assert!(!is_safe_shell_command("rm -rf /"));
+        assert!(!is_safe_shell_command("format C:"));
+        assert!(!is_safe_shell_command("del /F /Q C:\\Windows"));
+        assert!(!is_safe_shell_command("Restart-Computer -Force"));
+        assert!(!is_safe_shell_command("Stop-Process -Name explorer"));
+        assert!(!is_safe_shell_command("shutdown /r /f"));
+        assert!(!is_safe_shell_command("reg delete HKLM\\Software"));
+    }
+
+    #[test]
+    fn allowlist_rejects_command_chaining() {
+        // Tentative classique : préfixer par un Get-* "safe" puis chainer
+        // une commande dangereuse. Le check de chaînage doit casser ça.
+        assert!(!is_safe_shell_command(
+            "Get-Process; Remove-Item C:\\* -Recurse"
+        ));
+        assert!(!is_safe_shell_command("ipconfig && format C:"));
+        assert!(!is_safe_shell_command("whoami || rm -rf /"));
+        assert!(!is_safe_shell_command("Get-Date; rm -rf ~"));
+        assert!(!is_safe_shell_command("$(rm -rf /)"));
+    }
+
+    #[test]
+    fn allowlist_rejects_empty() {
+        assert!(!is_safe_shell_command(""));
+        assert!(!is_safe_shell_command("   "));
+    }
+
+    #[test]
+    fn allowlist_accepts_paren_get_subexpression() {
+        // PowerShell sub-expression read-only — utilisé dans le system prompt
+        // pour requêter Brightness/Volume.
+        assert!(is_safe_shell_command(
+            "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness)"
+        ));
     }
 
     #[test]
