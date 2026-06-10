@@ -278,9 +278,19 @@ class AiPipeline {
   captureFrame = (): { jpegBase64: string; width: number; height: number } | null => {
     const video = viewerPeer.viewerVideoEl;
     if (!video) return null;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) return null;
+    const srcW = video.videoWidth;
+    const srcH = video.videoHeight;
+    if (!srcW || !srcH) return null;
+
+    // Cap a 1280px de large pour matcher la capture agent-side
+    // (capture_primary_jpeg_base64_scaled(1280, 50)). Sans ça, sur un écran
+    // 4K, le base64 fait ~2-4 MB → latence Groq qui explose + budget tokens
+    // consomme inutilement (Llama 4 Scout downscale a 768px en interne de
+    // toute facon, donc envoyer plus est gaspille).
+    const MAX_WIDTH = 1280;
+    const scale = srcW > MAX_WIDTH ? MAX_WIDTH / srcW : 1;
+    const w = Math.round(srcW * scale);
+    const h = Math.round(srcH * scale);
 
     const canvas = document.createElement("canvas");
     canvas.width = w;
@@ -293,7 +303,8 @@ class AiPipeline {
       console.warn("[ai] captureFrame drawImage failed", err);
       return null;
     }
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+    // Qualite 0.6 (au lieu de 0.7) : meme cible que l'agent-side (q=50).
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
     const comma = dataUrl.indexOf(",");
     if (comma < 0) return null;
     return { jpegBase64: dataUrl.slice(comma + 1), width: w, height: h };
