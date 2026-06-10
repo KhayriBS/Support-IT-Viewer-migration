@@ -98,6 +98,10 @@ class AiPipeline {
    *  Gemini termine son plan par un screenshot, on le réutilise comme input
    *  du tour suivant (gain de temps + plus fiable que recapturer côté viewer). */
   private agenticLastAgentScreenshot: { b64: string; width: number; height: number } | null = null;
+  /** Compteur de tours consécutifs SANS action exécutée — protège contre les
+   *  modèles qui "réfléchissent" en boucle (rationale + actions=[] + done=false).
+   *  Au 2e tour stérile, on coupe pour ne pas griller des appels Groq inutiles. */
+  private agenticEmptyTurnStreak = 0;
 
   private detachAiActionListener: (() => void) | null = null;
   private detachAiConnectionListener: (() => void) | null = null;
@@ -635,6 +639,23 @@ class AiPipeline {
         return;
       }
 
+      // Anti-boucle stérile : si le modèle renvoie actions=[] + done=false
+      // deux tours d'affilée, il "réfléchit" sans agir — on coupe au lieu
+      // de gaspiller les 5 tours.
+      if (actions.length === 0 && !isDone) {
+        this.agenticEmptyTurnStreak++;
+        if (this.agenticEmptyTurnStreak >= 2) {
+          this.appendAiChatMessage(
+            `🛑 L'IA n'a pas produit d'actions concrètes sur 2 tours. Reformule la commande plus précisément.`,
+            "ai-system"
+          );
+          this.stopAgenticLoop("Boucle stérile (no-action loop)");
+          return;
+        }
+      } else {
+        this.agenticEmptyTurnStreak = 0;
+      }
+
       if (this.agenticIteration + 1 >= AGENTIC_MAX_ITERATIONS && !isDone) {
         // On va faire ce tour mais ce sera le dernier — on prévient Gemini
         // dans le chat technicien et on coupera la relance après les résultats.
@@ -804,6 +825,7 @@ class AiPipeline {
     this.agenticCurrentTurnResults = [];
     this.agenticDoneAfterTurn = false;
     this.agenticLastAgentScreenshot = null;
+    this.agenticEmptyTurnStreak = 0;
     this.aiBusy = false;
     this.stopAiBusyWatchdog();
     if (reason) {
