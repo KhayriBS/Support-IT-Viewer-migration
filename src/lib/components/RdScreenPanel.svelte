@@ -59,24 +59,6 @@
 </script>
 
 <section class="rd-panel rd-viewer">
-  <header class="rd-viewer__head">
-    <h2 class="rd-panel__title">
-      <span class="rd-icon">🖥</span>
-      Session en cours avec
-      <strong class="rd-viewer__peer">{session.agentMachineId}</strong>
-    </h2>
-    <p class="rd-viewer__sub">
-      {#if signalBus.signalingConnected && viewerPeer.viewerRemoteStream}
-        Stream actif
-        {#if viewerPeer.viewerStreamMbps !== null}&nbsp;•&nbsp; {viewerPeer.viewerStreamMbps.toFixed(1)} Mbps{/if}
-        {#if viewerPeer.viewerStreamFps !== null}&nbsp;•&nbsp; {viewerPeer.viewerStreamFps.toFixed(0)} fps{/if}
-      {:else if signalBus.signalingConnected}
-        Signalisation connectée — attente de la première image…
-      {:else}
-        Connexion en cours…
-      {/if}
-    </p>
-  </header>
 
   <div
     bind:this={viewerPeer.viewerShellEl}
