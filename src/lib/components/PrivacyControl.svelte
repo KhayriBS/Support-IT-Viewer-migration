@@ -38,18 +38,20 @@
         : "Activer le floutage des mots de passe"
       : "Canal privacy non connecté"}
     aria-pressed={blurEnabled}
+    aria-label={blurEnabled
+      ? "Floutage des mots de passe activé"
+      : "Floutage des mots de passe désactivé"}
   >
     <span class="ti ti-lock privacy-control__icon" aria-hidden="true"></span>
-    <span class="privacy-control__label">Masquer mots de passe</span>
   </button>
 
   <span
     class="privacy-control__badge"
     class:privacy-control__badge--on={blurEnabled}
     class:privacy-control__badge--off={!blurEnabled}
-  >
-    {blurEnabled ? "Protection active" : "Désactivé"}
-  </span>
+    title={blurEnabled ? "Protection active" : "Protection désactivée"}
+    aria-label={blurEnabled ? "Protection active" : "Protection désactivée"}
+  ></span>
 </div>
 
 {#if !blurEnabled && !compact}
@@ -69,8 +71,8 @@
   .privacy-control__toggle {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    padding: 0.4rem 0.75rem;
+    justify-content: center;
+    padding: 0.45rem;
     border: 1px solid #2e7d32;
     border-radius: 8px;
     background: rgba(46, 125, 50, 0.12);
@@ -111,14 +113,11 @@
   }
 
   .privacy-control__badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.2rem 0.55rem;
+    display: inline-block;
+    width: 0.65rem;
+    height: 0.65rem;
     border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
   }
 
   .privacy-control__badge--on {
